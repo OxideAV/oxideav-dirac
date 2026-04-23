@@ -29,6 +29,7 @@ pub mod arith;
 pub mod bits;
 pub mod decoder;
 pub mod parse_info;
+pub mod quant;
 pub mod sequence;
 pub mod stream;
 pub mod subband;
