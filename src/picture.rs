@@ -202,6 +202,22 @@ pub fn decode_picture(
     parse_info: ParseInfo,
     sequence: &SequenceHeader,
 ) -> Result<DecodedPicture, PictureError> {
+    // Dispatch by profile / syntax family.
+    if parse_info.is_low_delay() {
+        return decode_low_delay_picture(payload, parse_info, sequence);
+    }
+    if parse_info.is_core_syntax() {
+        return decode_core_syntax_picture(payload, parse_info, sequence);
+    }
+    Err(PictureError::CoreSyntaxNotImplemented)
+}
+
+/// Full low-delay picture decode (LD or HQ profile).
+fn decode_low_delay_picture(
+    payload: &[u8],
+    parse_info: ParseInfo,
+    sequence: &SequenceHeader,
+) -> Result<DecodedPicture, PictureError> {
     let profile = if (parse_info.parse_code & 0xF8) == 0xE8 {
         LowDelayProfile::HQ
     } else if (parse_info.parse_code & 0xF8) == 0xC8 {
@@ -300,6 +316,118 @@ pub fn decode_picture(
         luma_h as usize,
         sequence.luma_depth,
     );
+    let u = trim_clip_offset(
+        &u_data,
+        chroma_w as usize,
+        chroma_h as usize,
+        sequence.chroma_depth,
+    );
+    let v = trim_clip_offset(
+        &v_data,
+        chroma_w as usize,
+        chroma_h as usize,
+        sequence.chroma_depth,
+    );
+
+    Ok(DecodedPicture {
+        picture_number,
+        luma_width: luma_w as usize,
+        luma_height: luma_h as usize,
+        chroma_width: chroma_w as usize,
+        chroma_height: chroma_h as usize,
+        y,
+        u,
+        v,
+        luma_depth: sequence.luma_depth,
+        chroma_depth: sequence.chroma_depth,
+    })
+}
+
+/// Full core-syntax picture decode (AC or VLC, intra only for now).
+fn decode_core_syntax_picture(
+    payload: &[u8],
+    parse_info: ParseInfo,
+    sequence: &SequenceHeader,
+) -> Result<DecodedPicture, PictureError> {
+    let is_intra = parse_info.is_intra();
+    let using_ac = parse_info.using_ac();
+
+    let mut r = BitReader::new(payload);
+    r.byte_align();
+    if payload.len() < 4 {
+        return Err(PictureError::Truncated("picture number"));
+    }
+    let picture_number = r.read_uint_lit(4);
+
+    // Inter pictures carry reference-picture deltas + prediction data
+    // before the wavelet_transform block. The scaffold parses enough
+    // of that header to keep the bitstream cursor in sync but then
+    // bails out before motion compensation.
+    if parse_info.is_inter() {
+        let num_refs = parse_info.num_refs() as u32;
+        let _ref1 = r.read_sint();
+        if num_refs == 2 {
+            let _ref2 = r.read_sint();
+        }
+        if parse_info.is_reference() {
+            let _retd = r.read_sint();
+        }
+        r.byte_align();
+        // Parse picture_prediction_parameters so the bitstream stays
+        // in sync with §11.2; block motion data decode is future work.
+        let _ = crate::picture_inter::parse_picture_prediction_parameters(
+            &mut r, sequence, num_refs,
+        )?;
+        r.byte_align();
+        return Err(PictureError::InterNotImplemented);
+    } else if parse_info.is_reference() {
+        let _retd = r.read_sint();
+    }
+
+    // §11.3 wavelet_transform. For intra pictures there's no
+    // zero_residual flag.
+    r.byte_align();
+
+    // §11.3.1 transform_parameters (core flavour).
+    let w_idx = r.read_uint();
+    let wavelet = crate::wavelet::WaveletFilter::from_index(w_idx)
+        .ok_or(PictureError::UnknownWaveletIndex(w_idx))?;
+    let dwt_depth = r.read_uint();
+    if dwt_depth > 6 {
+        return Err(PictureError::UnsupportedDwtDepth(dwt_depth));
+    }
+    // §11.3.3 codeblock_parameters.
+    let (codeblocks, codeblock_mode) =
+        crate::picture_core::parse_codeblock_parameters(&mut r, dwt_depth)?;
+    let params = crate::picture_core::CoreTransformParameters {
+        wavelet,
+        dwt_depth,
+        codeblocks,
+        codeblock_mode,
+        quant_matrix: None,
+    };
+
+    r.byte_align();
+    let luma_w = sequence.luma_width;
+    let luma_h = sequence.luma_height;
+    let chroma_w = sequence.chroma_width;
+    let chroma_h = sequence.chroma_height;
+
+    let y_py = crate::picture_core::core_transform_component(
+        &mut r, &params, luma_w, luma_h, using_ac, is_intra,
+    )?;
+    let u_py = crate::picture_core::core_transform_component(
+        &mut r, &params, chroma_w, chroma_h, using_ac, is_intra,
+    )?;
+    let v_py = crate::picture_core::core_transform_component(
+        &mut r, &params, chroma_w, chroma_h, using_ac, is_intra,
+    )?;
+
+    let y_data = idwt(&y_py, wavelet);
+    let u_data = idwt(&u_py, wavelet);
+    let v_data = idwt(&v_py, wavelet);
+
+    let y = trim_clip_offset(&y_data, luma_w as usize, luma_h as usize, sequence.luma_depth);
     let u = trim_clip_offset(
         &u_data,
         chroma_w as usize,

@@ -124,12 +124,17 @@ impl DiracDecoder {
                     self.pending_codes.pop_front();
                     return Ok(Some(decoded_to_video_frame(&pic, &seq)));
                 }
-                Err(PictureError::CoreSyntaxNotImplemented)
-                | Err(PictureError::InterNotImplemented) => {
+                Err(PictureError::InterNotImplemented) => {
+                    // Skip inter pictures until OBMC lands; propagate
+                    // as a non-fatal NeedMore so the pipeline can
+                    // continue with future intra pictures.
+                    self.pending.pop_front();
+                    self.pending_codes.pop_front();
+                    continue;
+                }
+                Err(PictureError::CoreSyntaxNotImplemented) => {
                     return Err(Error::unsupported(
-                        "dirac decoder: picture decode not yet implemented for \
-                         this parse code (core-syntax / inter). Only intra \
-                         low-delay (VC-2) pictures are supported.",
+                        "dirac decoder: unsupported core-syntax parse code",
                     ));
                 }
                 Err(e) => {

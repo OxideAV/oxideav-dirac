@@ -41,6 +41,8 @@ pub mod bits;
 pub mod decoder;
 pub mod parse_info;
 pub mod picture;
+pub mod picture_core;
+pub mod picture_inter;
 pub mod quant;
 pub mod sequence;
 pub mod stream;

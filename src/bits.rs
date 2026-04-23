@@ -54,6 +54,26 @@ impl<'a> BitReader<'a> {
         self.byte_pos
     }
 
+    /// Skip ahead to `new_pos` (in bytes). Used after consuming a
+    /// length-prefixed sub-block whose internal parser tracks its own
+    /// byte position. `new_pos` must be >= the current byte position.
+    pub fn skip_to(&mut self, new_pos: usize) {
+        if new_pos < self.byte_pos {
+            return;
+        }
+        self.byte_pos = new_pos;
+        self.next_bit = -1;
+        if new_pos >= self.data.len() {
+            self.eof = true;
+        }
+    }
+
+    /// Raw byte slice backing the reader — useful when feeding a
+    /// sub-block to an arithmetic decoder at the current byte position.
+    pub fn data(&self) -> &'a [u8] {
+        self.data
+    }
+
     /// Number of bits remaining in the slice from the cursor's point of
     /// view. Zero once the reader has exhausted the input.
     pub fn bits_remaining(&self) -> usize {
