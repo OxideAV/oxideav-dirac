@@ -31,7 +31,9 @@ pub mod decoder;
 pub mod parse_info;
 pub mod sequence;
 pub mod stream;
+pub mod subband;
 pub mod video_format;
+pub mod wavelet;
 
 use oxideav_codec::{CodecInfo, CodecRegistry};
 use oxideav_core::{CodecCapabilities, CodecId, CodecTag};
