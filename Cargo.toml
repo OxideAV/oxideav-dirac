@@ -1,0 +1,18 @@
+[package]
+name = "oxideav-dirac"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+repository = "https://github.com/OxideAV/oxideav-dirac"
+authors = ["Mark Karpeles"]
+description = "Pure-Rust Dirac / VC-2 (BBC) wavelet video codec for oxideav"
+
+readme = "README.md"
+homepage = "https://github.com/OxideAV/oxideav-dirac"
+keywords = ["multimedia", "video", "dirac", "vc2", "codec"]
+categories = ["multimedia::encoding", "multimedia::video"]
+
+[dependencies]
+oxideav-core = "0.1"
+oxideav-codec = "0.1"
