@@ -535,4 +535,75 @@ mod tests {
         // HH at any position → 0.
         assert_eq!(sign_predict(&b, Orient::HH, 2, 2), 0);
     }
+
+    /// End-to-end smoke test for the VLC path: encode a 2x2 subband's
+    /// coefficients as signed exp-Golomb, feed them through
+    /// `decode_subband_vlc` and check the recovered values (after
+    /// inverse-quantisation with q=0, which is identity for |x| > 0).
+    #[test]
+    fn vlc_decode_recovers_coefficients() {
+        // Bits for sint 2, 0, -1, 3  in exp-Golomb (signed):
+        //   2  -> 0 1 1 0        (4 bits)
+        //   0  -> 1               (1 bit)
+        //   -1 -> 0 0 1 1        (4 bits)
+        //   3  -> 0 0 0 0 1 0 0   (7 bits)
+        // Concatenated: 0110 1 0011 0000100 = "0110100110000100"
+        let bits = "0110100110000100";
+        let mut byte_buf: Vec<u8> = Vec::new();
+        let padded = {
+            let mut s = bits.to_string();
+            while s.len() % 8 != 0 {
+                s.push('0');
+            }
+            s
+        };
+        for chunk in padded.as_bytes().chunks(8) {
+            let mut b = 0u8;
+            for c in chunk {
+                b = (b << 1) | if *c == b'1' { 1 } else { 0 };
+            }
+            byte_buf.push(b);
+        }
+
+        let params = CoreTransformParameters {
+            wavelet: WaveletFilter::LeGall5_3,
+            dwt_depth: 1,
+            codeblocks: vec![(1, 1), (1, 1)],
+            codeblock_mode: 0,
+            quant_matrix: None,
+        };
+        // Build a 2x2 LL band at level 0.
+        let mut py = vec![
+            [
+                SubbandData::new(2, 2),
+                SubbandData::new(0, 0),
+                SubbandData::new(0, 0),
+                SubbandData::new(0, 0),
+            ],
+            [
+                SubbandData::new(0, 0),
+                SubbandData::new(2, 2),
+                SubbandData::new(2, 2),
+                SubbandData::new(2, 2),
+            ],
+        ];
+        let total_bits = (byte_buf.len() as u64) * 8;
+        decode_subband_vlc(
+            &byte_buf,
+            total_bits,
+            &mut py,
+            0,
+            Orient::LL,
+            2,
+            2,
+            &params,
+            0,
+        )
+        .unwrap();
+        let ll = &py[0][0];
+        assert_eq!(ll.get(0, 0), 2);
+        assert_eq!(ll.get(0, 1), 0);
+        assert_eq!(ll.get(1, 0), -1);
+        assert_eq!(ll.get(1, 1), 3);
+    }
 }
