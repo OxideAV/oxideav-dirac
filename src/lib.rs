@@ -27,12 +27,17 @@
 //! * **VC-2 LD intra pictures** (parse codes 0xC8 / 0xCC) — full
 //!   coefficient unpack, intra DC prediction, IDWT, output offset.
 //! * **VC-2 HQ intra pictures** (parse codes 0xE8 / 0xEC) — same,
-//!   minus the DC prediction. A 64x64 ffmpeg testsrc clip produces
-//!   pixel-for-pixel-identical output to ffmpeg's reference decoder.
+//!   minus the DC prediction. A multi-frame 128x96 ffmpeg testsrc
+//!   clip decodes pixel-for-pixel-identically to ffmpeg.
+//! * **Core-syntax intra pictures** (parse code 0x08 / 0x0C) — §13.4
+//!   per-subband codeblock unpacking, with both the VLC and the
+//!   arithmetic-coded paths (zero-parent / zero-neighbourhood /
+//!   sign-prediction contexts per Table 13.1). End-to-end testing
+//!   relies on a third-party Dirac encoder; ffmpeg only emits VC-2.
 //!
-//! Still unsupported (planned): core-syntax (arithmetic-coded)
-//! pictures, inter pictures + OBMC motion compensation, v3 extended
-//! transform parameters (horizontal-only transforms).
+//! Still unsupported (planned): inter pictures + OBMC motion
+//! compensation (parsing scaffold exists), v3 extended transform
+//! parameters (horizontal-only transforms).
 
 #![allow(clippy::needless_range_loop)]
 
