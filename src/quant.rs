@@ -36,32 +36,28 @@ pub fn quant_factor(q: u32) -> u32 {
     }
 }
 
-/// `quant_offset(q)` (§13.2.1). The intra / inter split depends on the
-/// picture type so callers pass it explicitly rather than snooping on
-/// global state.
-pub fn quant_offset(q: u32, is_intra: bool) -> u32 {
+/// `quant_offset(q)` per VC-2 §13.3.2 (SMPTE ST 2042-1:2022). The
+/// 2008 Dirac spec had an intra / inter split; VC-2 collapsed both
+/// branches into a single formula. Since this crate currently
+/// supports only intra pictures the distinction is moot either way.
+pub fn quant_offset(q: u32) -> u32 {
     if q == 0 {
-        return 1;
-    }
-    if is_intra {
-        if q == 1 {
-            2
-        } else {
-            (quant_factor(q) + 1) / 2
-        }
+        1
+    } else if q == 1 {
+        2
     } else {
-        (quant_factor(q) * 3 + 4) / 8
+        (quant_factor(q) + 1) / 2
     }
 }
 
-/// `inverse_quant(qcoeff, q)` (§13.2).
-pub fn inverse_quant(qcoeff: i32, q: u32, is_intra: bool) -> i32 {
+/// `inverse_quant(qcoeff, q)` (§13.3.1).
+pub fn inverse_quant(qcoeff: i32, q: u32) -> i32 {
     if qcoeff == 0 {
         return 0;
     }
     let mag = qcoeff.unsigned_abs() as u64;
     let qf = quant_factor(q) as u64;
-    let off = quant_offset(q, is_intra) as u64;
+    let off = quant_offset(q) as u64;
     let mag = (mag * qf + off + 2) / 4;
     if qcoeff < 0 {
         -(mag as i32)
@@ -216,17 +212,15 @@ mod tests {
 
     #[test]
     fn inverse_quant_identity_on_zero() {
-        assert_eq!(inverse_quant(0, 0, true), 0);
-        assert_eq!(inverse_quant(0, 5, false), 0);
+        assert_eq!(inverse_quant(0, 0), 0);
+        assert_eq!(inverse_quant(0, 5), 0);
     }
 
     #[test]
     fn inverse_quant_trivial_q0() {
-        // With q=0, qf=4, off=1; so
-        //   mag = (|x|*4 + 1 + 2)/4 = |x| + (3/4) ≈ |x|
-        // We model the same equation here to spot-check.
-        assert_eq!(inverse_quant(5, 0, true), 5);
-        assert_eq!(inverse_quant(-3, 0, true), -3);
+        // With q=0, qf=4, off=1: mag = (|x|*4 + 1 + 2)/4 = |x| (rounded).
+        assert_eq!(inverse_quant(5, 0), 5);
+        assert_eq!(inverse_quant(-3, 0), -3);
     }
 
     #[test]

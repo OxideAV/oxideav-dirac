@@ -1,38 +1,44 @@
-//! Dirac decoder front-end (foundation pass).
+//! Dirac decoder front-end.
 //!
-//! At this stage the decoder parses parse-info framing and sequence
-//! headers but does **not** produce decoded pixels — the wavelet
-//! transform and coefficient unpacking are future work. Any picture
-//! data unit currently returns `Error::Unsupported` so callers can
-//! treat this crate as "probe + parse" while the heavy lifting lands
-//! in subsequent commits.
-//!
-//! The decoder's state machine:
+//! State machine:
 //! 1. Concatenate every incoming packet into a growing buffer.
 //! 2. On each `receive_frame`, walk the buffer via
 //!    [`crate::stream::DataUnitIter`].
 //! 3. Sequence headers are parsed and cached.
-//! 4. Pictures return `Unsupported` with a descriptive message naming
-//!    which feature is missing (wavelet transform, arithmetic
-//!    coefficient decode, motion compensation, …).
+//! 4. Low-delay intra pictures are decoded to a `VideoFrame`.
+//! 5. Core-syntax (arithmetic-coded) and inter pictures still return
+//!    `Error::Unsupported` for now — motion compensation and the core
+//!    entropy codec are the next milestones.
 
 use oxideav_codec::Decoder;
-use oxideav_core::{CodecId, CodecParameters, Error, Frame, Packet, Result};
+use oxideav_core::{
+    CodecId, CodecParameters, Error, Frame, Packet, PixelFormat, Result,
+    VideoFrame, VideoPlane,
+};
 
+use crate::picture::{decode_picture, DecodedPicture, PictureError};
 use crate::sequence::{parse_sequence_header, SequenceHeader};
 use crate::stream::DataUnitIter;
+use crate::video_format::ChromaFormat;
 
 pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     Ok(Box::new(DiracDecoder::new(params.codec_id.clone())))
 }
 
-/// Minimal Dirac decoder scaffold. See module docs for the current
-/// capability surface.
+/// Decoder scaffold. See module docs.
 pub struct DiracDecoder {
     codec_id: CodecId,
     buffer: Vec<u8>,
     last_sequence: Option<SequenceHeader>,
+    /// Picture data units pending decode; as `receive_frame` is called
+    /// we pop the front one.
+    pending: std::collections::VecDeque<Vec<u8>>,
+    /// Parse codes for each pending payload.
+    pending_codes: std::collections::VecDeque<u8>,
     eof: bool,
+    /// How far into `buffer` we've already scanned; used so we don't
+    /// re-parse units after calling `scan()` repeatedly.
+    scan_cursor: usize,
 }
 
 impl DiracDecoder {
@@ -41,7 +47,10 @@ impl DiracDecoder {
             codec_id,
             buffer: Vec::new(),
             last_sequence: None,
+            pending: std::collections::VecDeque::new(),
+            pending_codes: std::collections::VecDeque::new(),
             eof: false,
+            scan_cursor: 0,
         }
     }
 
@@ -52,17 +61,23 @@ impl DiracDecoder {
         self.last_sequence.as_ref()
     }
 
-    /// Walk the accumulated buffer, updating `last_sequence` for every
-    /// sequence header seen. Returns `Err` on a malformed sequence
-    /// header; returns `Ok(())` with no output on pictures (currently
-    /// unimplemented).
+    /// Walk any new bytes appended to the buffer. We remember how far
+    /// we've walked so subsequent calls don't reprocess old units.
     fn scan(&mut self) -> Result<()> {
-        // Walk in-place; we don't consume bytes yet because we don't
-        // produce frames. A future commit will advance the buffer
-        // cursor past fully-decoded units.
-        for unit in DataUnitIter::new(&self.buffer) {
-            if unit.parse_info.is_seq_header() {
-                match parse_sequence_header(unit.payload) {
+        let start = self.scan_cursor;
+        // Snapshot each unit (pi + payload bytes) before processing so
+        // we can mutate self after the walker's borrow ends.
+        let snap: Vec<(u8, usize, Vec<u8>)> = DataUnitIter::new(&self.buffer[start..])
+            .map(|u| (u.parse_info.parse_code, u.pi_offset, u.payload.to_vec()))
+            .collect();
+        for (parse_code, pi_offset, payload) in snap {
+            let pi = crate::parse_info::ParseInfo {
+                parse_code,
+                next_parse_offset: 0,
+                previous_parse_offset: 0,
+            };
+            if pi.is_seq_header() {
+                match parse_sequence_header(&payload) {
                     Ok(sh) => {
                         self.last_sequence = Some(sh);
                     }
@@ -72,9 +87,56 @@ impl DiracDecoder {
                         )));
                     }
                 }
+            } else if pi.is_picture() {
+                self.pending.push_back(payload.clone());
+                self.pending_codes.push_back(parse_code);
             }
+            let payload_end = start + pi_offset + 13 + payload.len();
+            self.scan_cursor = payload_end.max(self.scan_cursor);
         }
         Ok(())
+    }
+
+    fn try_decode_next(&mut self) -> Result<Option<VideoFrame>> {
+        loop {
+            let payload = match self.pending.front() {
+                Some(p) => p.clone(),
+                None => return Ok(None),
+            };
+            let code = self.pending_codes.front().copied().unwrap_or(0);
+            let seq = match self.last_sequence.as_ref() {
+                Some(s) => s.clone(),
+                None => {
+                    // Drop pictures that arrive before any seq header.
+                    self.pending.pop_front();
+                    self.pending_codes.pop_front();
+                    continue;
+                }
+            };
+            let pi = crate::parse_info::ParseInfo {
+                parse_code: code,
+                next_parse_offset: 0,
+                previous_parse_offset: 0,
+            };
+            match decode_picture(&payload, pi, &seq) {
+                Ok(pic) => {
+                    self.pending.pop_front();
+                    self.pending_codes.pop_front();
+                    return Ok(Some(decoded_to_video_frame(&pic, &seq)));
+                }
+                Err(PictureError::CoreSyntaxNotImplemented)
+                | Err(PictureError::InterNotImplemented) => {
+                    return Err(Error::unsupported(
+                        "dirac decoder: picture decode not yet implemented for \
+                         this parse code (core-syntax / inter). Only intra \
+                         low-delay (VC-2) pictures are supported.",
+                    ));
+                }
+                Err(e) => {
+                    return Err(Error::invalid(format!("dirac: picture decode: {e}")));
+                }
+            }
+        }
     }
 }
 
@@ -90,20 +152,70 @@ impl Decoder for DiracDecoder {
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
-        // Pictures are not yet decoded. Defer with a descriptive error;
-        // higher layers (CLI probe, job graph) can detect this and skip
-        // past it rather than aborting.
-        if self.last_sequence.is_none() {
+        if self.last_sequence.is_none() && self.pending.is_empty() {
             return Err(Error::NeedMore);
         }
-        Err(Error::unsupported(
-            "dirac decoder: picture decode not yet implemented \
-             (foundation pass — parse-info + sequence header only)",
-        ))
+        match self.try_decode_next()? {
+            Some(vf) => Ok(Frame::Video(vf)),
+            None => {
+                if self.eof {
+                    Err(Error::Eof)
+                } else {
+                    Err(Error::NeedMore)
+                }
+            }
+        }
     }
 
     fn flush(&mut self) -> Result<()> {
         self.eof = true;
         self.scan()
+    }
+}
+
+/// Map a decoded Dirac picture (Y/U/V as `Vec<i32>` 0..2^depth) into
+/// an oxideav-core `VideoFrame`. 8-bit depths use `Yuv*P` formats;
+/// deeper bit depths (10/12-bit video) fall back to packing the low
+/// byte of each sample into 8-bit planes for now — a follow-up will
+/// produce `Yuv420P10Le` etc.
+fn decoded_to_video_frame(pic: &DecodedPicture, seq: &SequenceHeader) -> VideoFrame {
+    let format = match (seq.video_params.chroma_format, pic.luma_depth) {
+        (ChromaFormat::Yuv420, d) if d <= 8 => PixelFormat::Yuv420P,
+        (ChromaFormat::Yuv422, d) if d <= 8 => PixelFormat::Yuv422P,
+        (ChromaFormat::Yuv444, d) if d <= 8 => PixelFormat::Yuv444P,
+        // Higher bit depths: demote to 8 bits for now — better than
+        // returning Unsupported, and lets the test rig look at the
+        // actual decoded pattern.
+        (ChromaFormat::Yuv420, _) => PixelFormat::Yuv420P,
+        (ChromaFormat::Yuv422, _) => PixelFormat::Yuv422P,
+        (ChromaFormat::Yuv444, _) => PixelFormat::Yuv444P,
+    };
+    let y = plane_from_i32(&pic.y, pic.luma_width, pic.luma_depth);
+    let u = plane_from_i32(&pic.u, pic.chroma_width, pic.chroma_depth);
+    let v = plane_from_i32(&pic.v, pic.chroma_width, pic.chroma_depth);
+    VideoFrame {
+        format,
+        width: pic.luma_width as u32,
+        height: pic.luma_height as u32,
+        pts: None,
+        time_base: oxideav_core::TimeBase::new(1, 25),
+        planes: vec![y, u, v],
+    }
+}
+
+fn plane_from_i32(values: &[i32], stride: usize, depth: u32) -> VideoPlane {
+    // For depths > 8 we shift to fit into one byte per sample so the
+    // downstream VideoFrame can still be 8-bit. 8-bit data pipes
+    // through as-is.
+    let shift = depth.saturating_sub(8);
+    let mut data = Vec::with_capacity(values.len());
+    for &v in values {
+        let clamped = v.max(0).min(((1i64 << depth) - 1) as i32);
+        let byte = (clamped >> shift) as u8;
+        data.push(byte);
+    }
+    VideoPlane {
+        stride,
+        data,
     }
 }

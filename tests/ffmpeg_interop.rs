@@ -4,11 +4,11 @@
 //! * Walking the parse-info framing and spotting sequence headers.
 //! * Parsing the sequence header and extracting usable frame
 //!   dimensions + chroma format.
-//! * Driving the public `Decoder` trait far enough to parse headers
-//!   (pictures still return `Unsupported`).
+//! * Driving the public `Decoder` trait all the way to a decoded
+//!   picture (HQ-profile VC-2 intra pictures produce a `VideoFrame`).
 
 use oxideav_codec::CodecRegistry;
-use oxideav_core::{CodecId, CodecParameters, Error, Packet, TimeBase};
+use oxideav_core::{CodecId, CodecParameters, Frame, Packet, PixelFormat, TimeBase};
 use oxideav_dirac::parse_info::ParseInfo;
 use oxideav_dirac::sequence::{parse_sequence_header, PictureCodingMode};
 use oxideav_dirac::stream::DataUnitIter;
@@ -34,25 +34,15 @@ fn walker_finds_multiple_units() {
 
 #[test]
 fn sequence_header_describes_a_64x64_stream() {
-    // Our ffmpeg fixture was generated with `-f lavfi testsrc=size=64x64`
-    // at 25fps, progressive frames. The sequence header should
-    // reproduce those numbers, modulo any padding ffmpeg chose.
     let sh_unit = DataUnitIter::new(TINY)
         .find(|u| u.parse_info.is_seq_header())
         .expect("sequence header");
     let sh = parse_sequence_header(sh_unit.payload).expect("parse");
-    // 64x64 is obviously not in the Annex C tables, so it must arrive
-    // via the `custom_dimensions_flag` override on top of whichever
-    // base format ffmpeg picked. Either way the final frame size
-    // must be what we asked for.
     assert_eq!(
         (sh.video_params.frame_width, sh.video_params.frame_height),
         (64, 64)
     );
     assert_eq!(sh.picture_coding_mode, PictureCodingMode::Frames);
-    // Chroma format is encoder's choice; just require it's one of the
-    // three Dirac-supported sampling grids and that the computed
-    // picture dimensions are consistent with the subsampling ratios.
     let cf = sh.video_params.chroma_format;
     assert!(matches!(
         cf,
@@ -64,8 +54,6 @@ fn sequence_header_describes_a_64x64_stream() {
 
 #[test]
 fn parse_info_offsets_link_forward() {
-    // The first parse info's next_parse_offset should land on another
-    // BBCD prefix if non-zero.
     let pi = ParseInfo::parse(TINY, 0).expect("first parse info");
     if pi.next_parse_offset != 0 {
         let next = pi.next_parse_offset as usize;
@@ -76,24 +64,40 @@ fn parse_info_offsets_link_forward() {
     }
 }
 
+/// Drive the public `Decoder` trait: feed the whole stream, then pull
+/// the first frame. With the HQ-profile intra path implemented, this
+/// should produce a `VideoFrame` with 64x64 luma — the testsrc
+/// pattern that ffmpeg's `lavfi testsrc=size=64x64` generated.
 #[test]
-fn decoder_accepts_packets_and_reports_unsupported_picture() {
+fn decoder_produces_first_frame_from_hq_vc2_intra() {
     let mut reg = CodecRegistry::new();
     oxideav_dirac::register(&mut reg);
     let params = CodecParameters::video(CodecId::new("dirac"));
     let mut dec = reg.make_decoder(&params).expect("decoder");
     let packet = Packet::new(0, TimeBase::new(1, 25), TINY.to_vec());
     dec.send_packet(&packet).expect("send_packet");
-    // Foundation pass: picture decode returns Unsupported. We're
-    // validating that we get there cleanly, not a crash.
-    match dec.receive_frame() {
-        Err(Error::Unsupported(msg)) => {
-            assert!(msg.contains("picture decode"), "unexpected msg: {msg}");
+    let frame = dec.receive_frame().expect("receive_frame");
+    match frame {
+        Frame::Video(v) => {
+            assert_eq!(v.width, 64);
+            assert_eq!(v.height, 64);
+            // Fixture is yuv444p, 8-bit.
+            assert_eq!(v.format, PixelFormat::Yuv444P);
+            assert_eq!(v.planes.len(), 3);
+            assert_eq!(v.planes[0].data.len(), 64 * 64);
+            assert_eq!(v.planes[1].data.len(), 64 * 64);
+            assert_eq!(v.planes[2].data.len(), 64 * 64);
+            // testsrc's Y plane covers a wide range of intensities;
+            // as a sanity check we expect both dark and bright pixels.
+            let y = &v.planes[0].data;
+            let min = *y.iter().min().unwrap();
+            let max = *y.iter().max().unwrap();
+            assert!(
+                max - min > 50,
+                "expected a varied Y plane (min={min}, max={max}) — \
+                 looks like the decoded picture is flat / corrupt",
+            );
         }
-        Err(Error::NeedMore) => {
-            // Also acceptable — means we haven't hit a picture yet.
-        }
-        Ok(_) => panic!("picture decode unexpectedly succeeded"),
-        Err(other) => panic!("unexpected error: {other:?}"),
+        other => panic!("expected a video frame, got {other:?}"),
     }
 }
