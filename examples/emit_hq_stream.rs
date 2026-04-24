@@ -20,11 +20,7 @@ fn main() {
     match target {
         Some(path) => {
             std::fs::write(&path, &stream).expect("write file");
-            eprintln!(
-                "Wrote {} bytes to {}",
-                stream.len(),
-                path
-            );
+            eprintln!("Wrote {} bytes to {}", stream.len(), path);
         }
         None => {
             std::io::stdout().write_all(&stream).expect("write stdout");

@@ -111,10 +111,7 @@ pub enum ParseError {
     /// `source_sampling` was neither 0 (progressive) nor 1 (interlaced).
     UnknownScanFormat(u32),
     /// Preset frame-rate / aspect-ratio / signal-range index out of range.
-    PresetOutOfRange {
-        which: &'static str,
-        index: u32,
-    },
+    PresetOutOfRange { which: &'static str, index: u32 },
     /// `picture_coding_mode` was not 0 or 1.
     UnknownPictureCodingMode(u32),
 }
@@ -331,8 +328,8 @@ mod tests {
                                 // all 8 "custom_*_flag" booleans False (frame_size, chroma,
                                 // scan, frame_rate, par, clean, signal_range, colour_spec).
         bits.push_str("00000000");
-        bits.push_str("1"); // picture_coding_mode = 0
-                            // pad to byte
+        bits.push('1'); // picture_coding_mode = 0
+                        // pad to byte
         while bits.len() % 8 != 0 {
             bits.push('0');
         }

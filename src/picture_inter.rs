@@ -178,8 +178,8 @@ pub fn parse_picture_prediction_parameters(
     let lh = sequence.luma_height;
     let four_xbsep = 4 * luma_xbsep.max(1);
     let four_ybsep = 4 * luma_ybsep.max(1);
-    let superblocks_x = (lw + four_xbsep - 1) / four_xbsep;
-    let superblocks_y = (lh + four_ybsep - 1) / four_ybsep;
+    let superblocks_x = lw.div_ceil(four_xbsep);
+    let superblocks_y = lh.div_ceil(four_ybsep);
     let blocks_x = 4 * superblocks_x;
     let blocks_y = 4 * superblocks_y;
 
@@ -289,10 +289,7 @@ pub mod mvctx {
 
 /// Wrap `data[byte_pos..byte_pos + length]` as an arith-decoded block,
 /// then advance the outer reader past it.
-fn arith_from_reader<'a>(
-    r: &mut BitReader<'a>,
-    length: usize,
-) -> (ArithDecoder<'a>, usize) {
+fn arith_from_reader<'a>(r: &mut BitReader<'a>, length: usize) -> (ArithDecoder<'a>, usize) {
     r.byte_align();
     let start = r.byte_pos();
     let data = r.data();
@@ -371,18 +368,14 @@ fn decode_sb_splits(
     let mut bank = ContextBank::new(3);
     for ysb in 0..motion.superblocks_y {
         for xsb in 0..motion.superblocks_x {
-            let residual = dec.read_uint(
-                &mut bank,
-                &[mvctx::SB_F1, mvctx::SB_F2],
-                mvctx::SB_DATA,
-            );
+            let residual = dec.read_uint(&mut bank, &[mvctx::SB_F1, mvctx::SB_F2], mvctx::SB_DATA);
             let pred = split_prediction(motion, xsb, ysb);
             let val = (residual + pred) % 3;
             *motion.split_mut(xsb, ysb) = val;
         }
     }
     // Advance outer reader past the block.
-    drop(dec);
+    let _ = dec;
     let cur = r.byte_pos();
     r.skip_to(cur + length);
     Ok(())
@@ -429,7 +422,7 @@ fn decode_prediction_modes(
             }
         }
     }
-    drop(dec);
+    let _ = dec;
     let cur = r.byte_pos();
     r.skip_to(cur + length);
     Ok(())
@@ -569,15 +562,13 @@ fn decode_vector_elements(
                 for p in 0..block_count {
                     let bx = 4 * xsb + p * step;
                     let by = 4 * ysb + q * step;
-                    block_vector(
-                        &mut dec, &mut bank, motion, bx, by, ref_num, dirn, &follow,
-                    );
+                    block_vector(&mut dec, &mut bank, motion, bx, by, ref_num, dirn, &follow);
                     propagate(motion, bx, by, step, PropField::Vector);
                 }
             }
         }
     }
-    drop(dec);
+    let _ = dec;
     let cur = r.byte_pos();
     r.skip_to(cur + length);
     Ok(())
@@ -600,12 +591,7 @@ fn block_vector(
     if !uses || block.gmode {
         return;
     }
-    let residual = dec.read_sint(
-        bank,
-        follow,
-        mvctx::VECTOR_DATA,
-        mvctx::VECTOR_SIGN,
-    );
+    let residual = dec.read_sint(bank, follow, mvctx::VECTOR_DATA, mvctx::VECTOR_SIGN);
     let pred = mv_prediction(motion, x, y, ref_num, dirn);
     let value = residual + pred;
     let block = motion.get_block_mut(x, y);
@@ -694,7 +680,7 @@ fn decode_dc_values(
             }
         }
     }
-    drop(dec);
+    let _ = dec;
     let cur = r.byte_pos();
     r.skip_to(cur + length);
     Ok(())

@@ -66,7 +66,11 @@ pub fn interp2by2(ref_plane: &[i32], w: usize, h: usize, depth: u32) -> (Vec<i32
     let up_h = 2 * h - 1;
     // First: vertical upsampling → `ref2` (width = w, height = 2h-1).
     let mut ref2: Vec<i32> = vec![0; w * up_h];
-    let half = if depth == 0 { 1i32 } else { 1i32 << (depth - 1) };
+    let half = if depth == 0 {
+        1i32
+    } else {
+        1i32 << (depth - 1)
+    };
     let min = -half;
     let max = half - 1;
     for q in 0..up_h {
@@ -117,7 +121,14 @@ pub fn interp2by2(ref_plane: &[i32], w: usize, h: usize, depth: u32) -> (Vec<i32
 /// §15.8.10 `subpel_predict`. `(u, v)` is in units of 1 << mv_precision.
 /// When `mv_precision == 0` the caller should pick the integer pixel
 /// from the reference directly rather than calling this.
-pub fn subpel_predict(upref: &[i32], up_w: usize, up_h: usize, u: i64, v: i64, mv_precision: u32) -> i32 {
+pub fn subpel_predict(
+    upref: &[i32],
+    up_w: usize,
+    up_h: usize,
+    u: i64,
+    v: i64,
+    mv_precision: u32,
+) -> i32 {
     // Half-pel part = u >> (mv_precision - 1); sub-half remainder = u - half_part << shift.
     let shift = mv_precision - 1;
     let hu = fshr(u, shift);
@@ -212,6 +223,7 @@ pub fn v_wt(yblen: usize, ybsep: usize, yoffset: usize, j: u32, blocks_y: u32) -
 
 /// §15.8.6 `spatial_wt`. 2-D outer product of the horizontal and
 /// vertical ramp windows.
+#[allow(clippy::too_many_arguments)]
 pub fn spatial_wt(
     xblen: usize,
     yblen: usize,
@@ -253,8 +265,7 @@ pub fn global_mv(g: &GlobalParams, x: i32, y: i32) -> (i32, i32) {
     let b = g.pan_tilt;
     let a = g.zrs;
     let c = g.perspective;
-    let m: i64 =
-        (1i64 << ep) - (c.0 as i64 * x as i64 + c.1 as i64 * y as i64);
+    let m: i64 = (1i64 << ep) - (c.0 as i64 * x as i64 + c.1 as i64 * y as i64);
     let ax = a[0][0] as i64 * x as i64 + a[0][1] as i64 * y as i64;
     let ay = a[1][0] as i64 * x as i64 + a[1][1] as i64 * y as i64;
     // Spec writes `+ 2^ez * b[0]` for both coords — typo in spec; we
@@ -412,9 +423,14 @@ pub fn block_mc(
                 RefPredMode::Ref1Only => {
                     let (p1, w1, h1) = ref1_plane.expect("ref1 required");
                     let v = pixel_pred(
-                        p1, w1, h1,
+                        p1,
+                        w1,
+                        h1,
                         ref1_upref,
-                        block, 1, x, y,
+                        block,
+                        1,
+                        x,
+                        y,
                         params.is_chroma,
                         params.chroma_h_ratio,
                         params.chroma_v_ratio,
@@ -427,9 +443,14 @@ pub fn block_mc(
                 RefPredMode::Ref2Only => {
                     let (p2, w2, h2) = ref2_plane.expect("ref2 required");
                     let v = pixel_pred(
-                        p2, w2, h2,
+                        p2,
+                        w2,
+                        h2,
                         ref2_upref,
-                        block, 2, x, y,
+                        block,
+                        2,
+                        x,
+                        y,
                         params.is_chroma,
                         params.chroma_h_ratio,
                         params.chroma_v_ratio,
@@ -443,9 +464,14 @@ pub fn block_mc(
                     let (p1, w1, h1) = ref1_plane.expect("ref1 required");
                     let (p2, w2, h2) = ref2_plane.expect("ref2 required");
                     let v1 = pixel_pred(
-                        p1, w1, h1,
+                        p1,
+                        w1,
+                        h1,
                         ref1_upref,
-                        block, 1, x, y,
+                        block,
+                        1,
+                        x,
+                        y,
                         params.is_chroma,
                         params.chroma_h_ratio,
                         params.chroma_v_ratio,
@@ -453,9 +479,14 @@ pub fn block_mc(
                         &motion.global1,
                     );
                     let v2 = pixel_pred(
-                        p2, w2, h2,
+                        p2,
+                        w2,
+                        h2,
                         ref2_upref,
-                        block, 2, x, y,
+                        block,
+                        2,
+                        x,
+                        y,
                         params.is_chroma,
                         params.chroma_h_ratio,
                         params.chroma_v_ratio,
@@ -494,8 +525,10 @@ pub fn motion_compensate(
         (true, Some((p, w, h))) => Some(interp2by2(p, w, h, depth)),
         _ => None,
     };
-    let ref1_up_ref: Option<(&[i32], usize, usize)> = ref1_up.as_ref().map(|(v, w, h)| (v.as_slice(), *w, *h));
-    let ref2_up_ref: Option<(&[i32], usize, usize)> = ref2_up.as_ref().map(|(v, w, h)| (v.as_slice(), *w, *h));
+    let ref1_up_ref: Option<(&[i32], usize, usize)> =
+        ref1_up.as_ref().map(|(v, w, h)| (v.as_slice(), *w, *h));
+    let ref2_up_ref: Option<(&[i32], usize, usize)> =
+        ref2_up.as_ref().map(|(v, w, h)| (v.as_slice(), *w, *h));
     for j in 0..params.blocks_y {
         for i in 0..params.blocks_x {
             block_mc(
@@ -512,7 +545,11 @@ pub fn motion_compensate(
         }
     }
     let bit_depth = params.bit_depth();
-    let half = if bit_depth == 0 { 1i32 } else { 1i32 << (bit_depth - 1) };
+    let half = if bit_depth == 0 {
+        1i32
+    } else {
+        1i32 << (bit_depth - 1)
+    };
     let lo = -half;
     let hi = half - 1;
     for y in 0..params.len_y {
@@ -550,10 +587,7 @@ mod tests {
         // (constraint xblen <= 2*xbsep → xbsep >= 8 when overlap=8).
         // Pick xbsep=8 → xblen=16.
         let hwt = h_wt(16, 8, 4, 1, 4);
-        assert_eq!(
-            hwt,
-            vec![1, 2, 3, 4, 4, 5, 6, 7, 7, 6, 5, 4, 4, 3, 2, 1]
-        );
+        assert_eq!(hwt, vec![1, 2, 3, 4, 4, 5, 6, 7, 7, 6, 5, 4, 4, 3, 2, 1]);
     }
 
     #[test]
@@ -582,7 +616,7 @@ mod tests {
 
     #[test]
     fn interp2by2_copies_even_coordinates() {
-        let r: Vec<i32> = (0..16).map(|i| i as i32).collect();
+        let r: Vec<i32> = (0..16).collect();
         let (up, w, h) = interp2by2(&r, 4, 4, 8);
         assert_eq!((w, h), (7, 7));
         // Even, even coordinates are copies.
@@ -681,13 +715,7 @@ mod tests {
             chroma_depth: 8,
         };
         let mut pic = vec![0i32; w * h];
-        motion_compensate(
-            &mut pic,
-            &params,
-            &motion,
-            Some((&ref_plane, w, h)),
-            None,
-        );
+        motion_compensate(&mut pic, &params, &motion, Some((&ref_plane, w, h)), None);
         // With MV=0 and residue=0, the motion-compensated picture
         // should match the reference exactly across the interior.
         // The ramp is within the 8-bit signed range so no clipping.

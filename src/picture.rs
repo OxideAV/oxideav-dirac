@@ -25,9 +25,7 @@ use crate::bits::BitReader;
 use crate::parse_info::ParseInfo;
 use crate::quant::{inverse_quant, slice_quantisers, QuantMatrix};
 use crate::sequence::SequenceHeader;
-use crate::subband::{
-    init_pyramid, padded_component_dims, subband_dims, Orient, SubbandData,
-};
+use crate::subband::{init_pyramid, padded_component_dims, subband_dims, Orient, SubbandData};
 use crate::wavelet::{idwt, WaveletFilter};
 
 /// A single fully-decoded picture: Y / U / V plane arrays (one signed
@@ -276,11 +274,8 @@ fn decode_low_delay_picture(
 
     // §12.3 wavelet_transform: for intra pictures, no zero_residual flag.
     r.byte_align();
-    let params = parse_transform_parameters(
-        &mut r,
-        profile,
-        sequence.parse_parameters.version_major,
-    )?;
+    let params =
+        parse_transform_parameters(&mut r, profile, sequence.parse_parameters.version_major)?;
 
     r.byte_align();
 
@@ -293,10 +288,8 @@ fn decode_low_delay_picture(
     let mut u_py = init_pyramid(chroma_w, chroma_h, params.dwt_depth);
     let mut v_py = init_pyramid(chroma_w, chroma_h, params.dwt_depth);
 
-    let mut luma_dims: Vec<(usize, usize)> =
-        Vec::with_capacity(params.dwt_depth as usize + 1);
-    let mut chroma_dims: Vec<(usize, usize)> =
-        Vec::with_capacity(params.dwt_depth as usize + 1);
+    let mut luma_dims: Vec<(usize, usize)> = Vec::with_capacity(params.dwt_depth as usize + 1);
+    let mut chroma_dims: Vec<(usize, usize)> = Vec::with_capacity(params.dwt_depth as usize + 1);
     for level in 0..=params.dwt_depth {
         luma_dims.push(subband_dims(luma_w, luma_h, params.dwt_depth, level));
         chroma_dims.push(subband_dims(chroma_w, chroma_h, params.dwt_depth, level));
@@ -342,10 +335,8 @@ fn decode_low_delay_picture(
     let u_data = idwt(&u_py, params.wavelet);
     let v_data = idwt(&v_py, params.wavelet);
 
-    let (_luma_pw, _luma_ph) =
-        padded_component_dims(luma_w, luma_h, params.dwt_depth);
-    let (_chroma_pw, _chroma_ph) =
-        padded_component_dims(chroma_w, chroma_h, params.dwt_depth);
+    let (_luma_pw, _luma_ph) = padded_component_dims(luma_w, luma_h, params.dwt_depth);
+    let (_chroma_pw, _chroma_ph) = padded_component_dims(chroma_w, chroma_h, params.dwt_depth);
     let y = trim_clip_offset(
         &y_data,
         luma_w as usize,
@@ -413,12 +404,10 @@ fn decode_core_syntax_picture(
             let _retd = r.read_sint();
         }
         r.byte_align();
-        let pred = crate::picture_inter::parse_picture_prediction_parameters(
-            &mut r, sequence, num_refs,
-        )?;
+        let pred =
+            crate::picture_inter::parse_picture_prediction_parameters(&mut r, sequence, num_refs)?;
         r.byte_align();
-        let motion =
-            crate::picture_inter::decode_block_motion_data(&mut r, &pred, num_refs)?;
+        let motion = crate::picture_inter::decode_block_motion_data(&mut r, &pred, num_refs)?;
         r.byte_align();
         Some(InterDecodeContext {
             ref1_num,
@@ -499,9 +488,7 @@ fn decode_core_syntax_picture(
         let ref1 = find_ref(references, ctx.ref1_num)
             .ok_or(PictureError::MissingReference(ctx.ref1_num))?;
         let ref2_pic = match ctx.ref2_num {
-            Some(n) => Some(
-                find_ref(references, n).ok_or(PictureError::MissingReference(n))?,
-            ),
+            Some(n) => Some(find_ref(references, n).ok_or(PictureError::MissingReference(n))?),
             None => None,
         };
         motion_compensate_all(
@@ -560,7 +547,11 @@ fn crop_to(big: &SubbandData, w: usize, h: usize) -> Vec<i32> {
 }
 
 fn clip_plane(plane: &mut [i32], depth: u32) {
-    let half = if depth == 0 { 1i32 } else { 1i32 << (depth - 1) };
+    let half = if depth == 0 {
+        1i32
+    } else {
+        1i32 << (depth - 1)
+    };
     let lo = -half;
     let hi = half - 1;
     for v in plane.iter_mut() {
@@ -569,7 +560,11 @@ fn clip_plane(plane: &mut [i32], depth: u32) {
 }
 
 fn offset_plane(plane: &[i32], depth: u32) -> Vec<i32> {
-    let half = if depth == 0 { 1i32 } else { 1i32 << (depth - 1) };
+    let half = if depth == 0 {
+        1i32
+    } else {
+        1i32 << (depth - 1)
+    };
     plane.iter().map(|v| v + half).collect()
 }
 
@@ -693,8 +688,8 @@ fn parse_transform_parameters(
     major_version: u32,
 ) -> Result<TransformParameters, PictureError> {
     let w_idx = r.read_uint();
-    let wavelet = WaveletFilter::from_index(w_idx)
-        .ok_or(PictureError::UnknownWaveletIndex(w_idx))?;
+    let wavelet =
+        WaveletFilter::from_index(w_idx).ok_or(PictureError::UnknownWaveletIndex(w_idx))?;
     let dwt_depth = r.read_uint();
     if dwt_depth > 6 {
         return Err(PictureError::UnsupportedDwtDepth(dwt_depth));
@@ -790,20 +785,62 @@ fn decode_ld_slice(
 
     {
         let mut f = Funnel::new(r, slice_y_length);
-        decode_luma_band(&mut f, 0, Orient::LL, sx, sy, params, y_py, luma_dims, &q_per_level);
+        decode_luma_band(
+            &mut f,
+            0,
+            Orient::LL,
+            sx,
+            sy,
+            params,
+            y_py,
+            luma_dims,
+            &q_per_level,
+        );
         for level in 1..=params.dwt_depth {
             for orient in [Orient::HL, Orient::LH, Orient::HH] {
-                decode_luma_band(&mut f, level, orient, sx, sy, params, y_py, luma_dims, &q_per_level);
+                decode_luma_band(
+                    &mut f,
+                    level,
+                    orient,
+                    sx,
+                    sy,
+                    params,
+                    y_py,
+                    luma_dims,
+                    &q_per_level,
+                );
             }
         }
         f.flush();
     }
     {
         let mut f = Funnel::new(r, chroma_bits);
-        decode_chroma_pair(&mut f, 0, Orient::LL, sx, sy, params, u_py, v_py, chroma_dims, &q_per_level);
+        decode_chroma_pair(
+            &mut f,
+            0,
+            Orient::LL,
+            sx,
+            sy,
+            params,
+            u_py,
+            v_py,
+            chroma_dims,
+            &q_per_level,
+        );
         for level in 1..=params.dwt_depth {
             for orient in [Orient::HL, Orient::LH, Orient::HH] {
-                decode_chroma_pair(&mut f, level, orient, sx, sy, params, u_py, v_py, chroma_dims, &q_per_level);
+                decode_chroma_pair(
+                    &mut f,
+                    level,
+                    orient,
+                    sx,
+                    sy,
+                    params,
+                    u_py,
+                    v_py,
+                    chroma_dims,
+                    &q_per_level,
+                );
             }
         }
         f.flush();
@@ -851,10 +888,30 @@ fn decode_hq_slice(
             1 => u_py,
             _ => v_py,
         };
-        decode_hq_component_band(&mut f, 0, Orient::LL, sx, sy, params, py, dims, &q_per_level);
+        decode_hq_component_band(
+            &mut f,
+            0,
+            Orient::LL,
+            sx,
+            sy,
+            params,
+            py,
+            dims,
+            &q_per_level,
+        );
         for level in 1..=params.dwt_depth {
             for orient in [Orient::HL, Orient::LH, Orient::HH] {
-                decode_hq_component_band(&mut f, level, orient, sx, sy, params, py, dims, &q_per_level);
+                decode_hq_component_band(
+                    &mut f,
+                    level,
+                    orient,
+                    sx,
+                    sy,
+                    params,
+                    py,
+                    dims,
+                    &q_per_level,
+                );
             }
         }
         f.flush();
@@ -971,13 +1028,12 @@ fn mean3(a: i32, b: i32, c: i32) -> i32 {
 /// Crop the IDWT output to the real component size (§15.7), clip to
 /// `[-2^(depth-1), 2^(depth-1) - 1]` (§15.9), and offset by
 /// `2^(depth-1)` for non-negative output (§15.10).
-fn trim_clip_offset(
-    big: &SubbandData,
-    out_w: usize,
-    out_h: usize,
-    depth: u32,
-) -> Vec<i32> {
-    let half = if depth == 0 { 1i32 } else { 1i32 << (depth - 1) };
+fn trim_clip_offset(big: &SubbandData, out_w: usize, out_h: usize, depth: u32) -> Vec<i32> {
+    let half = if depth == 0 {
+        1i32
+    } else {
+        1i32 << (depth - 1)
+    };
     let min = -half;
     let max = half - 1;
     let mut out = Vec::with_capacity(out_w * out_h);

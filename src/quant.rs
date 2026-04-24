@@ -46,7 +46,7 @@ pub fn quant_offset(q: u32) -> u32 {
     } else if q == 1 {
         2
     } else {
-        (quant_factor(q) + 1) / 2
+        quant_factor(q).div_ceil(2)
     }
 }
 
@@ -156,9 +156,7 @@ impl QuantMatrix {
                 }
             }
             _ => {
-                for (i, &(hl, lh, hh)) in
-                    hl_row.iter().take(dwt_depth as usize).enumerate()
-                {
+                for (i, &(hl, lh, hh)) in hl_row.iter().take(dwt_depth as usize).enumerate() {
                     let _level = i + 1;
                     levels.push([0, hl, lh, hh]);
                 }

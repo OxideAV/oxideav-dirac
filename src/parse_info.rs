@@ -54,12 +54,8 @@ impl ParseInfo {
             return None;
         }
         let parse_code = data[pos + 4];
-        let next_parse_offset = u32::from_be_bytes([
-            data[pos + 5],
-            data[pos + 6],
-            data[pos + 7],
-            data[pos + 8],
-        ]);
+        let next_parse_offset =
+            u32::from_be_bytes([data[pos + 5], data[pos + 6], data[pos + 7], data[pos + 8]]);
         let previous_parse_offset = u32::from_be_bytes([
             data[pos + 9],
             data[pos + 10],
@@ -80,10 +76,7 @@ impl ParseInfo {
         let end = data.len().saturating_sub(3);
         let mut i = pos;
         while i < end {
-            if data[i] == b'B'
-                && data[i + 1] == b'B'
-                && data[i + 2] == b'C'
-                && data[i + 3] == b'D'
+            if data[i] == b'B' && data[i + 1] == b'B' && data[i + 2] == b'C' && data[i + 3] == b'D'
             {
                 return Some(i);
             }

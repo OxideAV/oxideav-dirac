@@ -15,13 +15,11 @@
 
 use oxideav_codec::Decoder;
 use oxideav_core::{
-    CodecId, CodecParameters, Error, Frame, Packet, PixelFormat, Result, TimeBase,
-    VideoFrame, VideoPlane,
+    CodecId, CodecParameters, Error, Frame, Packet, PixelFormat, Result, TimeBase, VideoFrame,
+    VideoPlane,
 };
 
-use crate::picture::{
-    decode_picture_with_refs, DecodedPicture, PictureError, ReferencePicture,
-};
+use crate::picture::{decode_picture_with_refs, DecodedPicture, PictureError, ReferencePicture};
 use crate::sequence::{parse_sequence_header, SequenceHeader};
 use crate::stream::DataUnitIter;
 use crate::video_format::ChromaFormat;
@@ -114,17 +112,14 @@ impl DiracDecoder {
                         self.last_sequence = Some(sh);
                     }
                     Err(e) => {
-                        return Err(Error::invalid(format!(
-                            "dirac: bad sequence header: {e}"
-                        )));
+                        return Err(Error::invalid(format!("dirac: bad sequence header: {e}")));
                     }
                 }
             } else if pi.is_picture() {
                 self.pending.push_back(payload.clone());
                 self.pending_codes.push_back(parse_code);
                 self.pending_pts.push_back(self.last_packet_pts);
-                self.pending_time_base
-                    .push_back(self.last_packet_time_base);
+                self.pending_time_base.push_back(self.last_packet_time_base);
             }
             let payload_end = start + pi_offset + 13 + payload.len();
             self.scan_cursor = payload_end.max(self.scan_cursor);
@@ -180,8 +175,7 @@ impl DiracDecoder {
                     } else {
                         pkt_tb
                     };
-                    let effective_pts =
-                        pkt_pts.or(Some(pic.picture_number as i64));
+                    let effective_pts = pkt_pts.or(Some(pic.picture_number as i64));
                     return Ok(Some(decoded_to_video_frame(
                         &pic,
                         &seq,
@@ -357,12 +351,7 @@ fn decoded_to_video_frame(
 /// The `stride` we return is the byte stride of one row — `width` for
 /// 8-bit formats and `2 * width` for 10/12-bit formats, since each
 /// sample occupies two bytes.
-fn plane_from_i32(
-    values: &[i32],
-    width: usize,
-    source_depth: u32,
-    store_depth: u32,
-) -> VideoPlane {
+fn plane_from_i32(values: &[i32], width: usize, source_depth: u32, store_depth: u32) -> VideoPlane {
     match store_depth {
         8 => {
             // Source might be >8 bits; right-shift the excess so the
@@ -378,7 +367,10 @@ fn plane_from_i32(
                 let clamped = v.clamp(0, max_src);
                 data.push((clamped >> shift) as u8);
             }
-            VideoPlane { stride: width, data }
+            VideoPlane {
+                stride: width,
+                data,
+            }
         }
         10 | 12 => {
             // Store one 16-bit LE sample per coefficient, masking to
@@ -461,10 +453,7 @@ mod tests {
         let values = [0i32, 1023, 512, 1];
         let p = plane_from_i32(&values, 4, 10, 10);
         assert_eq!(p.stride, 8);
-        assert_eq!(
-            p.data,
-            vec![0x00, 0x00, 0xFF, 0x03, 0x00, 0x02, 0x01, 0x00]
-        );
+        assert_eq!(p.data, vec![0x00, 0x00, 0xFF, 0x03, 0x00, 0x02, 0x01, 0x00]);
     }
 
     /// A 12-bit source clipped down into a 10-bit plane right-shifts

@@ -252,8 +252,7 @@ fn decode_subband_vlc(
                 let next = q as i32 + delta;
                 q = if next < 0 { 0 } else { next as u32 };
             }
-            let (left, right, top, bottom) =
-                codeblock_bounds(cx, cy, cbx, cby, band_w, band_h);
+            let (left, right, top, bottom) = codeblock_bounds(cx, cy, cbx, cby, band_w, band_h);
             let band = &mut py[level as usize][orient.as_index()];
             for y in top..bottom {
                 for x in left..right {
@@ -263,8 +262,8 @@ fn decode_subband_vlc(
             }
         }
     }
-    // f lush_inputb: implicit — dropping the reader discards trailing bits.
-    drop(r);
+    // flush_inputb: implicit — dropping the reader discards trailing bits.
+    let _ = r;
     Ok(())
 }
 
@@ -315,8 +314,7 @@ fn decode_subband_ac(
                 let next = q as i32 + delta;
                 q = if next < 0 { 0 } else { next as u32 };
             }
-            let (left, right, top, bottom) =
-                codeblock_bounds(cx, cy, cbx, cby, band_w, band_h);
+            let (left, right, top, bottom) = codeblock_bounds(cx, cy, cbx, cby, band_w, band_h);
             // Split the parent (immutable) and current (mutable) bands
             // using a conditional to avoid aliasing. For level < 2
             // there's no parent — use `None`.
@@ -345,8 +343,8 @@ fn decode_subband_ac(
             }
         }
     }
-    // f lush_inputb: no-op — decoder goes out of scope.
-    drop(dec);
+    // flush_inputb: no-op — decoder goes out of scope.
+    let _ = dec;
     Ok(())
 }
 

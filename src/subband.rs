@@ -94,8 +94,8 @@ pub fn subband_dims(
     level: u32,
 ) -> (usize, usize) {
     let scale: u32 = 1 << dwt_depth;
-    let pw = scale * ((comp_width + scale - 1) / scale);
-    let ph = scale * ((comp_height + scale - 1) / scale);
+    let pw = scale * comp_width.div_ceil(scale);
+    let ph = scale * comp_height.div_ceil(scale);
     if level == 0 {
         let d = 1u32 << dwt_depth;
         ((pw / d) as usize, (ph / d) as usize)
@@ -108,25 +108,17 @@ pub fn subband_dims(
 /// Luma / chroma padded component dimensions `(padded_width,
 /// padded_height)` — the dimensions of the final IDWT output before
 /// trimming back to the real picture size (§15.7).
-pub fn padded_component_dims(
-    comp_width: u32,
-    comp_height: u32,
-    dwt_depth: u32,
-) -> (usize, usize) {
+pub fn padded_component_dims(comp_width: u32, comp_height: u32, dwt_depth: u32) -> (usize, usize) {
     let scale: u32 = 1 << dwt_depth;
-    let pw = scale * ((comp_width + scale - 1) / scale);
-    let ph = scale * ((comp_height + scale - 1) / scale);
+    let pw = scale * comp_width.div_ceil(scale);
+    let ph = scale * comp_height.div_ceil(scale);
     (pw as usize, ph as usize)
 }
 
 /// Build a freshly-zeroed 4-band entry for level 0 (LL only; HL/LH/HH
 /// are empty placeholders) and for each subsequent level 1..=dwt_depth
 /// (where only HL/LH/HH carry data). This matches `initialise_wavelet_data`.
-pub fn init_pyramid(
-    comp_width: u32,
-    comp_height: u32,
-    dwt_depth: u32,
-) -> Vec<[SubbandData; 4]> {
+pub fn init_pyramid(comp_width: u32, comp_height: u32, dwt_depth: u32) -> Vec<[SubbandData; 4]> {
     let mut levels: Vec<[SubbandData; 4]> = Vec::with_capacity(dwt_depth as usize + 1);
     // Level 0: LL only.
     let (w0, h0) = subband_dims(comp_width, comp_height, dwt_depth, 0);

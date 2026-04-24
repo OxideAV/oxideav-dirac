@@ -536,13 +536,8 @@ pub fn vh_analysis(
 /// `pyramid[0][0]` holds the level-0 LL band, and `pyramid[level][1..=3]`
 /// for `level >= 1` holds HL / LH / HH. Level 0's HL/LH/HH entries and
 /// every level's LL slot for `level >= 1` are empty placeholders.
-pub fn dwt(
-    picture: &SubbandData,
-    filter: WaveletFilter,
-    dwt_depth: u32,
-) -> Vec<[SubbandData; 4]> {
-    let mut pyramid: Vec<[SubbandData; 4]> =
-        Vec::with_capacity(dwt_depth as usize + 1);
+pub fn dwt(picture: &SubbandData, filter: WaveletFilter, dwt_depth: u32) -> Vec<[SubbandData; 4]> {
+    let mut pyramid: Vec<[SubbandData; 4]> = Vec::with_capacity(dwt_depth as usize + 1);
     for _ in 0..=dwt_depth {
         pyramid.push([
             SubbandData::new(0, 0),
@@ -613,13 +608,7 @@ mod tests {
             }
         }
         let zeros = SubbandData::new(w, h);
-        let out = vh_synth(
-            &ll,
-            &zeros,
-            &zeros,
-            &zeros,
-            WaveletFilter::LeGall5_3,
-        );
+        let out = vh_synth(&ll, &zeros, &zeros, &zeros, WaveletFilter::LeGall5_3);
         for y in 0..out.height {
             for x in 0..out.width {
                 assert_eq!(out.get(y, x), 42, "({x},{y}) got {}", out.get(y, x));
@@ -649,12 +638,7 @@ mod tests {
         );
         for y in 0..out.height {
             for x in 0..out.width {
-                assert_eq!(
-                    out.get(y, x),
-                    17,
-                    "({x},{y}) got {}",
-                    out.get(y, x)
-                );
+                assert_eq!(out.get(y, x), 17, "({x},{y}) got {}", out.get(y, x));
             }
         }
     }
@@ -668,7 +652,10 @@ mod tests {
         assert_eq!(WaveletFilter::from_index(1), Some(WaveletFilter::LeGall5_3));
         assert_eq!(WaveletFilter::from_index(3), Some(WaveletFilter::Haar0));
         assert_eq!(WaveletFilter::from_index(4), Some(WaveletFilter::Haar1));
-        assert_eq!(WaveletFilter::from_index(6), Some(WaveletFilter::Daubechies9_7));
+        assert_eq!(
+            WaveletFilter::from_index(6),
+            Some(WaveletFilter::Daubechies9_7)
+        );
         assert_eq!(WaveletFilter::from_index(7), None);
     }
 
@@ -685,8 +672,7 @@ mod tests {
     /// spec's lifting steps are integer-reversible by design.
     #[test]
     fn one_d_legall_analysis_synthesis_roundtrip() {
-        let original: Vec<i32> =
-            vec![10, -7, 42, 31, -5, 100, 128, -200, 17, 19, 22, 0];
+        let original: Vec<i32> = vec![10, -7, 42, 31, -5, 100, 128, -200, 17, 19, 22, 0];
         let mut work = original.clone();
         one_d_analysis(&mut work, WaveletFilter::LeGall5_3);
         one_d_synthesis(&mut work, WaveletFilter::LeGall5_3);
@@ -695,8 +681,7 @@ mod tests {
 
     #[test]
     fn one_d_dd97_analysis_synthesis_roundtrip() {
-        let original: Vec<i32> =
-            vec![10, -7, 42, 31, -5, 100, 128, -200, 17, 19, 22, 0];
+        let original: Vec<i32> = vec![10, -7, 42, 31, -5, 100, 128, -200, 17, 19, 22, 0];
         let mut work = original.clone();
         one_d_analysis(&mut work, WaveletFilter::DeslauriersDubuc9_7);
         one_d_synthesis(&mut work, WaveletFilter::DeslauriersDubuc9_7);
@@ -721,24 +706,13 @@ mod tests {
                 pic.set(y, x, v);
             }
         }
-        let (ll, hl, lh, hh) =
-            vh_analysis(&pic, WaveletFilter::LeGall5_3);
-        let back = vh_synth(
-            &ll,
-            &hl,
-            &lh,
-            &hh,
-            WaveletFilter::LeGall5_3,
-        );
+        let (ll, hl, lh, hh) = vh_analysis(&pic, WaveletFilter::LeGall5_3);
+        let back = vh_synth(&ll, &hl, &lh, &hh, WaveletFilter::LeGall5_3);
         assert_eq!(back.width, w);
         assert_eq!(back.height, h);
         for y in 0..h {
             for x in 0..w {
-                assert_eq!(
-                    back.get(y, x),
-                    pic.get(y, x),
-                    "({x},{y})"
-                );
+                assert_eq!(back.get(y, x), pic.get(y, x), "({x},{y})");
             }
         }
     }
@@ -778,10 +752,8 @@ mod tests {
                 pic.set(y, x, (x as i32 * 7 - y as i32 * 3) % 101);
             }
         }
-        let pyramid =
-            dwt(&pic, WaveletFilter::DeslauriersDubuc9_7, 2);
-        let back =
-            idwt(&pyramid, WaveletFilter::DeslauriersDubuc9_7);
+        let pyramid = dwt(&pic, WaveletFilter::DeslauriersDubuc9_7, 2);
+        let back = idwt(&pyramid, WaveletFilter::DeslauriersDubuc9_7);
         for y in 0..h {
             for x in 0..w {
                 assert_eq!(back.get(y, x), pic.get(y, x));
