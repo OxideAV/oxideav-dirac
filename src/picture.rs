@@ -160,7 +160,11 @@ fn slice_bounds(
     (left, right, top, bottom)
 }
 
-/// `intlog2(n)` for §13.5.3.1 slice-length sizing.
+/// `intlog2(n)` (§6.4.3) — retained for the sizing test below. The LD
+/// `slice_y_length` field now uses [`crate::encoder::ld_length_bits`]
+/// (which matches the SMPTE VC-2 reference) rather than the Dirac-spec
+/// `intlog2(8*slice_bytes - 7)` formula.
+#[cfg(test)]
 fn intlog2(n: u32) -> u32 {
     if n <= 1 {
         0
@@ -773,7 +777,9 @@ fn decode_ld_slice(
     }
     let total_bits = 8u64 * slice_n_bytes as u64;
     let qindex = r.read_nbits(7);
-    let length_bits = intlog2(slice_n_bytes.saturating_mul(8).saturating_sub(7));
+    // See `crate::encoder::ld_length_bits` — ffmpeg / SMPTE VC-2 reads
+    // `slice_y_length` as `floor(log2(total_bits)) + 1` raw bits.
+    let length_bits = crate::encoder::ld_length_bits(slice_n_bytes);
     let slice_y_length = r.read_nbits(length_bits) as u64;
     let header_bits = 7u64 + length_bits as u64;
     if header_bits + slice_y_length > total_bits {

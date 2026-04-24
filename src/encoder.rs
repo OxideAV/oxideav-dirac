@@ -747,14 +747,22 @@ impl LdEncoderParams {
     }
 }
 
-/// `intlog2(n)` matching the decoder-side helper in `picture.rs` —
-/// §13.5.3.1 slice-length sizing.
-fn intlog2(n: u32) -> u32 {
-    if n <= 1 {
-        0
-    } else {
-        32 - (n - 1).leading_zeros()
-    }
+/// Number of raw bits used by the slice-header `slice_y_length` field
+/// (§13.5.2).
+///
+/// The VC-2 / SMPTE ST 2042-1 reference — and ffmpeg's `vc2` decoder —
+/// size this field as `floor(log2(total_bits)) + 1` where
+/// `total_bits = 8 * slice_bytes`, i.e. the minimum number of bits
+/// required to represent any value in `[0, total_bits - 1]`. This
+/// agrees with the Dirac formula `intlog2(8*slice_bytes - 7)` whenever
+/// `total_bits` is not an exact power of two, and is one bit larger
+/// otherwise. Using the Dirac formula at power-of-two slice sizes
+/// (e.g. `slice_bytes ∈ {32, 64, 128, 256}`) causes a single-bit shift
+/// in the luma coefficient stream that ffmpeg interprets as garbage —
+/// the root cause of the Round 8 LD interop regression.
+pub(crate) fn ld_length_bits(slice_bytes: u32) -> u32 {
+    let total_bits = slice_bytes.saturating_mul(8).max(1);
+    32 - total_bits.leading_zeros()
 }
 
 /// `slice_bytes(sx, sy)` (§13.5.3.2). Mirrors the decoder helper.
@@ -980,7 +988,16 @@ fn encode_ld_slice(
         "LD slice budget must be > 0 (sx={sx}, sy={sy})",
     );
     let total_bits = 8u64 * slice_n_bytes as u64;
-    let length_bits = intlog2(slice_n_bytes.saturating_mul(8).saturating_sub(7));
+    // §13.5.2 specifies `length_bits = intlog2(8*slice_bytes - 7)` with the
+    // Dirac `intlog2` convention `2^(m-1) < n ≤ 2^m` (§6.4.3). In practice
+    // ffmpeg's VC-2 decoder — and the SMPTE ST 2042-1 reference — sizes
+    // this field as `floor(log2(total_bits)) + 1` (the minimum bits
+    // needed to represent `0..total_bits-1`), which agrees with the
+    // Dirac formula except when `total_bits` is an exact power of 2
+    // (e.g. slice_bytes = 32 / 64 / 128 / 256), where Dirac's formula
+    // under-sizes the field by one bit and shifts every subsequent
+    // coefficient by that same bit — the ~12 dB interop gap from Round 8.
+    let length_bits = ld_length_bits(slice_n_bytes);
     let header_bits = 7u64 + length_bits as u64;
     assert!(
         total_bits > header_bits,

@@ -355,20 +355,19 @@ fn ffmpeg_decodes_our_hq_stream_lossless_q0() {
     assert!(v_psnr >= 48.0, "V PSNR {v_psnr:.2} dB below 48 dB");
 }
 
-/// Verify ffmpeg at least *accepts* our LD stream (no decode error
-/// raised). Pixel-fidelity interop of the LD bit-packed slice format
-/// is still an open gap — ffmpeg decodes our LD stream at ~12 dB PSNR
-/// because of a systematic disagreement in the slice coefficient
-/// unpacking path (the HQ stream round-trips bit-exactly through the
-/// same ffmpeg decoder, so the framing / sequence header / parse info
-/// are all conformant).
+/// Round-trip our LD encoder through ffmpeg's vc2 decoder. Round 8
+/// landed at ~12.7 dB PSNR because of an off-by-one in the slice
+/// `slice_y_length` field width — the Dirac spec's `intlog2(8*sb - 7)`
+/// formula under-sizes the field by one bit whenever `8*sb` is an
+/// exact power of two, shifting every coefficient in the luma stream
+/// by one bit. Fixed in Round 9 by sizing the field as
+/// `floor(log2(total_bits)) + 1` (the SMPTE VC-2 / ffmpeg convention).
 ///
-/// This test only asserts "ffmpeg does not error out", which is the
-/// minimum-useful guarantee: the stream is well-formed at the parse-
-/// info and sequence-header levels even if coefficient recovery
-/// fidelity is imperfect.
+/// At qindex = 0 with a 128-byte per-slice budget the stream is
+/// near-lossless for all but the 255-valued cross of the synthetic
+/// testsrc pattern — we assert PSNR >= 48 dB for Y.
 #[test]
-fn ffmpeg_accepts_our_ld_stream_without_error() {
+fn ffmpeg_decodes_our_ld_stream_bit_exact() {
     if !ffmpeg_available() {
         eprintln!("ffmpeg not available; skipping LD interop test");
         return;
@@ -408,8 +407,90 @@ fn ffmpeg_accepts_our_ld_stream_without_error() {
         status.success(),
         "ffmpeg rejected our LD stream — framing / sequence header regressed"
     );
-    // Output should at least be the right byte count even if
-    // coefficient fidelity is imperfect.
     let out = std::fs::read(&yuv).expect("read ffmpeg yuv");
     assert_eq!(out.len(), 64 * 64 + 2 * 32 * 32);
+    let out_y = &out[..64 * 64];
+    let out_u = &out[64 * 64..64 * 64 + 32 * 32];
+    let out_v = &out[64 * 64 + 32 * 32..];
+
+    fn psnr(a: &[u8], b: &[u8]) -> f64 {
+        assert_eq!(a.len(), b.len());
+        let mut sse: u64 = 0;
+        for i in 0..a.len() {
+            let d = a[i] as i32 - b[i] as i32;
+            sse += (d * d) as u64;
+        }
+        if sse == 0 {
+            return f64::INFINITY;
+        }
+        let mse = sse as f64 / a.len() as f64;
+        20.0 * (255.0f64).log10() - 10.0 * mse.log10()
+    }
+
+    let y_psnr = psnr(out_y, &y);
+    let u_psnr = psnr(out_u, &u);
+    let v_psnr = psnr(out_v, &v);
+    eprintln!("ffmpeg LD decode PSNR: Y={y_psnr:.2} U={u_psnr:.2} V={v_psnr:.2}");
+    assert!(
+        y_psnr >= 48.0,
+        "Y PSNR {y_psnr:.2} dB below 48 dB — LD interop regression"
+    );
+    assert!(u_psnr >= 48.0, "U PSNR {u_psnr:.2} dB below 48 dB");
+    assert!(v_psnr >= 48.0, "V PSNR {v_psnr:.2} dB below 48 dB");
+}
+
+/// Sanity sub-case: a constant Y=100 input must decode to a constant
+/// Y=100 picture through ffmpeg. Round 8's failure mode produced a
+/// 128-centred ramp (see the test name in Round 9 brief), so this
+/// test pins the specific "DC coefficient read at the wrong scale"
+/// regression that the length-bits fix resolves.
+#[test]
+fn ffmpeg_decodes_our_ld_constant_frame_lossless() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg not available; skipping LD interop sanity test");
+        return;
+    }
+    use oxideav_dirac::encoder::{
+        encode_single_ld_intra_stream, make_minimal_sequence_ld, LdEncoderParams,
+    };
+    use oxideav_dirac::wavelet::WaveletFilter;
+
+    let seq = make_minimal_sequence_ld(64, 64, ChromaFormat::Yuv420);
+    let params = LdEncoderParams::default_ld(WaveletFilter::LeGall5_3, 3, 4, 4, 128);
+    let y = [100u8; 64 * 64];
+    let u = [128u8; 32 * 32];
+    let v = [128u8; 32 * 32];
+    let stream = encode_single_ld_intra_stream(&seq, &params, 0, &y, &u, &v);
+
+    let tmpdir = std::env::temp_dir();
+    let drc = tmpdir.join("oxideav_dirac_interop_ld_const.drc");
+    let yuv = tmpdir.join("oxideav_dirac_interop_ld_const.yuv");
+    std::fs::write(&drc, &stream).expect("write drc");
+
+    let status = std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "dirac",
+            "-i",
+        ])
+        .arg(&drc)
+        .args(["-f", "rawvideo", "-pix_fmt", "yuv420p"])
+        .arg(&yuv)
+        .status()
+        .expect("run ffmpeg");
+    assert!(status.success(), "ffmpeg rejected our constant LD stream");
+    let out = std::fs::read(&yuv).expect("read ffmpeg yuv");
+    let out_y = &out[..64 * 64];
+    let max = *out_y.iter().max().unwrap();
+    let min = *out_y.iter().min().unwrap();
+    assert_eq!(
+        (min, max),
+        (100, 100),
+        "constant Y=100 should decode to flat 100 — \
+         got min={min}, max={max} (ffmpeg coefficient mis-read regressed)"
+    );
 }
