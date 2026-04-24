@@ -39,6 +39,14 @@ impl BitWriter {
         self.buf.len() + if self.n_bits > 0 { 1 } else { 0 }
     }
 
+    /// Exact bit-level length of the pending bitstream — total bits
+    /// written so far (committed bytes * 8 + partial byte's bits).
+    /// Used by the LD encoder to measure a coefficient block before
+    /// packing it into a fixed-size slice payload.
+    pub fn measured_bits(&self) -> u64 {
+        (self.buf.len() as u64) * 8 + self.n_bits as u64
+    }
+
     /// Current committed byte length (partial byte NOT counted). Used
     /// when the caller needs the byte-aligned position for offsets.
     pub fn aligned_byte_pos(&self) -> usize {
