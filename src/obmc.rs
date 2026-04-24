@@ -621,4 +621,84 @@ mod tests {
         assert_eq!(chroma_mv_scale((4, 6), 2, 2), (2, 3));
         assert_eq!(chroma_mv_scale((-3, -1), 2, 2), (-2, -1)); // floor division
     }
+
+    /// End-to-end MC smoke test: a single-block inter picture with a
+    /// zero motion vector and zero residue should reproduce the
+    /// reference exactly. We use a single superblock (1x1 split=2 → 4
+    /// blocks) covering a 16x16 picture.
+    #[test]
+    fn motion_compensate_zero_mv_zero_residue_reproduces_ref() {
+        use crate::picture_inter::{BlockData, PictureMotionData, RefPredMode};
+        // 16x16 reference filled with a ramp (signed, pre-offset).
+        let w = 16usize;
+        let h = 16usize;
+        let mut ref_plane = vec![0i32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                ref_plane[y * w + x] = (x as i32 + y as i32) - 16;
+            }
+        }
+        // 8x8 blocks, xbsep = 4, xoffset = 2 — so 4x4 = 16 blocks cover
+        // the 16x16 picture (xbsep * 4 = 16).
+        let blocks_x = 4;
+        let blocks_y = 4;
+        let mut blocks = Vec::with_capacity((blocks_x * blocks_y) as usize);
+        for _ in 0..blocks_x * blocks_y {
+            blocks.push(BlockData {
+                rmode: RefPredMode::Ref1Only,
+                gmode: false,
+                mv: [(0, 0); 2],
+                dc: [0; 3],
+            });
+        }
+        let motion = PictureMotionData {
+            blocks_x,
+            blocks_y,
+            superblocks_x: 1,
+            superblocks_y: 1,
+            sb_split: vec![2], // level 2: 16 individual blocks
+            blocks,
+            global1: None,
+            global2: None,
+        };
+        let params = McParams {
+            len_x: w,
+            len_y: h,
+            xblen: 8,
+            yblen: 8,
+            xbsep: 4,
+            ybsep: 4,
+            blocks_x,
+            blocks_y,
+            mv_precision: 0,
+            is_chroma: false,
+            chroma_h_ratio: 1,
+            chroma_v_ratio: 1,
+            refs_wt_precision: 1,
+            ref1_wt: 1,
+            ref2_wt: 1,
+            luma_depth: 8,
+            chroma_depth: 8,
+        };
+        let mut pic = vec![0i32; w * h];
+        motion_compensate(
+            &mut pic,
+            &params,
+            &motion,
+            Some((&ref_plane, w, h)),
+            None,
+        );
+        // With MV=0 and residue=0, the motion-compensated picture
+        // should match the reference exactly across the interior.
+        // The ramp is within the 8-bit signed range so no clipping.
+        for y in 1..(h - 1) {
+            for x in 1..(w - 1) {
+                assert_eq!(
+                    pic[y * w + x],
+                    ref_plane[y * w + x],
+                    "mismatch at ({x}, {y})"
+                );
+            }
+        }
+    }
 }

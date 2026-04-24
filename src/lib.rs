@@ -34,10 +34,21 @@
 //!   arithmetic-coded paths (zero-parent / zero-neighbourhood /
 //!   sign-prediction contexts per Table 13.1). End-to-end testing
 //!   relies on a third-party Dirac encoder; ffmpeg only emits VC-2.
+//! * **Core-syntax inter pictures** — §11.2 picture prediction
+//!   parameters, §12.3 block motion data decode (superblock splits,
+//!   block modes, reference-1 / reference-2 motion vectors, DC values
+//!   for intra blocks, with spatial predictions from §12.3.6), and
+//!   §15.8 overlapped block motion compensation (8-tap half-pel
+//!   interpolation, bilinear sub-pel up to 1/8, the ramp spatial
+//!   weighting window, affine/perspective global motion, and bi-
+//!   directional reference weighting). The reference-picture buffer
+//!   is maintained across pictures by the decoder front-end. As of
+//!   writing, ffmpeg does not emit Dirac inter (only VC-2 intra) so
+//!   end-to-end testing of this path relies on primitives-level unit
+//!   tests until a third-party Dirac encoder is available.
 //!
-//! Still unsupported (planned): inter pictures + OBMC motion
-//! compensation (parsing scaffold exists), v3 extended transform
-//! parameters (horizontal-only transforms).
+//! Still unsupported (planned): v3 extended transform parameters
+//! (horizontal-only transforms).
 
 #![allow(clippy::needless_range_loop)]
 
@@ -64,14 +75,12 @@ use oxideav_core::{CodecCapabilities, CodecId, CodecTag};
 /// Canonical oxideav codec id.
 pub const CODEC_ID_STR: &str = "dirac";
 
-/// Register the Dirac decoder (foundation only) with a codec registry.
+/// Register the Dirac decoder with a codec registry.
 pub fn register(reg: &mut CodecRegistry) {
-    // intra_only = true reflects the current decoder's reach (VC-2 LD
-    // and HQ intra). Flip back to false once inter pictures with
-    // motion compensation land.
+    // Core-syntax inter pictures with OBMC motion compensation are
+    // implemented, so we no longer advertise `intra_only`.
     let caps = CodecCapabilities::video("dirac_sw")
         .with_lossy(true)
-        .with_intra_only(true)
         .with_max_size(7680, 4320);
     reg.register(
         CodecInfo::new(CodecId::new(CODEC_ID_STR))

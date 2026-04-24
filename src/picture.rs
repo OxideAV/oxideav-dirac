@@ -16,9 +16,10 @@
 //!   that component's coefficients. HQ pictures do **not** use DC
 //!   prediction.
 //!
-//! Only intra pictures are implemented; core-syntax arithmetic-coded
-//! or inter pictures are rejected with an `Unsupported` error until
-//! later milestones land.
+//! Core-syntax (arithmetic-coded) intra pictures are also handled
+//! through [`crate::picture_core`], and core-syntax inter pictures
+//! are decoded via §12.3 block motion data plus §15.8 OBMC in
+//! [`crate::picture_inter`] and [`crate::obmc`].
 
 use crate::bits::BitReader;
 use crate::parse_info::ParseInfo;
@@ -44,6 +45,22 @@ pub struct DecodedPicture {
     pub v: Vec<i32>,
     pub luma_depth: u32,
     pub chroma_depth: u32,
+}
+
+/// A decoded picture held in its **signed, clipped, pre-output-offset**
+/// form, suitable for use as a reference in subsequent inter decodes
+/// (§15.4). `y` / `u` / `v` values lie in the range
+/// `[-2^(depth-1), 2^(depth-1) - 1]`.
+#[derive(Debug, Clone)]
+pub struct ReferencePicture {
+    pub picture_number: u32,
+    pub luma_width: usize,
+    pub luma_height: usize,
+    pub chroma_width: usize,
+    pub chroma_height: usize,
+    pub y: Vec<i32>,
+    pub u: Vec<i32>,
+    pub v: Vec<i32>,
 }
 
 /// Which flavour of low-delay profile this picture uses.
@@ -90,6 +107,10 @@ pub enum PictureError {
     ExtendedTransformParams,
     /// Slice data wider than its declared byte length.
     SliceOverflow,
+    /// Inter picture referenced a picture number not in the reference
+    /// buffer. The decoder front-end is responsible for keeping the
+    /// buffer up to date.
+    MissingReference(u32),
 }
 
 impl core::fmt::Display for PictureError {
@@ -108,6 +129,9 @@ impl core::fmt::Display for PictureError {
                 write!(f, "extended transform parameters (v3) not implemented")
             }
             Self::SliceOverflow => write!(f, "slice data overflows declared length"),
+            Self::MissingReference(n) => {
+                write!(f, "inter picture references missing picture number {n}")
+            }
         }
     }
 }
@@ -202,12 +226,24 @@ pub fn decode_picture(
     parse_info: ParseInfo,
     sequence: &SequenceHeader,
 ) -> Result<DecodedPicture, PictureError> {
+    decode_picture_with_refs(payload, parse_info, sequence, &[])
+}
+
+/// Like [`decode_picture`], but allows the caller to supply the
+/// reference-picture buffer for inter decodes. Intra pictures ignore
+/// the references.
+pub fn decode_picture_with_refs(
+    payload: &[u8],
+    parse_info: ParseInfo,
+    sequence: &SequenceHeader,
+    references: &[ReferencePicture],
+) -> Result<DecodedPicture, PictureError> {
     // Dispatch by profile / syntax family.
     if parse_info.is_low_delay() {
         return decode_low_delay_picture(payload, parse_info, sequence);
     }
     if parse_info.is_core_syntax() {
-        return decode_core_syntax_picture(payload, parse_info, sequence);
+        return decode_core_syntax_picture(payload, parse_info, sequence, references);
     }
     Err(PictureError::CoreSyntaxNotImplemented)
 }
@@ -343,11 +379,12 @@ fn decode_low_delay_picture(
     })
 }
 
-/// Full core-syntax picture decode (AC or VLC, intra only for now).
+/// Full core-syntax picture decode (AC or VLC, intra or inter).
 fn decode_core_syntax_picture(
     payload: &[u8],
     parse_info: ParseInfo,
     sequence: &SequenceHeader,
+    references: &[ReferencePicture],
 ) -> Result<DecodedPicture, PictureError> {
     let is_intra = parse_info.is_intra();
     let using_ac = parse_info.using_ac();
@@ -359,87 +396,134 @@ fn decode_core_syntax_picture(
     }
     let picture_number = r.read_uint_lit(4);
 
-    // Inter pictures carry reference-picture deltas + prediction data
-    // before the wavelet_transform block. The scaffold parses enough
-    // of that header to keep the bitstream cursor in sync but then
-    // bails out before motion compensation.
-    if parse_info.is_inter() {
+    // Inter pictures: §9.6.1 reference deltas, §11.2 picture prediction
+    // parameters + block motion data, then §11.3 wavelet residue
+    // (optionally all-zero).
+    let inter_ctx = if parse_info.is_inter() {
         let num_refs = parse_info.num_refs() as u32;
-        let _ref1 = r.read_sint();
-        if num_refs == 2 {
-            let _ref2 = r.read_sint();
-        }
+        let d1 = r.read_sint();
+        let ref1_num = picture_number.wrapping_add(d1 as u32);
+        let ref2_num = if num_refs == 2 {
+            let d2 = r.read_sint();
+            Some(picture_number.wrapping_add(d2 as u32))
+        } else {
+            None
+        };
         if parse_info.is_reference() {
             let _retd = r.read_sint();
         }
         r.byte_align();
-        // Parse picture_prediction_parameters so the bitstream stays
-        // in sync with §11.2; block motion data decode is future work.
-        let _ = crate::picture_inter::parse_picture_prediction_parameters(
+        let pred = crate::picture_inter::parse_picture_prediction_parameters(
             &mut r, sequence, num_refs,
         )?;
         r.byte_align();
-        return Err(PictureError::InterNotImplemented);
-    } else if parse_info.is_reference() {
-        let _retd = r.read_sint();
-    }
-
-    // §11.3 wavelet_transform. For intra pictures there's no
-    // zero_residual flag.
-    r.byte_align();
-
-    // §11.3.1 transform_parameters (core flavour).
-    let w_idx = r.read_uint();
-    let wavelet = crate::wavelet::WaveletFilter::from_index(w_idx)
-        .ok_or(PictureError::UnknownWaveletIndex(w_idx))?;
-    let dwt_depth = r.read_uint();
-    if dwt_depth > 6 {
-        return Err(PictureError::UnsupportedDwtDepth(dwt_depth));
-    }
-    // §11.3.3 codeblock_parameters.
-    let (codeblocks, codeblock_mode) =
-        crate::picture_core::parse_codeblock_parameters(&mut r, dwt_depth)?;
-    let params = crate::picture_core::CoreTransformParameters {
-        wavelet,
-        dwt_depth,
-        codeblocks,
-        codeblock_mode,
-        quant_matrix: None,
+        let motion =
+            crate::picture_inter::decode_block_motion_data(&mut r, &pred, num_refs)?;
+        r.byte_align();
+        Some(InterDecodeContext {
+            ref1_num,
+            ref2_num,
+            pred,
+            motion,
+        })
+    } else {
+        if parse_info.is_reference() {
+            let _retd = r.read_sint();
+        }
+        None
     };
 
+    // §11.3 wavelet_transform. Inter pictures have a ZERO_RESIDUAL bool
+    // gate; intra pictures unconditionally carry the residual.
     r.byte_align();
+    let zero_residual = if parse_info.is_inter() {
+        r.read_bool()
+    } else {
+        false
+    };
+
     let luma_w = sequence.luma_width;
     let luma_h = sequence.luma_height;
     let chroma_w = sequence.chroma_width;
     let chroma_h = sequence.chroma_height;
 
-    let y_py = crate::picture_core::core_transform_component(
-        &mut r, &params, luma_w, luma_h, using_ac, is_intra,
-    )?;
-    let u_py = crate::picture_core::core_transform_component(
-        &mut r, &params, chroma_w, chroma_h, using_ac, is_intra,
-    )?;
-    let v_py = crate::picture_core::core_transform_component(
-        &mut r, &params, chroma_w, chroma_h, using_ac, is_intra,
-    )?;
+    // Decode (or zero) the wavelet residue, returning cropped planes.
+    let (mut y_plane, mut u_plane, mut v_plane) = if zero_residual {
+        (
+            vec![0i32; luma_w as usize * luma_h as usize],
+            vec![0i32; chroma_w as usize * chroma_h as usize],
+            vec![0i32; chroma_w as usize * chroma_h as usize],
+        )
+    } else {
+        // §11.3.1 transform_parameters (core flavour).
+        let w_idx = r.read_uint();
+        let wavelet = crate::wavelet::WaveletFilter::from_index(w_idx)
+            .ok_or(PictureError::UnknownWaveletIndex(w_idx))?;
+        let dwt_depth = r.read_uint();
+        if dwt_depth > 6 {
+            return Err(PictureError::UnsupportedDwtDepth(dwt_depth));
+        }
+        // §11.3.3 codeblock_parameters.
+        let (codeblocks, codeblock_mode) =
+            crate::picture_core::parse_codeblock_parameters(&mut r, dwt_depth)?;
+        let params = crate::picture_core::CoreTransformParameters {
+            wavelet,
+            dwt_depth,
+            codeblocks,
+            codeblock_mode,
+            quant_matrix: None,
+        };
 
-    let y_data = idwt(&y_py, wavelet);
-    let u_data = idwt(&u_py, wavelet);
-    let v_data = idwt(&v_py, wavelet);
+        r.byte_align();
+        let y_py = crate::picture_core::core_transform_component(
+            &mut r, &params, luma_w, luma_h, using_ac, is_intra,
+        )?;
+        let u_py = crate::picture_core::core_transform_component(
+            &mut r, &params, chroma_w, chroma_h, using_ac, is_intra,
+        )?;
+        let v_py = crate::picture_core::core_transform_component(
+            &mut r, &params, chroma_w, chroma_h, using_ac, is_intra,
+        )?;
+        let y_data = idwt(&y_py, wavelet);
+        let u_data = idwt(&u_py, wavelet);
+        let v_data = idwt(&v_py, wavelet);
+        (
+            crop_to(&y_data, luma_w as usize, luma_h as usize),
+            crop_to(&u_data, chroma_w as usize, chroma_h as usize),
+            crop_to(&v_data, chroma_w as usize, chroma_h as usize),
+        )
+    };
 
-    let y = trim_clip_offset(&y_data, luma_w as usize, luma_h as usize, sequence.luma_depth);
-    let u = trim_clip_offset(
-        &u_data,
-        chroma_w as usize,
-        chroma_h as usize,
-        sequence.chroma_depth,
-    );
-    let v = trim_clip_offset(
-        &v_data,
-        chroma_w as usize,
-        chroma_h as usize,
-        sequence.chroma_depth,
-    );
+    // §15.8: motion-compensate (inter only) or just clip (intra).
+    if let Some(ctx) = inter_ctx {
+        let ref1 = find_ref(references, ctx.ref1_num)
+            .ok_or(PictureError::MissingReference(ctx.ref1_num))?;
+        let ref2_pic = match ctx.ref2_num {
+            Some(n) => Some(
+                find_ref(references, n).ok_or(PictureError::MissingReference(n))?,
+            ),
+            None => None,
+        };
+        motion_compensate_all(
+            &mut y_plane,
+            &mut u_plane,
+            &mut v_plane,
+            sequence,
+            &ctx.pred,
+            &ctx.motion,
+            ref1,
+            ref2_pic,
+        );
+    } else {
+        clip_plane(&mut y_plane, sequence.luma_depth);
+        clip_plane(&mut u_plane, sequence.chroma_depth);
+        clip_plane(&mut v_plane, sequence.chroma_depth);
+    }
+
+    // §15.10 offset output.
+    let y = offset_plane(&y_plane, sequence.luma_depth);
+    let u = offset_plane(&u_plane, sequence.chroma_depth);
+    let v = offset_plane(&v_plane, sequence.chroma_depth);
 
     Ok(DecodedPicture {
         picture_number,
@@ -453,6 +537,153 @@ fn decode_core_syntax_picture(
         luma_depth: sequence.luma_depth,
         chroma_depth: sequence.chroma_depth,
     })
+}
+
+/// Inter-picture working state assembled while parsing the
+/// core-syntax header, held long enough for the motion-compensate
+/// pass after the wavelet residue is decoded.
+struct InterDecodeContext {
+    ref1_num: u32,
+    ref2_num: Option<u32>,
+    pred: crate::picture_inter::PicturePredictionParams,
+    motion: crate::picture_inter::PictureMotionData,
+}
+
+fn crop_to(big: &SubbandData, w: usize, h: usize) -> Vec<i32> {
+    let mut out = Vec::with_capacity(w * h);
+    for y in 0..h {
+        for x in 0..w {
+            out.push(big.get(y, x));
+        }
+    }
+    out
+}
+
+fn clip_plane(plane: &mut [i32], depth: u32) {
+    let half = if depth == 0 { 1i32 } else { 1i32 << (depth - 1) };
+    let lo = -half;
+    let hi = half - 1;
+    for v in plane.iter_mut() {
+        *v = (*v).clamp(lo, hi);
+    }
+}
+
+fn offset_plane(plane: &[i32], depth: u32) -> Vec<i32> {
+    let half = if depth == 0 { 1i32 } else { 1i32 << (depth - 1) };
+    plane.iter().map(|v| v + half).collect()
+}
+
+fn find_ref(refs: &[ReferencePicture], n: u32) -> Option<&ReferencePicture> {
+    refs.iter().find(|r| r.picture_number == n)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn motion_compensate_all(
+    y: &mut [i32],
+    u: &mut [i32],
+    v: &mut [i32],
+    sequence: &SequenceHeader,
+    pred: &crate::picture_inter::PicturePredictionParams,
+    motion: &crate::picture_inter::PictureMotionData,
+    ref1: &ReferencePicture,
+    ref2: Option<&ReferencePicture>,
+) {
+    let chroma_h_ratio = sequence.video_params.chroma_format.h_ratio();
+    let chroma_v_ratio = sequence.video_params.chroma_format.v_ratio();
+    mc_one(
+        y,
+        sequence.luma_width as usize,
+        sequence.luma_height as usize,
+        pred,
+        motion,
+        false,
+        sequence.luma_depth,
+        sequence.chroma_depth,
+        chroma_h_ratio,
+        chroma_v_ratio,
+        (&ref1.y, ref1.luma_width, ref1.luma_height),
+        ref2.map(|r| (r.y.as_slice(), r.luma_width, r.luma_height)),
+    );
+    mc_one(
+        u,
+        sequence.chroma_width as usize,
+        sequence.chroma_height as usize,
+        pred,
+        motion,
+        true,
+        sequence.luma_depth,
+        sequence.chroma_depth,
+        chroma_h_ratio,
+        chroma_v_ratio,
+        (&ref1.u, ref1.chroma_width, ref1.chroma_height),
+        ref2.map(|r| (r.u.as_slice(), r.chroma_width, r.chroma_height)),
+    );
+    mc_one(
+        v,
+        sequence.chroma_width as usize,
+        sequence.chroma_height as usize,
+        pred,
+        motion,
+        true,
+        sequence.luma_depth,
+        sequence.chroma_depth,
+        chroma_h_ratio,
+        chroma_v_ratio,
+        (&ref1.v, ref1.chroma_width, ref1.chroma_height),
+        ref2.map(|r| (r.v.as_slice(), r.chroma_width, r.chroma_height)),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mc_one(
+    pic: &mut [i32],
+    comp_w: usize,
+    comp_h: usize,
+    pred: &crate::picture_inter::PicturePredictionParams,
+    motion: &crate::picture_inter::PictureMotionData,
+    is_chroma: bool,
+    luma_depth: u32,
+    chroma_depth: u32,
+    chroma_h_ratio: u32,
+    chroma_v_ratio: u32,
+    ref1: (&[i32], usize, usize),
+    ref2: Option<(&[i32], usize, usize)>,
+) {
+    let (xblen, yblen, xbsep, ybsep) = if is_chroma {
+        (
+            (pred.luma_xblen / chroma_h_ratio) as usize,
+            (pred.luma_yblen / chroma_v_ratio) as usize,
+            (pred.luma_xbsep / chroma_h_ratio) as usize,
+            (pred.luma_ybsep / chroma_v_ratio) as usize,
+        )
+    } else {
+        (
+            pred.luma_xblen as usize,
+            pred.luma_yblen as usize,
+            pred.luma_xbsep as usize,
+            pred.luma_ybsep as usize,
+        )
+    };
+    let params = crate::obmc::McParams {
+        len_x: comp_w,
+        len_y: comp_h,
+        xblen,
+        yblen,
+        xbsep,
+        ybsep,
+        blocks_x: pred.blocks_x,
+        blocks_y: pred.blocks_y,
+        mv_precision: pred.mv_precision,
+        is_chroma,
+        chroma_h_ratio,
+        chroma_v_ratio,
+        refs_wt_precision: pred.refs_wt_precision,
+        ref1_wt: pred.ref1_wt,
+        ref2_wt: pred.ref2_wt,
+        luma_depth,
+        chroma_depth,
+    };
+    crate::obmc::motion_compensate(pic, &params, motion, Some(ref1), ref2);
 }
 
 /// §12.4 `transform_parameters`.

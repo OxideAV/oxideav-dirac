@@ -5,10 +5,13 @@
 //! 2. On each `receive_frame`, walk the buffer via
 //!    [`crate::stream::DataUnitIter`].
 //! 3. Sequence headers are parsed and cached.
-//! 4. Low-delay intra pictures are decoded to a `VideoFrame`.
-//! 5. Core-syntax (arithmetic-coded) and inter pictures still return
-//!    `Error::Unsupported` for now — motion compensation and the core
-//!    entropy codec are the next milestones.
+//! 4. Intra pictures (LD, HQ, or core-syntax) are decoded to a
+//!    `VideoFrame`.
+//! 5. Core-syntax inter pictures are decoded by driving
+//!    [`crate::picture::decode_picture_with_refs`] with the decoder's
+//!    own reference-picture buffer (§15.4). Reference pictures are
+//!    admitted on successful decode, oldest evicted when the buffer
+//!    fills.
 
 use oxideav_codec::Decoder;
 use oxideav_core::{
@@ -16,7 +19,9 @@ use oxideav_core::{
     VideoFrame, VideoPlane,
 };
 
-use crate::picture::{decode_picture, DecodedPicture, PictureError};
+use crate::picture::{
+    decode_picture_with_refs, DecodedPicture, PictureError, ReferencePicture,
+};
 use crate::sequence::{parse_sequence_header, SequenceHeader};
 use crate::stream::DataUnitIter;
 use crate::video_format::ChromaFormat;
@@ -39,6 +44,14 @@ pub struct DiracDecoder {
     /// How far into `buffer` we've already scanned; used so we don't
     /// re-parse units after calling `scan()` repeatedly.
     scan_cursor: usize,
+    /// §15.4 reference picture buffer. Populated with reference
+    /// pictures (parse code has bits 2,3 set) after each successful
+    /// decode, and drained in FIFO order when full.
+    reference_buffer: Vec<ReferencePicture>,
+    /// Upper bound on the reference buffer — Annex D specifies this
+    /// per profile / level; conservative default 4 covers all profiles
+    /// we currently decode.
+    max_ref_buffer: usize,
 }
 
 impl DiracDecoder {
@@ -51,6 +64,8 @@ impl DiracDecoder {
             pending_codes: std::collections::VecDeque::new(),
             eof: false,
             scan_cursor: 0,
+            reference_buffer: Vec::new(),
+            max_ref_buffer: 4,
         }
     }
 
@@ -118,16 +133,27 @@ impl DiracDecoder {
                 next_parse_offset: 0,
                 previous_parse_offset: 0,
             };
-            match decode_picture(&payload, pi, &seq) {
+            match decode_picture_with_refs(&payload, pi, &seq, &self.reference_buffer) {
                 Ok(pic) => {
                     self.pending.pop_front();
                     self.pending_codes.pop_front();
+                    // §15.4 add to reference buffer if this is a
+                    // reference picture.
+                    if pi.is_reference() {
+                        self.push_reference(&pic, &seq);
+                    }
                     return Ok(Some(decoded_to_video_frame(&pic, &seq)));
                 }
+                Err(PictureError::MissingReference(_)) => {
+                    // The reference buffer hasn't caught up to this
+                    // inter picture — skip and continue.
+                    self.pending.pop_front();
+                    self.pending_codes.pop_front();
+                    continue;
+                }
                 Err(PictureError::InterNotImplemented) => {
-                    // Skip inter pictures until OBMC lands; propagate
-                    // as a non-fatal NeedMore so the pipeline can
-                    // continue with future intra pictures.
+                    // Should no longer happen, but preserve the skip
+                    // behaviour so partial bitstreams don't break.
                     self.pending.pop_front();
                     self.pending_codes.pop_front();
                     continue;
@@ -141,6 +167,40 @@ impl DiracDecoder {
                     return Err(Error::invalid(format!("dirac: picture decode: {e}")));
                 }
             }
+        }
+    }
+
+    fn push_reference(&mut self, pic: &DecodedPicture, seq: &SequenceHeader) {
+        // Store a **pre-output-offset, clipped** copy: the decoded
+        // picture we produce has already been offset for output, so we
+        // subtract the offset here. The `i32` payload stays in
+        // `[-2^(depth-1), 2^(depth-1) - 1]`.
+        let luma_half = if seq.luma_depth == 0 {
+            0
+        } else {
+            1i32 << (seq.luma_depth - 1)
+        };
+        let chroma_half = if seq.chroma_depth == 0 {
+            0
+        } else {
+            1i32 << (seq.chroma_depth - 1)
+        };
+        let y: Vec<i32> = pic.y.iter().map(|v| v - luma_half).collect();
+        let u: Vec<i32> = pic.u.iter().map(|v| v - chroma_half).collect();
+        let v: Vec<i32> = pic.v.iter().map(|v| v - chroma_half).collect();
+        let rp = ReferencePicture {
+            picture_number: pic.picture_number,
+            luma_width: pic.luma_width,
+            luma_height: pic.luma_height,
+            chroma_width: pic.chroma_width,
+            chroma_height: pic.chroma_height,
+            y,
+            u,
+            v,
+        };
+        self.reference_buffer.push(rp);
+        while self.reference_buffer.len() > self.max_ref_buffer {
+            self.reference_buffer.remove(0);
         }
     }
 }
