@@ -43,7 +43,10 @@
 
 pub mod arith;
 pub mod bits;
+pub mod bitwriter;
 pub mod decoder;
+pub mod encoder;
+pub mod obmc;
 pub mod parse_info;
 pub mod picture;
 pub mod picture_core;
