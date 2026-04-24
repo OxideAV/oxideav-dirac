@@ -386,6 +386,186 @@ pub fn idwt(pyramid: &[[SubbandData; 4]], filter: WaveletFilter) -> SubbandData 
     ll
 }
 
+// --------------------------------------------------------------------
+//   Forward (analysis) transform — the exact inverse of the synthesis
+//   path used by the decoder above. This is what the encoder runs on
+//   each picture component before quantising the coefficients.
+// --------------------------------------------------------------------
+
+/// Invert a single lifting step: the synthesis applies `A[even] -= d`
+/// (Type 2) and `A[odd] += d` (Type 3) using the tap-weighted sum of
+/// neighbouring samples. The analysis does the opposite — Type 2
+/// becomes Type 1 (add), Type 3 becomes Type 4 (subtract), and the
+/// step is executed in reverse order.
+fn apply_inverse_lift(a: &mut [i32], step: &LiftingStep) {
+    let length = a.len();
+    if length < 2 {
+        return;
+    }
+    let half = length / 2;
+    let rounding: i32 = if step.shift > 0 {
+        1 << (step.shift - 1)
+    } else {
+        0
+    };
+    let d_i32 = step.d;
+    let taps = step.taps;
+    match step.kind {
+        // Synthesis Type 1 adds delta to even; analysis subtracts it.
+        // Synthesis Type 2 subtracts delta from even; analysis adds it.
+        LiftKind::Type1 | LiftKind::Type2 => {
+            for n in 0..half {
+                let mut sum: i32 = 0;
+                for (ti, &tap) in taps.iter().enumerate() {
+                    let i = d_i32 + ti as i32;
+                    let pos = 2 * (n as i32 + i) - 1;
+                    let pos = pos.min(length as i32 - 1).max(1) as usize;
+                    sum = sum.wrapping_add(tap.wrapping_mul(a[pos]));
+                }
+                let delta = (sum.wrapping_add(rounding)) >> step.shift;
+                let idx = 2 * n;
+                // Opposite sign vs. apply_lift.
+                if matches!(step.kind, LiftKind::Type1) {
+                    a[idx] = a[idx].wrapping_sub(delta);
+                } else {
+                    a[idx] = a[idx].wrapping_add(delta);
+                }
+            }
+        }
+        // Synthesis Type 3 adds delta to odd; analysis subtracts.
+        // Synthesis Type 4 subtracts delta from odd; analysis adds.
+        LiftKind::Type3 | LiftKind::Type4 => {
+            for n in 0..half {
+                let mut sum: i32 = 0;
+                for (ti, &tap) in taps.iter().enumerate() {
+                    let i = d_i32 + ti as i32;
+                    let pos = 2 * (n as i32 + i);
+                    let pos = pos.min(length as i32 - 2).max(0) as usize;
+                    sum = sum.wrapping_add(tap.wrapping_mul(a[pos]));
+                }
+                let delta = (sum.wrapping_add(rounding)) >> step.shift;
+                let idx = 2 * n + 1;
+                if matches!(step.kind, LiftKind::Type3) {
+                    a[idx] = a[idx].wrapping_sub(delta);
+                } else {
+                    a[idx] = a[idx].wrapping_add(delta);
+                }
+            }
+        }
+    }
+}
+
+/// One-dimensional analysis: apply every lifting step of `filter` in
+/// reverse order with inverted sign. This is the exact inverse of
+/// [`one_d_synthesis`].
+pub fn one_d_analysis(a: &mut [i32], filter: WaveletFilter) {
+    for step in filter.lifting_steps().iter().rev() {
+        apply_inverse_lift(a, step);
+    }
+}
+
+/// Forward 2-D analysis: split a `2w x 2h` picture-shaped array into
+/// four equal-sized LL / HL / LH / HH subbands.
+///
+/// This is the inverse of [`vh_synth`]. The steps run in reverse order:
+///
+/// 1. Left-shift by `filter_shift()` (cancelling the synthesis's
+///    accuracy-bit drop).
+/// 2. Horizontal analysis — one 1-D analysis per row.
+/// 3. Vertical analysis — one 1-D analysis per column.
+/// 4. De-interleave: samples at (2y, 2x), (2y, 2x+1), (2y+1, 2x),
+///    (2y+1, 2x+1) become LL, HL, LH, HH respectively.
+///
+/// The returned tuple is `(ll, hl, lh, hh)`.
+pub fn vh_analysis(
+    picture: &SubbandData,
+    filter: WaveletFilter,
+) -> (SubbandData, SubbandData, SubbandData, SubbandData) {
+    debug_assert!(picture.width % 2 == 0);
+    debug_assert!(picture.height % 2 == 0);
+    let out_w = picture.width;
+    let out_h = picture.height;
+    let mut work = picture.clone();
+    // Step 1: undo the accuracy-bit shift.
+    let shift = filter.filter_shift();
+    if shift > 0 {
+        for v in work.data.iter_mut() {
+            *v = v.wrapping_shl(shift);
+        }
+    }
+    // Step 2: horizontal analysis.
+    for y in 0..out_h {
+        let row = work.row_mut(y);
+        one_d_analysis(row, filter);
+    }
+    // Step 3: vertical analysis.
+    let mut col_buf = vec![0i32; out_h];
+    for x in 0..out_w {
+        for y in 0..out_h {
+            col_buf[y] = work.get(y, x);
+        }
+        one_d_analysis(&mut col_buf, filter);
+        for y in 0..out_h {
+            work.set(y, x, col_buf[y]);
+        }
+    }
+    // Step 4: de-interleave.
+    let half_w = out_w / 2;
+    let half_h = out_h / 2;
+    let mut ll = SubbandData::new(half_w, half_h);
+    let mut hl = SubbandData::new(half_w, half_h);
+    let mut lh = SubbandData::new(half_w, half_h);
+    let mut hh = SubbandData::new(half_w, half_h);
+    for y in 0..half_h {
+        for x in 0..half_w {
+            ll.set(y, x, work.get(2 * y, 2 * x));
+            hl.set(y, x, work.get(2 * y, 2 * x + 1));
+            lh.set(y, x, work.get(2 * y + 1, 2 * x));
+            hh.set(y, x, work.get(2 * y + 1, 2 * x + 1));
+        }
+    }
+    (ll, hl, lh, hh)
+}
+
+/// Full picture DWT: given a picture-sized coefficient array (already
+/// padded up to a multiple of `2^dwt_depth` per §15.7 and trimmed with
+/// the `2^(depth-1)` offset subtracted), iteratively decompose it into
+/// a pyramid of subbands matching the layout [`idwt`] expects.
+///
+/// The returned pyramid has the same shape as [`crate::subband::init_pyramid`]:
+/// `pyramid[0][0]` holds the level-0 LL band, and `pyramid[level][1..=3]`
+/// for `level >= 1` holds HL / LH / HH. Level 0's HL/LH/HH entries and
+/// every level's LL slot for `level >= 1` are empty placeholders.
+pub fn dwt(
+    picture: &SubbandData,
+    filter: WaveletFilter,
+    dwt_depth: u32,
+) -> Vec<[SubbandData; 4]> {
+    let mut pyramid: Vec<[SubbandData; 4]> =
+        Vec::with_capacity(dwt_depth as usize + 1);
+    for _ in 0..=dwt_depth {
+        pyramid.push([
+            SubbandData::new(0, 0),
+            SubbandData::new(0, 0),
+            SubbandData::new(0, 0),
+            SubbandData::new(0, 0),
+        ]);
+    }
+    // Start from the full-resolution signal and repeatedly split its LL
+    // sub-sample down by two until we've peeled off `dwt_depth` detail
+    // levels.
+    let mut ll = picture.clone();
+    for level in (1..=dwt_depth).rev() {
+        let (new_ll, hl, lh, hh) = vh_analysis(&ll, filter);
+        pyramid[level as usize][1] = hl;
+        pyramid[level as usize][2] = lh;
+        pyramid[level as usize][3] = hh;
+        ll = new_ll;
+    }
+    pyramid[0][0] = ll;
+    pyramid
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -498,5 +678,133 @@ mod tests {
         assert_eq!(WaveletFilter::Haar1.filter_shift(), 1);
         assert_eq!(WaveletFilter::LeGall5_3.filter_shift(), 1);
         assert_eq!(WaveletFilter::Fidelity.filter_shift(), 0);
+    }
+
+    /// Sanity check: encoding `one_d_analysis` followed by
+    /// `one_d_synthesis` reproduces the original sequence exactly. The
+    /// spec's lifting steps are integer-reversible by design.
+    #[test]
+    fn one_d_legall_analysis_synthesis_roundtrip() {
+        let original: Vec<i32> =
+            vec![10, -7, 42, 31, -5, 100, 128, -200, 17, 19, 22, 0];
+        let mut work = original.clone();
+        one_d_analysis(&mut work, WaveletFilter::LeGall5_3);
+        one_d_synthesis(&mut work, WaveletFilter::LeGall5_3);
+        assert_eq!(work, original);
+    }
+
+    #[test]
+    fn one_d_dd97_analysis_synthesis_roundtrip() {
+        let original: Vec<i32> =
+            vec![10, -7, 42, 31, -5, 100, 128, -200, 17, 19, 22, 0];
+        let mut work = original.clone();
+        one_d_analysis(&mut work, WaveletFilter::DeslauriersDubuc9_7);
+        one_d_synthesis(&mut work, WaveletFilter::DeslauriersDubuc9_7);
+        assert_eq!(work, original);
+    }
+
+    /// vh_analysis / vh_synth round trip for LeGall. Build a non-trivial
+    /// picture, analyse it, then re-synthesise and check byte-for-byte
+    /// equality.
+    #[test]
+    fn vh_legall_analysis_synthesis_roundtrip() {
+        let w = 8;
+        let h = 6;
+        let mut pic = SubbandData::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                // A non-trivial pattern: diagonal gradient + sparse spikes.
+                let mut v = (x as i32 * 3 - y as i32 * 5) * 4;
+                if (x + y) % 7 == 0 {
+                    v += 200;
+                }
+                pic.set(y, x, v);
+            }
+        }
+        let (ll, hl, lh, hh) =
+            vh_analysis(&pic, WaveletFilter::LeGall5_3);
+        let back = vh_synth(
+            &ll,
+            &hl,
+            &lh,
+            &hh,
+            WaveletFilter::LeGall5_3,
+        );
+        assert_eq!(back.width, w);
+        assert_eq!(back.height, h);
+        for y in 0..h {
+            for x in 0..w {
+                assert_eq!(
+                    back.get(y, x),
+                    pic.get(y, x),
+                    "({x},{y})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dwt_idwt_roundtrip_legall_depth3() {
+        // 32x32 picture, depth 3 => subband sizes 4,4,8,16 per level.
+        let w = 32;
+        let h = 32;
+        let mut pic = SubbandData::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let v = ((x as i32) ^ (y as i32 * 3)) * 2 - 32;
+                pic.set(y, x, v);
+            }
+        }
+        let pyramid = dwt(&pic, WaveletFilter::LeGall5_3, 3);
+        let back = idwt(&pyramid, WaveletFilter::LeGall5_3);
+        for y in 0..h {
+            for x in 0..w {
+                assert_eq!(
+                    back.get(y, x),
+                    pic.get(y, x),
+                    "dwt/idwt roundtrip failed at ({x},{y})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dwt_idwt_roundtrip_dd97_depth2() {
+        let w = 16;
+        let h = 16;
+        let mut pic = SubbandData::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                pic.set(y, x, (x as i32 * 7 - y as i32 * 3) % 101);
+            }
+        }
+        let pyramid =
+            dwt(&pic, WaveletFilter::DeslauriersDubuc9_7, 2);
+        let back =
+            idwt(&pyramid, WaveletFilter::DeslauriersDubuc9_7);
+        for y in 0..h {
+            for x in 0..w {
+                assert_eq!(back.get(y, x), pic.get(y, x));
+            }
+        }
+    }
+
+    #[test]
+    fn dwt_idwt_roundtrip_haar0_depth2() {
+        let w = 8;
+        let h = 8;
+        let mut pic = SubbandData::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                pic.set(y, x, (x + y * w) as i32);
+            }
+        }
+        let pyramid = dwt(&pic, WaveletFilter::Haar0, 2);
+        let back = idwt(&pyramid, WaveletFilter::Haar0);
+        for y in 0..h {
+            for x in 0..w {
+                assert_eq!(back.get(y, x), pic.get(y, x));
+            }
+        }
     }
 }
