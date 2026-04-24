@@ -101,3 +101,108 @@ fn decoder_produces_first_frame_from_hq_vc2_intra() {
         other => panic!("expected a video frame, got {other:?}"),
     }
 }
+
+/// Shell out to ffmpeg (if present) and emit a tiny 10-bit 4:2:0
+/// VC-2 stream, then feed it through our decoder and check we now
+/// produce a `Yuv420P10Le` frame rather than demoting to 8 bits. The
+/// test is skipped cleanly when ffmpeg isn't available so CI doesn't
+/// need it pre-installed.
+fn build_10bit_stream(dest: &std::path::Path) -> bool {
+    let ok = std::process::Command::new("ffmpeg")
+        .arg("-version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        return false;
+    }
+    // `-f dirac` raw elementary stream; single-frame 64x64, 10-bit
+    // 4:2:0, shallow wavelet depth so the slice buffers fit in the
+    // decoder's default plumbing.
+    let status = std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=64x64:duration=0.04:rate=25",
+            "-pix_fmt",
+            "yuv420p10le",
+            "-c:v",
+            "vc2",
+            "-wavelet_depth",
+            "2",
+            "-frames:v",
+            "1",
+            "-f",
+            "dirac",
+        ])
+        .arg(dest)
+        .status();
+    matches!(status, Ok(s) if s.success())
+}
+
+#[test]
+fn ffmpeg_10bit_yuv420_produces_yuv420p10le_frame() {
+    let tmp = std::env::temp_dir().join("oxideav_dirac_10bit_64x64.drc");
+    if !build_10bit_stream(&tmp) {
+        eprintln!("ffmpeg not available or failed to build 10-bit fixture; skipping");
+        return;
+    }
+    let data = std::fs::read(&tmp).expect("read generated fixture");
+
+    let mut reg = CodecRegistry::new();
+    oxideav_dirac::register(&mut reg);
+    let params = CodecParameters::video(CodecId::new("dirac"));
+    let mut dec = reg.make_decoder(&params).expect("decoder");
+    let packet =
+        oxideav_core::Packet::new(0, oxideav_core::TimeBase::new(1, 25), data);
+    dec.send_packet(&packet).expect("send_packet");
+    let frame = dec.receive_frame().expect("receive_frame");
+    match frame {
+        Frame::Video(v) => {
+            assert_eq!(v.width, 64);
+            assert_eq!(v.height, 64);
+            // The fixture is 4:2:0 + 10-bit — the decoder should emit
+            // the proper LE 16-bit planar format, not 8-bit demotion.
+            assert_eq!(v.format, PixelFormat::Yuv420P10Le);
+            assert_eq!(v.planes.len(), 3);
+            // Two bytes per luma sample, width=64 rows:
+            assert_eq!(v.planes[0].stride, 128);
+            assert_eq!(v.planes[0].data.len(), 64 * 64 * 2);
+            // Chroma: 32x32 * 2 bytes per sample.
+            assert_eq!(v.planes[1].stride, 64);
+            assert_eq!(v.planes[1].data.len(), 32 * 32 * 2);
+
+            // Decoder derives the timebase from the sequence header's
+            // frame rate (§10.3.5); it must at minimum be sensible.
+            let tb = v.time_base.as_rational();
+            assert!(tb.num > 0 && tb.den > 0);
+
+            // Sanity: the first sample should vary across the picture.
+            // testsrc is a vivid pattern; a flat / garbled output
+            // would sit near a single value.
+            let mut min: u16 = u16::MAX;
+            let mut max: u16 = 0;
+            for chunk in v.planes[0].data.chunks_exact(2) {
+                let s = u16::from_le_bytes([chunk[0], chunk[1]]);
+                if s < min {
+                    min = s;
+                }
+                if s > max {
+                    max = s;
+                }
+            }
+            assert!(
+                max as i32 - min as i32 > 50,
+                "expected a varied 10-bit Y plane (min={min}, max={max})"
+            );
+        }
+        other => panic!("expected a video frame, got {other:?}"),
+    }
+}

@@ -47,6 +47,16 @@
 //!   end-to-end testing of this path relies on primitives-level unit
 //!   tests until a third-party Dirac encoder is available.
 //!
+//! Output plumbing: the decoder front-end picks an oxideav-core
+//! [`PixelFormat`](oxideav_core::PixelFormat) from the sequence
+//! header's chroma format + luma bit depth. 8-bit streams emit
+//! `Yuv420P / Yuv422P / Yuv444P`; 9-10-bit streams emit
+//! `Yuv*P10Le` (two bytes per sample, little-endian); 11-12-bit 4:2:0
+//! emits `Yuv420P12Le`. Frame `time_base` is derived from §10.3.5
+//! `frame_rate_numer / frame_rate_denom`, and an incoming packet's
+//! `pts` is carried through to the decoded frame (falling back to
+//! the §12.2 picture_number when absent).
+//!
 //! Still unsupported (planned): v3 extended transform parameters
 //! (horizontal-only transforms).
 
