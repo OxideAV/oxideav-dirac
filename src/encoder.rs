@@ -399,13 +399,31 @@ pub fn encode_sequence_header(sequence: &SequenceHeader) -> Vec<u8> {
     w.write_bool(false);
     // Clean area: default.
     w.write_bool(false);
-    // Signal range: use custom bit-depth fields directly.
+    // Signal range: prefer a preset index when the params match (keeps
+    // the header compact and matches what ffmpeg-compatible decoders
+    // expect). Fall back to a fully custom (index 0) range when the
+    // caller supplies something off-preset.
     w.write_bool(true);
-    w.write_uint(0); // custom signal range
-    w.write_uint(sequence.video_params.signal_range.luma_offset);
-    w.write_uint(sequence.video_params.signal_range.luma_excursion);
-    w.write_uint(sequence.video_params.signal_range.chroma_offset);
-    w.write_uint(sequence.video_params.signal_range.chroma_excursion);
+    let sr = &sequence.video_params.signal_range;
+    use crate::video_format::SignalRange;
+    let preset_idx = if *sr == SignalRange::PRESET_8BIT_FULL {
+        1
+    } else if *sr == SignalRange::PRESET_8BIT_VIDEO {
+        2
+    } else if *sr == SignalRange::PRESET_10BIT_VIDEO {
+        3
+    } else if *sr == SignalRange::PRESET_12BIT_VIDEO {
+        4
+    } else {
+        0
+    };
+    w.write_uint(preset_idx);
+    if preset_idx == 0 {
+        w.write_uint(sr.luma_offset);
+        w.write_uint(sr.luma_excursion);
+        w.write_uint(sr.chroma_offset);
+        w.write_uint(sr.chroma_excursion);
+    }
     // Colour spec: default.
     w.write_bool(false);
 
@@ -506,8 +524,8 @@ pub fn make_minimal_sequence(
         parse_parameters: ParseParameters {
             version_major: 2,
             version_minor: 0,
-            profile: 3, // high quality (VC-2)
-            level: 0,
+            profile: 3, // VC-2 high quality
+            level: 3,   // VC-2 sub-sampled HQ profile level
         },
         base_video_format_index: 0,
         video_params: vp,
