@@ -107,20 +107,27 @@ fn decoder_produces_first_frame_from_hq_vc2_intra() {
 /// produce a `Yuv420P10Le` frame rather than demoting to 8 bits. The
 /// test is skipped cleanly when ffmpeg isn't available so CI doesn't
 /// need it pre-installed.
-fn build_10bit_stream(dest: &std::path::Path) -> bool {
-    let ok = std::process::Command::new("ffmpeg")
+fn ffmpeg_available() -> bool {
+    std::process::Command::new("ffmpeg")
         .arg("-version")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
         .map(|s| s.success())
-        .unwrap_or(false);
-    if !ok {
+        .unwrap_or(false)
+}
+
+/// Build a tiny VC-2 Dirac elementary stream with the given
+/// `pix_fmt`. Returns true on success, false if ffmpeg isn't
+/// available or the shell-out fails — callers skip cleanly in
+/// that case.
+fn build_vc2_stream(dest: &std::path::Path, pix_fmt: &str) -> bool {
+    if !ffmpeg_available() {
         return false;
     }
-    // `-f dirac` raw elementary stream; single-frame 64x64, 10-bit
-    // 4:2:0, shallow wavelet depth so the slice buffers fit in the
-    // decoder's default plumbing.
+    // `-f dirac` raw elementary stream; single-frame 64x64, shallow
+    // wavelet depth so the slice buffers fit in the decoder's
+    // default plumbing.
     let status = std::process::Command::new("ffmpeg")
         .args([
             "-y",
@@ -132,7 +139,7 @@ fn build_10bit_stream(dest: &std::path::Path) -> bool {
             "-i",
             "testsrc=size=64x64:duration=0.04:rate=25",
             "-pix_fmt",
-            "yuv420p10le",
+            pix_fmt,
             "-c:v",
             "vc2",
             "-wavelet_depth",
@@ -145,6 +152,10 @@ fn build_10bit_stream(dest: &std::path::Path) -> bool {
         .arg(dest)
         .status();
     matches!(status, Ok(s) if s.success())
+}
+
+fn build_10bit_stream(dest: &std::path::Path) -> bool {
+    build_vc2_stream(dest, "yuv420p10le")
 }
 
 #[test]
@@ -160,8 +171,7 @@ fn ffmpeg_10bit_yuv420_produces_yuv420p10le_frame() {
     oxideav_dirac::register(&mut reg);
     let params = CodecParameters::video(CodecId::new("dirac"));
     let mut dec = reg.make_decoder(&params).expect("decoder");
-    let packet =
-        oxideav_core::Packet::new(0, oxideav_core::TimeBase::new(1, 25), data);
+    let packet = oxideav_core::Packet::new(0, oxideav_core::TimeBase::new(1, 25), data);
     dec.send_packet(&packet).expect("send_packet");
     let frame = dec.receive_frame().expect("receive_frame");
     match frame {
@@ -201,6 +211,59 @@ fn ffmpeg_10bit_yuv420_produces_yuv420p10le_frame() {
             assert!(
                 max as i32 - min as i32 > 50,
                 "expected a varied 10-bit Y plane (min={min}, max={max})"
+            );
+        }
+        other => panic!("expected a video frame, got {other:?}"),
+    }
+}
+
+/// 8-bit 4:2:2 ffmpeg-interop baseline. The checked-in `tiny_1f.drc`
+/// fixture is 8-bit 4:4:4, and the round-1 highbitdepth test covers
+/// 10-bit 4:2:0 — this test plugs the 8-bit 4:2:2 gap so all three
+/// chroma geometries (§10.4) have baseline conformance coverage.
+#[test]
+fn ffmpeg_8bit_yuv422_produces_yuv422p_frame() {
+    let tmp = std::env::temp_dir().join("oxideav_dirac_8bit_422_64x64.drc");
+    if !build_vc2_stream(&tmp, "yuv422p") {
+        eprintln!("ffmpeg not available or failed to build 8-bit 4:2:2 fixture; skipping");
+        return;
+    }
+    let data = std::fs::read(&tmp).expect("read generated fixture");
+
+    let mut reg = CodecRegistry::new();
+    oxideav_dirac::register(&mut reg);
+    let params = CodecParameters::video(CodecId::new("dirac"));
+    let mut dec = reg.make_decoder(&params).expect("decoder");
+    let packet = oxideav_core::Packet::new(0, oxideav_core::TimeBase::new(1, 25), data);
+    dec.send_packet(&packet).expect("send_packet");
+    let frame = dec.receive_frame().expect("receive_frame");
+    match frame {
+        Frame::Video(v) => {
+            assert_eq!(v.width, 64);
+            assert_eq!(v.height, 64);
+            // 8-bit 4:2:2 — one byte per sample, horizontally
+            // sub-sampled chroma (§10.4 Table 10.3).
+            assert_eq!(v.format, PixelFormat::Yuv422P);
+            assert_eq!(v.planes.len(), 3);
+            assert_eq!(v.planes[0].stride, 64);
+            assert_eq!(v.planes[0].data.len(), 64 * 64);
+            // Chroma: 32x64, 1 byte per sample.
+            assert_eq!(v.planes[1].stride, 32);
+            assert_eq!(v.planes[1].data.len(), 32 * 64);
+            assert_eq!(v.planes[2].stride, 32);
+            assert_eq!(v.planes[2].data.len(), 32 * 64);
+
+            let tb = v.time_base.as_rational();
+            assert!(tb.num > 0 && tb.den > 0);
+
+            // Same testsrc sanity check as the 8-bit 4:4:4 fixture:
+            // a flat / garbled Y plane would sit near a single value.
+            let y = &v.planes[0].data;
+            let min = *y.iter().min().unwrap();
+            let max = *y.iter().max().unwrap();
+            assert!(
+                max - min > 50,
+                "expected a varied 8-bit Y plane (min={min}, max={max})"
             );
         }
         other => panic!("expected a video frame, got {other:?}"),
