@@ -269,3 +269,147 @@ fn ffmpeg_8bit_yuv422_produces_yuv422p_frame() {
         other => panic!("expected a video frame, got {other:?}"),
     }
 }
+
+/// Round-trip our HQ encoder through ffmpeg: encode a synthetic frame
+/// with `encode_single_hq_intra_stream`, feed the resulting elementary
+/// stream to ffmpeg's `dirac` decoder, and compare the decoded YUV
+/// back to the original planes.
+///
+/// At qindex=0 this is bit-exact (the dead-zone quantiser is an
+/// identity for small integer coefficients and LeGall 5/3's lifting
+/// DWT is reversible). PSNR should be `+inf`; we assert ≥ 48 dB to
+/// keep the test robust if future encoder changes introduce tiny
+/// rounding errors.
+#[test]
+fn ffmpeg_decodes_our_hq_stream_lossless_q0() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg not available; skipping HQ interop test");
+        return;
+    }
+    use oxideav_dirac::encoder::{
+        encode_single_hq_intra_stream, make_minimal_sequence, synthetic_testsrc_64_yuv420,
+        EncoderParams,
+    };
+    use oxideav_dirac::wavelet::WaveletFilter;
+
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let params = EncoderParams::default_hq(WaveletFilter::LeGall5_3, 3);
+    let (y, u, v) = synthetic_testsrc_64_yuv420();
+    let stream = encode_single_hq_intra_stream(&seq, &params, 0, &y, &u, &v);
+
+    // Write to a temp file and decode with ffmpeg -f dirac.
+    let tmpdir = std::env::temp_dir();
+    let drc = tmpdir.join("oxideav_dirac_interop_hq.drc");
+    let yuv = tmpdir.join("oxideav_dirac_interop_hq.yuv");
+    std::fs::write(&drc, &stream).expect("write drc");
+
+    let status = std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "dirac",
+            "-i",
+        ])
+        .arg(&drc)
+        .args(["-f", "rawvideo", "-pix_fmt", "yuv420p"])
+        .arg(&yuv)
+        .status()
+        .expect("run ffmpeg");
+    assert!(
+        status.success(),
+        "ffmpeg decode failed — HQ stream malformed"
+    );
+
+    let out = std::fs::read(&yuv).expect("read ffmpeg yuv");
+    assert_eq!(out.len(), 64 * 64 + 2 * 32 * 32);
+    let out_y = &out[..64 * 64];
+    let out_u = &out[64 * 64..64 * 64 + 32 * 32];
+    let out_v = &out[64 * 64 + 32 * 32..];
+
+    fn psnr(a: &[u8], b: &[u8]) -> f64 {
+        assert_eq!(a.len(), b.len());
+        let mut sse: u64 = 0;
+        for i in 0..a.len() {
+            let d = a[i] as i32 - b[i] as i32;
+            sse += (d * d) as u64;
+        }
+        if sse == 0 {
+            return f64::INFINITY;
+        }
+        let mse = sse as f64 / a.len() as f64;
+        20.0 * (255.0f64).log10() - 10.0 * mse.log10()
+    }
+
+    let y_psnr = psnr(out_y, &y);
+    let u_psnr = psnr(out_u, &u);
+    let v_psnr = psnr(out_v, &v);
+    eprintln!("ffmpeg HQ decode PSNR: Y={y_psnr:.2} U={u_psnr:.2} V={v_psnr:.2}");
+    assert!(
+        y_psnr >= 48.0,
+        "Y PSNR {y_psnr:.2} dB below 48 dB — HQ stream lost fidelity through ffmpeg"
+    );
+    assert!(u_psnr >= 48.0, "U PSNR {u_psnr:.2} dB below 48 dB");
+    assert!(v_psnr >= 48.0, "V PSNR {v_psnr:.2} dB below 48 dB");
+}
+
+/// Verify ffmpeg at least *accepts* our LD stream (no decode error
+/// raised). Pixel-fidelity interop of the LD bit-packed slice format
+/// is still an open gap — ffmpeg decodes our LD stream at ~12 dB PSNR
+/// because of a systematic disagreement in the slice coefficient
+/// unpacking path (the HQ stream round-trips bit-exactly through the
+/// same ffmpeg decoder, so the framing / sequence header / parse info
+/// are all conformant).
+///
+/// This test only asserts "ffmpeg does not error out", which is the
+/// minimum-useful guarantee: the stream is well-formed at the parse-
+/// info and sequence-header levels even if coefficient recovery
+/// fidelity is imperfect.
+#[test]
+fn ffmpeg_accepts_our_ld_stream_without_error() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg not available; skipping LD interop test");
+        return;
+    }
+    use oxideav_dirac::encoder::{
+        encode_single_ld_intra_stream, make_minimal_sequence_ld, synthetic_testsrc_64_yuv420,
+        LdEncoderParams,
+    };
+    use oxideav_dirac::wavelet::WaveletFilter;
+
+    let seq = make_minimal_sequence_ld(64, 64, ChromaFormat::Yuv420);
+    let params = LdEncoderParams::default_ld(WaveletFilter::LeGall5_3, 3, 4, 4, 128);
+    let (y, u, v) = synthetic_testsrc_64_yuv420();
+    let stream = encode_single_ld_intra_stream(&seq, &params, 0, &y, &u, &v);
+
+    let tmpdir = std::env::temp_dir();
+    let drc = tmpdir.join("oxideav_dirac_interop_ld.drc");
+    let yuv = tmpdir.join("oxideav_dirac_interop_ld.yuv");
+    std::fs::write(&drc, &stream).expect("write drc");
+
+    let status = std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "dirac",
+            "-i",
+        ])
+        .arg(&drc)
+        .args(["-f", "rawvideo", "-pix_fmt", "yuv420p"])
+        .arg(&yuv)
+        .status()
+        .expect("run ffmpeg");
+    assert!(
+        status.success(),
+        "ffmpeg rejected our LD stream — framing / sequence header regressed"
+    );
+    // Output should at least be the right byte count even if
+    // coefficient fidelity is imperfect.
+    let out = std::fs::read(&yuv).expect("read ffmpeg yuv");
+    assert_eq!(out.len(), 64 * 64 + 2 * 32 * 32);
+}

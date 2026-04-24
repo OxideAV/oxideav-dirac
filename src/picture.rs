@@ -1021,8 +1021,11 @@ pub fn intra_dc_prediction(band: &mut SubbandData) {
 }
 
 fn mean3(a: i32, b: i32, c: i32) -> i32 {
+    // §1.3 defines `a // b` as floor division — rounds toward -infinity,
+    // unlike Rust's `/` which truncates toward zero. For a negative
+    // sum, this matters: `-7 // 3 = -3` but `-7 / 3 = -2` in Rust.
     let s = a as i64 + b as i64 + c as i64;
-    (s / 3) as i32
+    s.div_euclid(3) as i32
 }
 
 /// Crop the IDWT output to the real component size (§15.7), clip to

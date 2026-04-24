@@ -369,60 +369,113 @@ fn write_slice_band(
 
 /// Emit a sequence header payload (not including the parse info).
 /// Mirrors [`crate::sequence::parse_sequence_header`] on the read side.
+///
+/// For each overridable field, we only set the custom flag if the
+/// caller's value differs from the preset's default. This keeps
+/// Annex C preset-conformant headers (Level 1, §D.2.3) compact and
+/// flag-free while still supporting ad-hoc customisations when the
+/// caller picks `base_video_format_index = 0` (Custom).
 pub fn encode_sequence_header(sequence: &SequenceHeader) -> Vec<u8> {
+    use crate::video_format::{BaseVideoFormat, SignalRange};
     let mut w = BitWriter::new();
     // parse_parameters (§10.1).
     w.write_uint(sequence.parse_parameters.version_major);
     w.write_uint(sequence.parse_parameters.version_minor);
     w.write_uint(sequence.parse_parameters.profile);
     w.write_uint(sequence.parse_parameters.level);
-    // base_video_format index — we pick 0 (custom) and override the
-    // fields we care about below.
+    // base_video_format index — 0 (Custom) or 1..=20 (Annex C preset).
     w.write_uint(sequence.base_video_format_index);
 
-    // Custom frame size always on so we can reconstruct exact dims.
-    w.write_bool(true);
-    w.write_uint(sequence.video_params.frame_width);
-    w.write_uint(sequence.video_params.frame_height);
+    // Pull the preset defaults. For index 0 (Custom) lookup gives a
+    // 640x480 stub; for a real preset this matches the spec exactly.
+    let base = BaseVideoFormat::lookup(sequence.base_video_format_index)
+        .unwrap_or_else(|| BaseVideoFormat::lookup(0).unwrap());
+    let vp = &sequence.video_params;
+
+    // Custom frame size — only emit the override if dims differ.
+    let dims_match = vp.frame_width == base.frame_width && vp.frame_height == base.frame_height;
+    w.write_bool(!dims_match);
+    if !dims_match {
+        w.write_uint(vp.frame_width);
+        w.write_uint(vp.frame_height);
+    }
 
     // Chroma sampling format.
-    w.write_bool(true);
-    w.write_uint(sequence.video_params.chroma_format.to_index());
-
-    // Scan format.
-    w.write_bool(false); // rely on base default — progressive.
-                         // Frame rate: rely on default.
-    w.write_bool(false);
-    // Pixel aspect ratio: default.
-    w.write_bool(false);
-    // Clean area: default.
-    w.write_bool(false);
-    // Signal range: prefer a preset index when the params match (keeps
-    // the header compact and matches what ffmpeg-compatible decoders
-    // expect). Fall back to a fully custom (index 0) range when the
-    // caller supplies something off-preset.
-    w.write_bool(true);
-    let sr = &sequence.video_params.signal_range;
-    use crate::video_format::SignalRange;
-    let preset_idx = if *sr == SignalRange::PRESET_8BIT_FULL {
-        1
-    } else if *sr == SignalRange::PRESET_8BIT_VIDEO {
-        2
-    } else if *sr == SignalRange::PRESET_10BIT_VIDEO {
-        3
-    } else if *sr == SignalRange::PRESET_12BIT_VIDEO {
-        4
-    } else {
-        0
-    };
-    w.write_uint(preset_idx);
-    if preset_idx == 0 {
-        w.write_uint(sr.luma_offset);
-        w.write_uint(sr.luma_excursion);
-        w.write_uint(sr.chroma_offset);
-        w.write_uint(sr.chroma_excursion);
+    let chroma_match = vp.chroma_format == base.chroma_format;
+    w.write_bool(!chroma_match);
+    if !chroma_match {
+        w.write_uint(vp.chroma_format.to_index());
     }
-    // Colour spec: default.
+
+    // Scan format — we always carry the base default (progressive).
+    let scan_match = vp.source_sampling == base.source_sampling;
+    w.write_bool(!scan_match);
+    if !scan_match {
+        let idx = match vp.source_sampling {
+            crate::video_format::ScanFormat::Progressive => 0,
+            crate::video_format::ScanFormat::Interlaced => 1,
+        };
+        w.write_uint(idx);
+    }
+
+    // Frame rate — omit when the base preset already matches.
+    let fr_match = vp.frame_rate_numer == base.frame_rate_numer
+        && vp.frame_rate_denom == base.frame_rate_denom;
+    w.write_bool(!fr_match);
+    if !fr_match {
+        w.write_uint(0); // custom: emit explicit numer/denom.
+        w.write_uint(vp.frame_rate_numer);
+        w.write_uint(vp.frame_rate_denom);
+    }
+
+    // Pixel aspect ratio.
+    let par_match = vp.pixel_aspect_ratio_numer == base.pixel_aspect_ratio_numer
+        && vp.pixel_aspect_ratio_denom == base.pixel_aspect_ratio_denom;
+    w.write_bool(!par_match);
+    if !par_match {
+        w.write_uint(0);
+        w.write_uint(vp.pixel_aspect_ratio_numer);
+        w.write_uint(vp.pixel_aspect_ratio_denom);
+    }
+
+    // Clean area.
+    let clean_match = vp.clean_width == base.clean_width
+        && vp.clean_height == base.clean_height
+        && vp.clean_left_offset == base.clean_left_offset
+        && vp.clean_top_offset == base.clean_top_offset;
+    w.write_bool(!clean_match);
+    if !clean_match {
+        w.write_uint(vp.clean_width);
+        w.write_uint(vp.clean_height);
+        w.write_uint(vp.clean_left_offset);
+        w.write_uint(vp.clean_top_offset);
+    }
+
+    // Signal range — emit a preset index when it matches, else custom.
+    let sr_match = vp.signal_range == base.signal_range;
+    w.write_bool(!sr_match);
+    if !sr_match {
+        let preset_idx = if vp.signal_range == SignalRange::PRESET_8BIT_FULL {
+            1
+        } else if vp.signal_range == SignalRange::PRESET_8BIT_VIDEO {
+            2
+        } else if vp.signal_range == SignalRange::PRESET_10BIT_VIDEO {
+            3
+        } else if vp.signal_range == SignalRange::PRESET_12BIT_VIDEO {
+            4
+        } else {
+            0
+        };
+        w.write_uint(preset_idx);
+        if preset_idx == 0 {
+            w.write_uint(vp.signal_range.luma_offset);
+            w.write_uint(vp.signal_range.luma_excursion);
+            w.write_uint(vp.signal_range.chroma_offset);
+            w.write_uint(vp.signal_range.chroma_excursion);
+        }
+    }
+
+    // Colour spec — always default.
     w.write_bool(false);
 
     // picture_coding_mode.
@@ -488,10 +541,43 @@ pub fn encode_single_hq_intra_stream(
 
 /// Build a minimal sequence header describing an `WxH` progressive
 /// 4:2:0 8-bit stream (or 4:4:4 / 4:2:2 depending on `chroma`).
+///
+/// Produces an HQ-profile (profile=3) sequence header — suitable for
+/// streams emitted via [`encode_single_hq_intra_stream`]. For LD
+/// streams, call [`make_minimal_sequence_ld`] (or patch `profile` to
+/// 0 — §D.1.1) so the parse parameters match the payload syntax.
+///
+/// `base_video_format_index` is 0 (Custom) with the width / height /
+/// chroma / signal-range fields carried explicitly so the header can
+/// describe any `(W, H, chroma)`. Level is set to 0 (RESERVED per
+/// §D.2) because §D.2.3 Level 1 forbids all custom flags and our
+/// sequences override at least dimensions; level 128 is Main-LongGOP
+/// only. Applications that need a conformant level should use
+/// [`make_preset_sequence`] with an Annex C index.
 pub fn make_minimal_sequence(
     frame_width: u32,
     frame_height: u32,
     chroma: ChromaFormat,
+) -> SequenceHeader {
+    make_minimal_sequence_for(frame_width, frame_height, chroma, 3)
+}
+
+/// Same as [`make_minimal_sequence`] but with `profile = 0` — the
+/// Low Delay VC-2 profile (§D.1.1). Matches streams emitted by
+/// [`encode_single_ld_intra_stream`].
+pub fn make_minimal_sequence_ld(
+    frame_width: u32,
+    frame_height: u32,
+    chroma: ChromaFormat,
+) -> SequenceHeader {
+    make_minimal_sequence_for(frame_width, frame_height, chroma, 0)
+}
+
+fn make_minimal_sequence_for(
+    frame_width: u32,
+    frame_height: u32,
+    chroma: ChromaFormat,
+    profile: u32,
 ) -> SequenceHeader {
     use crate::sequence::{ParseParameters, PictureCodingMode, VideoParams};
     use crate::video_format::{ScanFormat, SignalRange};
@@ -521,8 +607,9 @@ pub fn make_minimal_sequence(
         parse_parameters: ParseParameters {
             version_major: 2,
             version_minor: 0,
-            profile: 3, // VC-2 high quality
-            level: 3,   // VC-2 sub-sampled HQ profile level
+            profile,
+            level: 0, // RESERVED — streams with overridden dims don't
+                      // fit Level 1 (§D.2.3) or Level 128 (Main-LongGOP only).
         },
         base_video_format_index: 0,
         video_params: vp,
@@ -533,6 +620,57 @@ pub fn make_minimal_sequence(
         chroma_height: chroma_h,
         luma_depth: 8,
         chroma_depth: 8,
+    }
+}
+
+/// Build a sequence header that fits an Annex C preset exactly
+/// (base_video_format indices 1..=20) with no custom-field overrides.
+/// This is the path required by §D.2.3 Level 1: every `custom_*_flag`
+/// stays False and the stream declares `level = 1`.
+///
+/// `profile` should be 0 for LD (§D.1.1) or 3 for VC-2 HQ.
+/// Returns `None` if `preset_index` is not in `1..=20`.
+pub fn make_preset_sequence(preset_index: u32, profile: u32) -> Option<SequenceHeader> {
+    use crate::sequence::{ParseParameters, PictureCodingMode, VideoParams};
+    use crate::video_format::BaseVideoFormat;
+    let base = BaseVideoFormat::lookup(preset_index)?;
+    if !(1..=20).contains(&preset_index) {
+        return None;
+    }
+    let vp: VideoParams = base.into();
+    let (chroma_w, chroma_h) = match vp.chroma_format {
+        ChromaFormat::Yuv444 => (vp.frame_width, vp.frame_height),
+        ChromaFormat::Yuv422 => (vp.frame_width / 2, vp.frame_height),
+        ChromaFormat::Yuv420 => (vp.frame_width / 2, vp.frame_height / 2),
+    };
+    let luma_depth = intlog2_ceil_u32(vp.signal_range.luma_excursion + 1);
+    let chroma_depth = intlog2_ceil_u32(vp.signal_range.chroma_excursion + 1);
+    let luma_w = vp.frame_width;
+    let luma_h = vp.frame_height;
+    Some(SequenceHeader {
+        parse_parameters: ParseParameters {
+            version_major: 2,
+            version_minor: 0,
+            profile,
+            level: 1, // VC-2 default level.
+        },
+        base_video_format_index: preset_index,
+        video_params: vp,
+        picture_coding_mode: PictureCodingMode::Frames,
+        luma_width: luma_w,
+        luma_height: luma_h,
+        chroma_width: chroma_w,
+        chroma_height: chroma_h,
+        luma_depth,
+        chroma_depth,
+    })
+}
+
+fn intlog2_ceil_u32(n: u32) -> u32 {
+    if n <= 1 {
+        0
+    } else {
+        32 - (n - 1).leading_zeros()
     }
 }
 
@@ -651,7 +789,11 @@ pub fn forward_dc_prediction(band: &mut SubbandData) {
                 let b = orig[(y - 1) * w + (x - 1)];
                 let c = orig[(y - 1) * w + x];
                 let s = a as i64 + b as i64 + c as i64;
-                (s / 3) as i32
+                // §1.3 floor division — rounds toward -infinity.
+                // Rust's `/` truncates toward zero, which disagrees on
+                // negative sums. Self-roundtrip survives because both
+                // sides use the same formula; ffmpeg follows the spec.
+                s.div_euclid(3) as i32
             } else if x > 0 {
                 orig[y * w + (x - 1)]
             } else if y > 0 {
@@ -1016,6 +1158,13 @@ fn write_ld_slice_chroma_pair(
 
 /// Encode one 8-bit 4:2:0 YUV frame as a VC-2 LD intra-only elementary
 /// stream.
+///
+/// LD profile (§D.1.1) uses parse code `0xC8` (Intra Non-Reference
+/// Picture) exclusively — `0xCC` from Table 9.1 is *syntactically*
+/// permitted in the low-delay family, but §D.1.1 restricts compliant
+/// LD sequences to non-reference intra pictures. Callers needing a
+/// multi-picture sequence should use
+/// [`encode_ld_intra_multi_stream`].
 pub fn encode_single_ld_intra_stream(
     sequence: &SequenceHeader,
     params: &LdEncoderParams,
@@ -1039,6 +1188,93 @@ pub fn encode_single_ld_intra_stream(
     write_parse_info(&mut out, 0xC8, pic_unit_len as u32, sh_unit_len as u32);
     out.extend_from_slice(&pic_payload);
     write_parse_info(&mut out, 0x10, 0, pic_unit_len as u32);
+    out
+}
+
+/// One input picture: Y/U/V planes + picture number.
+#[derive(Debug, Clone)]
+pub struct InputPicture<'a> {
+    pub picture_number: u32,
+    pub y: &'a [u8],
+    pub u: &'a [u8],
+    pub v: &'a [u8],
+}
+
+/// Encode a multi-picture VC-2 LD intra-only elementary stream. Every
+/// picture uses parse code `0xC8` (Intra Non-Reference) per §D.1.1 —
+/// LD profile does not permit reference pictures.
+pub fn encode_ld_intra_multi_stream(
+    sequence: &SequenceHeader,
+    params: &LdEncoderParams,
+    pictures: &[InputPicture<'_>],
+) -> Vec<u8> {
+    let sh_payload = encode_sequence_header(sequence);
+    let pi_size = 13usize;
+    let sh_unit_len = pi_size + sh_payload.len();
+
+    let mut out = Vec::new();
+    write_parse_info(&mut out, 0x00, sh_unit_len as u32, 0);
+    out.extend_from_slice(&sh_payload);
+
+    let mut prev_len = sh_unit_len as u32;
+    let mut last_pic_len: Option<u32> = None;
+    for pic in pictures {
+        let pic_payload =
+            encode_ld_intra_picture(sequence, params, pic.picture_number, pic.y, pic.u, pic.v);
+        let pic_unit_len = (pi_size + pic_payload.len()) as u32;
+        write_parse_info(&mut out, 0xC8, pic_unit_len, prev_len);
+        out.extend_from_slice(&pic_payload);
+        prev_len = pic_unit_len;
+        last_pic_len = Some(pic_unit_len);
+    }
+    // End of sequence — `prev` is the last picture's unit length (or
+    // the seq-header if there were no pictures).
+    write_parse_info(
+        &mut out,
+        0x10,
+        0,
+        last_pic_len.unwrap_or(sh_unit_len as u32),
+    );
+    out
+}
+
+/// Encode a multi-picture VC-2 HQ intra-only elementary stream,
+/// alternating reference (`0xEC`) and non-reference (`0xE8`) parse
+/// codes. Every second picture is emitted as a reference picture —
+/// that covers the "reference-intra alternation" niche without
+/// introducing any inter-picture dependencies.
+pub fn encode_hq_intra_multi_stream(
+    sequence: &SequenceHeader,
+    params: &EncoderParams,
+    pictures: &[InputPicture<'_>],
+) -> Vec<u8> {
+    let sh_payload = encode_sequence_header(sequence);
+    let pi_size = 13usize;
+    let sh_unit_len = pi_size + sh_payload.len();
+
+    let mut out = Vec::new();
+    write_parse_info(&mut out, 0x00, sh_unit_len as u32, 0);
+    out.extend_from_slice(&sh_payload);
+
+    let mut prev_len = sh_unit_len as u32;
+    let mut last_pic_len: Option<u32> = None;
+    for (i, pic) in pictures.iter().enumerate() {
+        let pic_payload =
+            encode_hq_intra_picture(sequence, params, pic.picture_number, pic.y, pic.u, pic.v);
+        let pic_unit_len = (pi_size + pic_payload.len()) as u32;
+        // Alternate: even index → non-ref (0xE8), odd → ref (0xEC).
+        let parse_code = if i % 2 == 0 { 0xE8 } else { 0xEC };
+        write_parse_info(&mut out, parse_code, pic_unit_len, prev_len);
+        out.extend_from_slice(&pic_payload);
+        prev_len = pic_unit_len;
+        last_pic_len = Some(pic_unit_len);
+    }
+    write_parse_info(
+        &mut out,
+        0x10,
+        0,
+        last_pic_len.unwrap_or(sh_unit_len as u32),
+    );
     out
 }
 
@@ -1097,6 +1333,145 @@ mod tests {
         assert_eq!(parsed.video_params.chroma_format, ChromaFormat::Yuv444);
         assert_eq!(parsed.chroma_width, 32);
         assert_eq!(parsed.chroma_height, 32);
+    }
+
+    /// `make_minimal_sequence_ld` must set profile=0 per §D.1.1 so
+    /// conformance tools recognise the stream as Low Delay, not HQ.
+    #[test]
+    fn ld_minimal_sequence_sets_profile_zero() {
+        let seq = make_minimal_sequence_ld(64, 64, ChromaFormat::Yuv420);
+        assert_eq!(seq.parse_parameters.profile, 0, "LD profile per §D.1.1");
+        // Round-trip — parse what we emit and confirm profile stays 0.
+        let bytes = encode_sequence_header(&seq);
+        let parsed = parse_sequence_header(&bytes).expect("parse");
+        assert_eq!(parsed.parse_parameters.profile, 0);
+    }
+
+    /// `make_preset_sequence` produces an Annex C-conformant header:
+    /// base_video_format carries the preset index and every custom
+    /// flag stays clear (§D.2.3 Level 1).
+    #[test]
+    fn preset_sequence_is_level1_clean() {
+        // QCIF = index 2 (§C.1 Table C.1), LD profile.
+        let seq = make_preset_sequence(2, 0).expect("QCIF preset");
+        assert_eq!(seq.parse_parameters.profile, 0);
+        assert_eq!(seq.parse_parameters.level, 1);
+        assert_eq!(seq.base_video_format_index, 2);
+        assert_eq!(seq.video_params.frame_width, 176);
+        assert_eq!(seq.video_params.frame_height, 144);
+        assert_eq!(seq.video_params.chroma_format, ChromaFormat::Yuv420);
+
+        // Parse back — the stream should decode to the same values.
+        let bytes = encode_sequence_header(&seq);
+        let parsed = parse_sequence_header(&bytes).expect("parse");
+        assert_eq!(parsed.base_video_format_index, 2);
+        assert_eq!(parsed.video_params.frame_width, 176);
+        assert_eq!(parsed.video_params.frame_height, 144);
+        assert_eq!(parsed.parse_parameters.level, 1);
+    }
+
+    /// `make_preset_sequence` rejects out-of-range indices (0 = Custom
+    /// is handled by [`make_minimal_sequence`], not here).
+    #[test]
+    fn preset_sequence_rejects_bad_index() {
+        assert!(make_preset_sequence(0, 0).is_none());
+        assert!(make_preset_sequence(21, 0).is_none());
+        assert!(make_preset_sequence(1, 0).is_some());
+        assert!(make_preset_sequence(20, 0).is_some());
+    }
+
+    /// Multi-picture HQ stream alternates 0xE8 / 0xEC for the niche
+    /// of intra-only reference + non-reference picture interleaving.
+    #[test]
+    fn hq_multi_stream_alternates_parse_codes() {
+        let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+        let params = EncoderParams::default_hq(WaveletFilter::LeGall5_3, 3);
+        let (y, u, v) = synthetic_testsrc_64_yuv420();
+        let pics = [
+            InputPicture {
+                picture_number: 0,
+                y: &y,
+                u: &u,
+                v: &v,
+            },
+            InputPicture {
+                picture_number: 1,
+                y: &y,
+                u: &u,
+                v: &v,
+            },
+            InputPicture {
+                picture_number: 2,
+                y: &y,
+                u: &u,
+                v: &v,
+            },
+        ];
+        let stream = encode_hq_intra_multi_stream(&seq, &params, &pics);
+        // Walk parse-info units to confirm: seq_hdr, then 0xE8, 0xEC, 0xE8, EOS.
+        let mut codes: Vec<u8> = Vec::new();
+        let mut off = 0usize;
+        while off + 13 <= stream.len() {
+            assert_eq!(&stream[off..off + 4], BBCD, "BBCD prefix at {off}");
+            let pc = stream[off + 4];
+            codes.push(pc);
+            let next = u32::from_be_bytes([
+                stream[off + 5],
+                stream[off + 6],
+                stream[off + 7],
+                stream[off + 8],
+            ]);
+            if next == 0 {
+                break;
+            }
+            off += next as usize;
+        }
+        assert_eq!(codes, vec![0x00, 0xE8, 0xEC, 0xE8, 0x10]);
+    }
+
+    /// Multi-picture LD stream only uses 0xC8 (§D.1.1 — reference
+    /// pictures are not permitted in Low Delay profile sequences).
+    #[test]
+    fn ld_multi_stream_stays_non_reference() {
+        let seq = make_minimal_sequence_ld(64, 64, ChromaFormat::Yuv420);
+        let params = LdEncoderParams::default_ld(WaveletFilter::LeGall5_3, 3, 4, 4, 128);
+        let y = [128u8; 64 * 64];
+        let u = [128u8; 32 * 32];
+        let v = [128u8; 32 * 32];
+        let pics = [
+            InputPicture {
+                picture_number: 0,
+                y: &y,
+                u: &u,
+                v: &v,
+            },
+            InputPicture {
+                picture_number: 1,
+                y: &y,
+                u: &u,
+                v: &v,
+            },
+        ];
+        let stream = encode_ld_intra_multi_stream(&seq, &params, &pics);
+        // Walk and confirm seq_hdr + 2x 0xC8 + EOS — NEVER 0xCC.
+        let mut codes: Vec<u8> = Vec::new();
+        let mut off = 0usize;
+        while off + 13 <= stream.len() {
+            assert_eq!(&stream[off..off + 4], BBCD);
+            let pc = stream[off + 4];
+            codes.push(pc);
+            let next = u32::from_be_bytes([
+                stream[off + 5],
+                stream[off + 6],
+                stream[off + 7],
+                stream[off + 8],
+            ]);
+            if next == 0 {
+                break;
+            }
+            off += next as usize;
+        }
+        assert_eq!(codes, vec![0x00, 0xC8, 0xC8, 0x10]);
     }
 
     #[test]
@@ -1189,7 +1564,7 @@ mod tests {
     /// code and then a 0xC8 LD non-reference intra picture.
     #[test]
     fn ld_stream_has_expected_parse_codes() {
-        let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+        let seq = make_minimal_sequence_ld(64, 64, ChromaFormat::Yuv420);
         let params = LdEncoderParams::default_ld(WaveletFilter::LeGall5_3, 3, 4, 4, 128);
         // Use a smooth pattern so the 128-byte budget is sufficient.
         let mut y = [0u8; 64 * 64];
