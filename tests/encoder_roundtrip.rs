@@ -8,7 +8,7 @@
 //! wavelets round-trip bit-exactly. So we expect bit-exact reproduction
 //! of the input plane on the smallest test pattern.
 
-use oxideav_codec::CodecRegistry;
+use oxideav_core::CodecRegistry;
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, PixelFormat, TimeBase};
 use oxideav_dirac::encoder::{
     encode_single_hq_intra_stream, encode_single_ld_intra_stream, make_minimal_sequence,

@@ -79,8 +79,8 @@ pub mod subband;
 pub mod video_format;
 pub mod wavelet;
 
-use oxideav_codec::{CodecInfo, CodecRegistry};
 use oxideav_core::{CodecCapabilities, CodecId, CodecTag};
+use oxideav_core::{CodecInfo, CodecRegistry};
 
 /// Canonical oxideav codec id.
 pub const CODEC_ID_STR: &str = "dirac";

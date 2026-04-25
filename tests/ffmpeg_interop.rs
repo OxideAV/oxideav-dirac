@@ -7,7 +7,7 @@
 //! * Driving the public `Decoder` trait all the way to a decoded
 //!   picture (HQ-profile VC-2 intra pictures produce a `VideoFrame`).
 
-use oxideav_codec::CodecRegistry;
+use oxideav_core::CodecRegistry;
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, PixelFormat, TimeBase};
 use oxideav_dirac::parse_info::ParseInfo;
 use oxideav_dirac::sequence::{parse_sequence_header, PictureCodingMode};

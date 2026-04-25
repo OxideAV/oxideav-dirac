@@ -13,7 +13,7 @@
 //!    admitted on successful decode, oldest evicted when the buffer
 //!    fills.
 
-use oxideav_codec::Decoder;
+use oxideav_core::Decoder;
 use oxideav_core::{
     CodecId, CodecParameters, Error, Frame, Packet, PixelFormat, Result, TimeBase, VideoFrame,
     VideoPlane,
