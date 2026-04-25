@@ -779,4 +779,78 @@ mod tests {
             }
         }
     }
+
+    /// Exhaustive `dwt` / `idwt` round-trip across **all seven** spec
+    /// wavelet filters (Tables 15.1-15.7) for `dwt_depth` 1..=3 on a
+    /// non-trivial 32x32 picture. Every filter is integer-reversible
+    /// by construction (Annex G lifting), so the reconstructed picture
+    /// must be bit-exact regardless of which filter was used.
+    ///
+    /// Catches regressions in filter step ordering, tap signs, or
+    /// `filter_shift()` shift counts that bit-exactly cancel for
+    /// LeGall / DD9_7 (the only filters previously covered) but break
+    /// the heavier filters.
+    #[test]
+    fn dwt_idwt_roundtrip_all_filters_all_depths() {
+        let w = 32;
+        let h = 32;
+        let mut pic = SubbandData::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let mut v = (x as i32 * 3 - y as i32 * 5) * 2;
+                if (x + 2 * y) % 11 == 0 {
+                    v += 64;
+                }
+                pic.set(y, x, v);
+            }
+        }
+        for filter in [
+            WaveletFilter::DeslauriersDubuc9_7,
+            WaveletFilter::LeGall5_3,
+            WaveletFilter::DeslauriersDubuc13_7,
+            WaveletFilter::Haar0,
+            WaveletFilter::Haar1,
+            WaveletFilter::Fidelity,
+            WaveletFilter::Daubechies9_7,
+        ] {
+            for depth in 1..=3u32 {
+                let pyramid = dwt(&pic, filter, depth);
+                let back = idwt(&pyramid, filter);
+                for y in 0..h {
+                    for x in 0..w {
+                        assert_eq!(
+                            back.get(y, x),
+                            pic.get(y, x),
+                            "filter {filter:?} depth {depth} mismatch at ({x},{y})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Round-trip on a non-square picture (40x24) at depth 3 — exercises
+    /// the asymmetric column / row handling in `vh_synth` / `vh_analysis`
+    /// that a square test cannot. 40 and 24 are both multiples of 8 =
+    /// 2^depth, the spec's §15.7 alignment requirement.
+    #[test]
+    fn dwt_idwt_roundtrip_non_square_legall_depth3() {
+        let w = 40;
+        let h = 24;
+        let mut pic = SubbandData::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                pic.set(y, x, (x as i32 * 7 + y as i32 * 11) % 257 - 128);
+            }
+        }
+        let pyramid = dwt(&pic, WaveletFilter::LeGall5_3, 3);
+        let back = idwt(&pyramid, WaveletFilter::LeGall5_3);
+        assert_eq!(back.width, w);
+        assert_eq!(back.height, h);
+        for y in 0..h {
+            for x in 0..w {
+                assert_eq!(back.get(y, x), pic.get(y, x), "({x},{y})");
+            }
+        }
+    }
 }

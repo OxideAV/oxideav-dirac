@@ -439,6 +439,277 @@ fn ffmpeg_decodes_our_ld_stream_bit_exact() {
     assert!(v_psnr >= 48.0, "V PSNR {v_psnr:.2} dB below 48 dB");
 }
 
+/// HQ ffmpeg-interop matrix: round-trip our HQ encoder through ffmpeg's
+/// `dirac` decoder for both 4:2:2 and 4:4:4 chroma formats. The
+/// existing 4:2:0 case (`ffmpeg_decodes_our_hq_stream_lossless_q0`)
+/// covers the most common geometry; this fills the gap for the other
+/// two §10.4 chroma layouts. With LeGall 5/3 + qindex=0 the dead-zone
+/// quantiser is identity, so PSNR should be effectively infinite — we
+/// assert ≥ 48 dB to leave headroom for tiny rounding differences in
+/// ffmpeg's IDWT path.
+#[test]
+fn ffmpeg_decodes_our_hq_stream_lossless_q0_yuv422() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg not available; skipping HQ 4:2:2 interop test");
+        return;
+    }
+    use oxideav_dirac::encoder::{
+        encode_single_hq_intra_stream, make_minimal_sequence, EncoderParams,
+    };
+    use oxideav_dirac::wavelet::WaveletFilter;
+
+    let w: u32 = 64;
+    let h: u32 = 64;
+    let cw: u32 = w / 2;
+    let ch: u32 = h;
+    // Smooth-ish synthetic content; flat-channel U/V keeps the test
+    // robust to ffmpeg subsampling-filter differences.
+    let mut y = vec![0u8; (w * h) as usize];
+    for row in 0..h as usize {
+        for col in 0..w as usize {
+            y[row * w as usize + col] = ((row * 3 + col * 2) & 0xff) as u8;
+        }
+    }
+    let u = vec![100u8; (cw * ch) as usize];
+    let v = vec![160u8; (cw * ch) as usize];
+
+    let seq = make_minimal_sequence(w, h, ChromaFormat::Yuv422);
+    let params = EncoderParams::default_hq(WaveletFilter::LeGall5_3, 3);
+    let stream = encode_single_hq_intra_stream(&seq, &params, 0, &y, &u, &v);
+
+    let tmpdir = std::env::temp_dir();
+    let drc = tmpdir.join("oxideav_dirac_interop_hq_422.drc");
+    let yuv = tmpdir.join("oxideav_dirac_interop_hq_422.yuv");
+    std::fs::write(&drc, &stream).expect("write drc");
+
+    let status = std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "dirac",
+            "-i",
+        ])
+        .arg(&drc)
+        .args(["-f", "rawvideo", "-pix_fmt", "yuv422p"])
+        .arg(&yuv)
+        .status()
+        .expect("run ffmpeg");
+    assert!(status.success(), "ffmpeg decode failed for 4:2:2 HQ stream");
+    let out = std::fs::read(&yuv).expect("read ffmpeg yuv");
+    let y_len = (w * h) as usize;
+    let c_len = (cw * ch) as usize;
+    assert_eq!(out.len(), y_len + 2 * c_len);
+    let out_y = &out[..y_len];
+    let out_u = &out[y_len..y_len + c_len];
+    let out_v = &out[y_len + c_len..];
+
+    fn psnr(a: &[u8], b: &[u8]) -> f64 {
+        let mut sse: u64 = 0;
+        for i in 0..a.len() {
+            let d = a[i] as i32 - b[i] as i32;
+            sse += (d * d) as u64;
+        }
+        if sse == 0 {
+            return f64::INFINITY;
+        }
+        let mse = sse as f64 / a.len() as f64;
+        20.0 * (255.0f64).log10() - 10.0 * mse.log10()
+    }
+    let y_psnr = psnr(out_y, &y);
+    let u_psnr = psnr(out_u, &u);
+    let v_psnr = psnr(out_v, &v);
+    eprintln!("ffmpeg HQ 4:2:2 PSNR: Y={y_psnr:.2} U={u_psnr:.2} V={v_psnr:.2}");
+    assert!(
+        y_psnr >= 48.0,
+        "Y PSNR {y_psnr:.2} dB below 48 dB — 4:2:2 HQ regression"
+    );
+    assert!(u_psnr >= 48.0, "U PSNR {u_psnr:.2} dB below 48 dB");
+    assert!(v_psnr >= 48.0, "V PSNR {v_psnr:.2} dB below 48 dB");
+}
+
+#[test]
+fn ffmpeg_decodes_our_hq_stream_lossless_q0_yuv444() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg not available; skipping HQ 4:4:4 interop test");
+        return;
+    }
+    use oxideav_dirac::encoder::{
+        encode_single_hq_intra_stream, make_minimal_sequence, EncoderParams,
+    };
+    use oxideav_dirac::wavelet::WaveletFilter;
+
+    let w: u32 = 64;
+    let h: u32 = 64;
+    // 4:4:4: chroma resolution == luma.
+    let mut y = vec![0u8; (w * h) as usize];
+    for row in 0..h as usize {
+        for col in 0..w as usize {
+            y[row * w as usize + col] = ((row * 3 + col * 2) & 0xff) as u8;
+        }
+    }
+    let u = vec![100u8; (w * h) as usize];
+    let v = vec![160u8; (w * h) as usize];
+
+    let seq = make_minimal_sequence(w, h, ChromaFormat::Yuv444);
+    let params = EncoderParams::default_hq(WaveletFilter::LeGall5_3, 3);
+    let stream = encode_single_hq_intra_stream(&seq, &params, 0, &y, &u, &v);
+
+    let tmpdir = std::env::temp_dir();
+    let drc = tmpdir.join("oxideav_dirac_interop_hq_444.drc");
+    let yuv = tmpdir.join("oxideav_dirac_interop_hq_444.yuv");
+    std::fs::write(&drc, &stream).expect("write drc");
+
+    let status = std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "dirac",
+            "-i",
+        ])
+        .arg(&drc)
+        .args(["-f", "rawvideo", "-pix_fmt", "yuv444p"])
+        .arg(&yuv)
+        .status()
+        .expect("run ffmpeg");
+    assert!(status.success(), "ffmpeg decode failed for 4:4:4 HQ stream");
+    let out = std::fs::read(&yuv).expect("read ffmpeg yuv");
+    let plane_len = (w * h) as usize;
+    assert_eq!(out.len(), 3 * plane_len);
+    let out_y = &out[..plane_len];
+    let out_u = &out[plane_len..2 * plane_len];
+    let out_v = &out[2 * plane_len..];
+
+    fn psnr(a: &[u8], b: &[u8]) -> f64 {
+        let mut sse: u64 = 0;
+        for i in 0..a.len() {
+            let d = a[i] as i32 - b[i] as i32;
+            sse += (d * d) as u64;
+        }
+        if sse == 0 {
+            return f64::INFINITY;
+        }
+        let mse = sse as f64 / a.len() as f64;
+        20.0 * (255.0f64).log10() - 10.0 * mse.log10()
+    }
+    let y_psnr = psnr(out_y, &y);
+    let u_psnr = psnr(out_u, &u);
+    let v_psnr = psnr(out_v, &v);
+    eprintln!("ffmpeg HQ 4:4:4 PSNR: Y={y_psnr:.2} U={u_psnr:.2} V={v_psnr:.2}");
+    assert!(
+        y_psnr >= 48.0,
+        "Y PSNR {y_psnr:.2} dB below 48 dB — 4:4:4 HQ regression"
+    );
+    assert!(u_psnr >= 48.0, "U PSNR {u_psnr:.2} dB below 48 dB");
+    assert!(v_psnr >= 48.0, "V PSNR {v_psnr:.2} dB below 48 dB");
+}
+
+/// HQ ffmpeg-interop wavelet matrix: confirm ffmpeg's Dirac decoder
+/// accepts our HQ encoder output for every wavelet preset we support
+/// (skipping Fidelity, which intentionally falls outside the HQ slice
+/// budget — see `encoder_matrix.rs` for the rationale). Each filter's
+/// `wavelet_index` (§12.3.4) plus its quant matrix (Annex E.1) is
+/// signalled in the bitstream, so this test catches a regression where
+/// e.g. a Daubechies9_7 quant matrix gets miswritten.
+#[test]
+fn ffmpeg_accepts_our_hq_stream_across_wavelets() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg not available; skipping HQ wavelet matrix test");
+        return;
+    }
+    use oxideav_dirac::encoder::{
+        encode_single_hq_intra_stream, make_minimal_sequence, EncoderParams,
+    };
+    use oxideav_dirac::wavelet::WaveletFilter;
+
+    let w: u32 = 64;
+    let h: u32 = 64;
+    let cw = w / 2;
+    let ch = h / 2;
+    let mut y = vec![0u8; (w * h) as usize];
+    for row in 0..h as usize {
+        for col in 0..w as usize {
+            // Smooth gradient — every wavelet's dynamic range stays
+            // within the HQ slice budget.
+            y[row * w as usize + col] = ((row + col) * 2) as u8;
+        }
+    }
+    let u = vec![128u8; (cw * ch) as usize];
+    let v = vec![128u8; (cw * ch) as usize];
+    let seq = make_minimal_sequence(w, h, ChromaFormat::Yuv420);
+
+    fn psnr(a: &[u8], b: &[u8]) -> f64 {
+        let mut sse: u64 = 0;
+        for i in 0..a.len() {
+            let d = a[i] as i32 - b[i] as i32;
+            sse += (d * d) as u64;
+        }
+        if sse == 0 {
+            return f64::INFINITY;
+        }
+        let mse = sse as f64 / a.len() as f64;
+        20.0 * (255.0f64).log10() - 10.0 * mse.log10()
+    }
+
+    for filter in [
+        WaveletFilter::DeslauriersDubuc9_7,
+        WaveletFilter::LeGall5_3,
+        WaveletFilter::DeslauriersDubuc13_7,
+        WaveletFilter::Haar0,
+        WaveletFilter::Haar1,
+        WaveletFilter::Daubechies9_7,
+    ] {
+        let params = EncoderParams::default_hq(filter, 3);
+        let stream = encode_single_hq_intra_stream(&seq, &params, 0, &y, &u, &v);
+
+        let tmpdir = std::env::temp_dir();
+        let tag = format!("{filter:?}").to_lowercase();
+        let drc = tmpdir.join(format!("oxideav_dirac_hq_wavelet_{tag}.drc"));
+        let yuv = tmpdir.join(format!("oxideav_dirac_hq_wavelet_{tag}.yuv"));
+        std::fs::write(&drc, &stream).expect("write drc");
+
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "dirac",
+                "-i",
+            ])
+            .arg(&drc)
+            .args(["-f", "rawvideo", "-pix_fmt", "yuv420p"])
+            .arg(&yuv)
+            .status()
+            .expect("run ffmpeg");
+        assert!(
+            status.success(),
+            "ffmpeg rejected our HQ stream for filter {filter:?}"
+        );
+
+        let out = std::fs::read(&yuv).expect("read ffmpeg yuv");
+        let y_len = (w * h) as usize;
+        let c_len = (cw * ch) as usize;
+        assert_eq!(out.len(), y_len + 2 * c_len);
+        let out_y = &out[..y_len];
+        let py = psnr(out_y, &y);
+        eprintln!("ffmpeg HQ wavelet {filter:?}: Y PSNR = {py:.2} dB");
+        // Smooth gradient + integer-reversible wavelets → very high
+        // PSNR. Allow some slack for ffmpeg's own quant rounding on
+        // the heavier filters.
+        assert!(
+            py >= 35.0,
+            "{filter:?}: Y PSNR {py:.2} dB below 35 dB — bitstream signal mismatch?"
+        );
+    }
+}
+
 /// Sanity sub-case: a constant Y=100 input must decode to a constant
 /// Y=100 picture through ffmpeg. Round 8's failure mode produced a
 /// 128-centred ramp (see the test name in Round 9 brief), so this
