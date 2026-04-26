@@ -8,7 +8,7 @@
 //!   picture (HQ-profile VC-2 intra pictures produce a `VideoFrame`).
 
 use oxideav_core::CodecRegistry;
-use oxideav_core::{CodecId, CodecParameters, Frame, Packet, PixelFormat, TimeBase};
+use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
 use oxideav_dirac::parse_info::ParseInfo;
 use oxideav_dirac::sequence::{parse_sequence_header, PictureCodingMode};
 use oxideav_dirac::stream::DataUnitIter;
@@ -79,11 +79,10 @@ fn decoder_produces_first_frame_from_hq_vc2_intra() {
     let frame = dec.receive_frame().expect("receive_frame");
     match frame {
         Frame::Video(v) => {
-            assert_eq!(v.width, 64);
-            assert_eq!(v.height, 64);
-            // Fixture is yuv444p, 8-bit.
-            assert_eq!(v.format, PixelFormat::Yuv444P);
+            // Fixture is yuv444p, 8-bit: stride==width per plane.
             assert_eq!(v.planes.len(), 3);
+            assert_eq!(v.planes[0].stride, 64);
+            assert_eq!(v.planes[0].data.len() / v.planes[0].stride, 64);
             assert_eq!(v.planes[0].data.len(), 64 * 64);
             assert_eq!(v.planes[1].data.len(), 64 * 64);
             assert_eq!(v.planes[2].data.len(), 64 * 64);
@@ -176,23 +175,16 @@ fn ffmpeg_10bit_yuv420_produces_yuv420p10le_frame() {
     let frame = dec.receive_frame().expect("receive_frame");
     match frame {
         Frame::Video(v) => {
-            assert_eq!(v.width, 64);
-            assert_eq!(v.height, 64);
-            // The fixture is 4:2:0 + 10-bit — the decoder should emit
-            // the proper LE 16-bit planar format, not 8-bit demotion.
-            assert_eq!(v.format, PixelFormat::Yuv420P10Le);
+            // The fixture is 4:2:0 + 10-bit — Yuv420P10Le packs each
+            // sample into 2 bytes, so Y stride == 2 * width.
             assert_eq!(v.planes.len(), 3);
             // Two bytes per luma sample, width=64 rows:
             assert_eq!(v.planes[0].stride, 128);
             assert_eq!(v.planes[0].data.len(), 64 * 64 * 2);
+            assert_eq!(v.planes[0].data.len() / v.planes[0].stride, 64);
             // Chroma: 32x32 * 2 bytes per sample.
             assert_eq!(v.planes[1].stride, 64);
             assert_eq!(v.planes[1].data.len(), 32 * 32 * 2);
-
-            // Decoder derives the timebase from the sequence header's
-            // frame rate (§10.3.5); it must at minimum be sensible.
-            let tb = v.time_base.as_rational();
-            assert!(tb.num > 0 && tb.den > 0);
 
             // Sanity: the first sample should vary across the picture.
             // testsrc is a vivid pattern; a flat / garbled output
@@ -239,22 +231,17 @@ fn ffmpeg_8bit_yuv422_produces_yuv422p_frame() {
     let frame = dec.receive_frame().expect("receive_frame");
     match frame {
         Frame::Video(v) => {
-            assert_eq!(v.width, 64);
-            assert_eq!(v.height, 64);
             // 8-bit 4:2:2 — one byte per sample, horizontally
             // sub-sampled chroma (§10.4 Table 10.3).
-            assert_eq!(v.format, PixelFormat::Yuv422P);
             assert_eq!(v.planes.len(), 3);
             assert_eq!(v.planes[0].stride, 64);
             assert_eq!(v.planes[0].data.len(), 64 * 64);
+            assert_eq!(v.planes[0].data.len() / v.planes[0].stride, 64);
             // Chroma: 32x64, 1 byte per sample.
             assert_eq!(v.planes[1].stride, 32);
             assert_eq!(v.planes[1].data.len(), 32 * 64);
             assert_eq!(v.planes[2].stride, 32);
             assert_eq!(v.planes[2].data.len(), 32 * 64);
-
-            let tb = v.time_base.as_rational();
-            assert!(tb.num > 0 && tb.den > 0);
 
             // Same testsrc sanity check as the 8-bit 4:4:4 fixture:
             // a flat / garbled Y plane would sit near a single value.

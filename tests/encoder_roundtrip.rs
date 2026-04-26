@@ -9,7 +9,7 @@
 //! of the input plane on the smallest test pattern.
 
 use oxideav_core::CodecRegistry;
-use oxideav_core::{CodecId, CodecParameters, Frame, Packet, PixelFormat, TimeBase};
+use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
 use oxideav_dirac::encoder::{
     encode_single_hq_intra_stream, encode_single_ld_intra_stream, make_minimal_sequence,
     synthetic_testsrc_64_yuv420, EncoderParams, LdEncoderParams,
@@ -38,10 +38,10 @@ fn encode_then_decode_lossless_q0_64x64_yuv420() {
         Frame::Video(vf) => vf,
         other => panic!("expected video frame, got {other:?}"),
     };
-    assert_eq!(v_frame.width, 64);
-    assert_eq!(v_frame.height, 64);
-    assert_eq!(v_frame.format, PixelFormat::Yuv420P);
+    // Yuv420P: Y plane stride == width, data.len()/stride == height.
     assert_eq!(v_frame.planes.len(), 3);
+    assert_eq!(v_frame.planes[0].stride, 64);
+    assert_eq!(v_frame.planes[0].data.len() / v_frame.planes[0].stride, 64);
 
     // Bit-exact comparison per plane.
     assert_eq!(v_frame.planes[0].data, y.to_vec(), "Y plane mismatch");
@@ -143,9 +143,9 @@ fn encode_then_decode_ld_qindex0_psnr_over_35() {
         Frame::Video(v) => v,
         other => panic!("expected video, got {other:?}"),
     };
-    assert_eq!(frame.width, 64);
-    assert_eq!(frame.height, 64);
-    assert_eq!(frame.format, PixelFormat::Yuv420P);
+    // Yuv420P: Y plane stride == width, data.len()/stride == height.
+    assert_eq!(frame.planes[0].stride, 64);
+    assert_eq!(frame.planes[0].data.len() / frame.planes[0].stride, 64);
 
     let psnr_y = psnr(&frame.planes[0].data, &y_flat);
     let psnr_u = psnr(&frame.planes[1].data, &u_flat);

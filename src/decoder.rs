@@ -324,15 +324,12 @@ fn decoded_to_video_frame(
         (ChromaFormat::Yuv422, _) => (PixelFormat::Yuv422P10Le, 10),
         (ChromaFormat::Yuv444, _) => (PixelFormat::Yuv444P10Le, 10),
     };
+    let _ = (format, time_base);
     let y = plane_from_i32(&pic.y, pic.luma_width, pic.luma_depth, store_depth);
     let u = plane_from_i32(&pic.u, pic.chroma_width, pic.chroma_depth, store_depth);
     let v = plane_from_i32(&pic.v, pic.chroma_width, pic.chroma_depth, store_depth);
     VideoFrame {
-        format,
-        width: pic.luma_width as u32,
-        height: pic.luma_height as u32,
         pts,
-        time_base,
         planes: vec![y, u, v],
     }
 }
@@ -581,11 +578,10 @@ mod tests {
             chroma_depth: 10,
         };
         let tb = time_base_from_frame_rate(&seq);
+        assert_eq!(tb.as_rational().num, 1);
+        assert_eq!(tb.as_rational().den, 50);
         let frame = decoded_to_video_frame(&pic, &seq, Some(42), tb);
-        assert_eq!(frame.format, PixelFormat::Yuv422P10Le);
         assert_eq!(frame.pts, Some(42));
-        assert_eq!(frame.time_base.as_rational().num, 1);
-        assert_eq!(frame.time_base.as_rational().den, 50);
         // Each sample occupies two bytes.
         assert_eq!(frame.planes[0].stride, 128);
         assert_eq!(frame.planes[0].data.len(), 64 * 64 * 2);
@@ -616,7 +612,6 @@ mod tests {
         };
         let tb = time_base_from_frame_rate(&seq);
         let frame = decoded_to_video_frame(&pic, &seq, None, tb);
-        assert_eq!(frame.format, PixelFormat::Yuv420P12Le);
         assert_eq!(frame.planes[0].stride, 128);
         // 2048 = 0x800 -> 0x00, 0x08 in little-endian.
         assert_eq!(frame.planes[0].data[0], 0x00);
@@ -647,7 +642,6 @@ mod tests {
         };
         let tb = time_base_from_frame_rate(&seq);
         let frame = decoded_to_video_frame(&pic, &seq, None, tb);
-        assert_eq!(frame.format, PixelFormat::Yuv444P);
         assert_eq!(frame.planes[0].stride, 64);
         assert_eq!(frame.planes[0].data.len(), 64 * 64);
         assert_eq!(frame.planes[0].data[0], 128);

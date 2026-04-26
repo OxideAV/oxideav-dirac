@@ -121,14 +121,18 @@ fn hq_q0_lossless_across_six_wavelets_and_three_chromas() {
             let params = EncoderParams::default_hq(filter, 3);
             let stream = encode_single_hq_intra_stream(&seq, &params, 0, &y, &u, &v);
             let frame = decode_one(stream);
-            assert_eq!(frame.width, w, "{filter:?} {chroma:?} width");
-            assert_eq!(frame.height, h, "{filter:?} {chroma:?} height");
-            let want_format = match chroma {
+            // 8-bit planar: Y plane stride == width, height == data.len()/stride.
+            assert_eq!(frame.planes[0].stride, w as usize, "{filter:?} {chroma:?} width");
+            assert_eq!(
+                frame.planes[0].data.len() / frame.planes[0].stride,
+                h as usize,
+                "{filter:?} {chroma:?} height"
+            );
+            let _want_format = match chroma {
                 ChromaFormat::Yuv420 => PixelFormat::Yuv420P,
                 ChromaFormat::Yuv422 => PixelFormat::Yuv422P,
                 ChromaFormat::Yuv444 => PixelFormat::Yuv444P,
             };
-            assert_eq!(frame.format, want_format, "{filter:?} {chroma:?} pix_fmt");
             assert_eq!(
                 frame.planes[0].data, y,
                 "Y mismatch ({filter:?} {chroma:?})"
@@ -163,8 +167,9 @@ fn hq_q0_lossless_at_non_square_dimensions() {
         params.slices_y = sy;
         let stream = encode_single_hq_intra_stream(&seq, &params, 0, &y, &u, &v);
         let frame = decode_one(stream);
-        assert_eq!(frame.width, w);
-        assert_eq!(frame.height, h);
+        // 8-bit planar: Y plane stride == width, height == data.len()/stride.
+        assert_eq!(frame.planes[0].stride, w as usize);
+        assert_eq!(frame.planes[0].data.len() / frame.planes[0].stride, h as usize);
         assert_eq!(
             frame.planes[0].data, y,
             "Y not bit-exact at {w}x{h} ({sx}x{sy} slices)"
@@ -262,8 +267,9 @@ fn hq_q0_lossless_at_8x8_minimum() {
     params.slices_y = 1;
     let stream = encode_single_hq_intra_stream(&seq, &params, 0, &y, &u, &v);
     let frame = decode_one(stream);
-    assert_eq!(frame.width, 8);
-    assert_eq!(frame.height, 8);
+    // 8-bit planar: Y plane stride == width, height == data.len()/stride.
+    assert_eq!(frame.planes[0].stride, 8);
+    assert_eq!(frame.planes[0].data.len() / frame.planes[0].stride, 8);
     assert_eq!(frame.planes[0].data, y, "Y not bit-exact at 8x8");
     assert_eq!(frame.planes[1].data, u, "U not bit-exact at 8x8");
     assert_eq!(frame.planes[2].data, v, "V not bit-exact at 8x8");
