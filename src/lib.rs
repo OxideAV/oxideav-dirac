@@ -71,11 +71,20 @@
 //!   translating-square fixture; zero-motion is bit-exact. Driven by
 //!   the new [`arith::ArithEncoder`] (Annex B.2 mirror of
 //!   `ArithDecoder`).
+//! * **Dirac core-syntax intra** ([`encoder_intra_core::encode_single_core_intra_stream`]
+//!   and [`encoder_intra_core::encode_core_intra_then_inter_stream`])
+//!   — round 2: AC-coded intra reference picture (parse code `0x0C`),
+//!   single codeblock per subband, no per-codeblock quant offset, no
+//!   custom quant matrix. Self-roundtrip is bit-exact on flat
+//!   pictures and ≥48 dB Y/U on a testsrc gradient. Pairs with the
+//!   round-1 inter encoder for a homogeneous-syntax 2-frame stream
+//!   that ffmpeg's `dirac` decoder accepts end-to-end (cross-decoded
+//!   intra Y PSNR ≈ 52 dB).
 //!
 //! Still unsupported (planned): v3 extended transform parameters
-//! (horizontal-only transforms); core-syntax intra encode (would let
-//! ffmpeg cross-decode the inter stream end-to-end); sub-pel ME, OBMC
-//! window weighting at the encoder, and 2-reference bi-prediction.
+//! (horizontal-only transforms); sub-pel ME, OBMC window weighting at
+//! the encoder, and 2-reference bi-prediction; wavelet residue under
+//! inter pictures (currently `ZERO_RESIDUAL = true` only).
 
 #![allow(clippy::needless_range_loop)]
 
@@ -85,6 +94,7 @@ pub mod bitwriter;
 pub mod decoder;
 pub mod encoder;
 pub mod encoder_inter;
+pub mod encoder_intra_core;
 pub mod obmc;
 pub mod parse_info;
 pub mod picture;

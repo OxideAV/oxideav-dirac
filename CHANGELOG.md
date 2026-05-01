@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Dirac core-syntax **intra encoder** (round 2) — new `encoder_intra_core`
+  module emits `0x0C` AC-coded intra reference pictures (single
+  codeblock per subband, no per-codeblock quant offset, no custom quant
+  matrix, qindex=0 near-lossless). The new
+  `encode_core_intra_then_inter_stream` chains a `0x0C` intra reference
+  with the round-1 `0x09` inter so the entire stream stays in one
+  parse-code family. ffmpeg's `dirac` decoder no longer rejects the
+  chain (the round-1 ffmpeg-interop soft-skip closes here): cross-
+  decoded intra Y PSNR ≈ 52 dB on a translating-square 64x64 fixture.
+  Self-roundtrip is bit-exact on flat pictures and ≥48 dB Y/U on the
+  testsrc gradient. 6 new unit tests + 4 new integration tests
+  (`tests/encoder_intra_core_roundtrip.rs`) including a hard ffmpeg
+  cross-decode (no soft-skip).
+
 - Dirac core-syntax **inter encoder** (round 1) — `encoder_inter` module
   emits 1-reference, integer-pel-MV, OBMC-only inter pictures (parse
   code `0x09`) with §11.2 picture-prediction parameters and §12.3

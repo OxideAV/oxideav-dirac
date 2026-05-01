@@ -29,6 +29,7 @@ the goal here is to land the bitstream framing and primitives first.
 | Dirac core-syntax intra / inter     | Parse-only                                                    |
 | Encoder — VC-2 HQ intra             | Implemented (8/10-bit, 4:2:0/4:2:2/4:4:4, 6 wavelets)         |
 | Encoder — VC-2 LD intra             | Implemented (ffmpeg-bit-exact at q=0)                         |
+| Encoder — Dirac core-syntax intra (r2) | AC-coded `0x0C` ref, single codeblock, q=0 near-lossless. ffmpeg-validated. |
 | Encoder — Dirac inter (r1)          | 1-ref, integer-pel ME, OBMC, no residue. ≥30 dB self-PSNR.   |
 
 ## Codec ID
