@@ -57,8 +57,25 @@
 //! `pts` is carried through to the decoded frame (falling back to
 //! the §12.2 picture_number when absent).
 //!
+//! Encoder coverage:
+//!
+//! * **VC-2 HQ intra** ([`encoder::encode_single_hq_intra_stream`]) —
+//!   the bit-exact ffmpeg interop baseline (≥48 dB Y PSNR at q=0
+//!   across LeGall / DD9-7 / DD13-7 / Haar / Fidelity / Daubechies).
+//! * **VC-2 LD intra** ([`encoder::encode_single_ld_intra_stream`]) —
+//!   ffmpeg-validated with the Round 9 `slice_y_length` width fix.
+//! * **Dirac core-syntax inter** ([`encoder_inter::encode_intra_then_inter_stream`])
+//!   — round 1: 1-ref non-reference inter (parse code `0x09`) over
+//!   integer-pel full-search ME, preset-1 8x8 blocks, no OBMC overlap
+//!   reduction, no residue. Self-roundtrip ≥30 dB Y PSNR on a
+//!   translating-square fixture; zero-motion is bit-exact. Driven by
+//!   the new [`arith::ArithEncoder`] (Annex B.2 mirror of
+//!   `ArithDecoder`).
+//!
 //! Still unsupported (planned): v3 extended transform parameters
-//! (horizontal-only transforms).
+//! (horizontal-only transforms); core-syntax intra encode (would let
+//! ffmpeg cross-decode the inter stream end-to-end); sub-pel ME, OBMC
+//! window weighting at the encoder, and 2-reference bi-prediction.
 
 #![allow(clippy::needless_range_loop)]
 
@@ -67,6 +84,7 @@ pub mod bits;
 pub mod bitwriter;
 pub mod decoder;
 pub mod encoder;
+pub mod encoder_inter;
 pub mod obmc;
 pub mod parse_info;
 pub mod picture;

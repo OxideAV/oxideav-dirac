@@ -1,0 +1,201 @@
+//! Inter-encoder end-to-end validator.
+//!
+//! Encode a 2-picture stream — HQ intra reference + 1-ref core-syntax
+//! inter — through `oxideav_dirac::encoder_inter::encode_intra_then_inter_stream`,
+//! pipe through our own decoder, and measure the inter frame's PSNR
+//! against the input. Round 1 targets a *much* better PSNR than
+//! all-intra would give at the same residue (zero) for any real motion,
+//! since the inter encoder transmits actual MVs.
+
+use oxideav_core::CodecRegistry;
+use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
+use oxideav_dirac::encoder::{make_minimal_sequence, EncoderParams};
+use oxideav_dirac::encoder_inter::{
+    encode_intra_then_inter_stream, synthetic_translating_pair_64, InterEncoderParams,
+    InterInputPicture,
+};
+use oxideav_dirac::video_format::ChromaFormat;
+use oxideav_dirac::wavelet::WaveletFilter;
+
+fn psnr(a: &[u8], b: &[u8]) -> f64 {
+    assert_eq!(a.len(), b.len());
+    let mut sse: u64 = 0;
+    for i in 0..a.len() {
+        let d = a[i] as i32 - b[i] as i32;
+        sse += (d * d) as u64;
+    }
+    if sse == 0 {
+        return f64::INFINITY;
+    }
+    let mse = sse as f64 / a.len() as f64;
+    20.0 * (255.0f64).log10() - 10.0 * mse.log10()
+}
+
+/// Drive 2 pictures through the encoder/decoder loop. The intra
+/// reference round-trips bit-exact (qindex=0); the inter frame's PSNR
+/// against ground truth measures how well the OBMC predictions
+/// reconstruct the translating square (with zero wavelet residue).
+#[test]
+fn intra_then_inter_translate_4_pixels_yields_high_psnr() {
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let intra_params = EncoderParams::default_hq(WaveletFilter::LeGall5_3, 3);
+    let inter_params = InterEncoderParams::default();
+
+    // Frame 0: square at (24, 24), Frame 1: square at (24, 28).
+    let (y0, u0, v0, y1, u1, v1) = synthetic_translating_pair_64(4, 0);
+    let intra = InterInputPicture {
+        picture_number: 10,
+        y: &y0,
+        u: &u0,
+        v: &v0,
+    };
+    let inter = InterInputPicture {
+        picture_number: 11,
+        y: &y1,
+        u: &u1,
+        v: &v1,
+    };
+    let stream = encode_intra_then_inter_stream(&seq, &intra_params, &inter_params, &intra, &inter);
+
+    let mut reg = CodecRegistry::new();
+    oxideav_dirac::register(&mut reg);
+    let cp = CodecParameters::video(CodecId::new("dirac"));
+    let mut dec = reg.make_decoder(&cp).expect("make decoder");
+    let packet = Packet::new(0, TimeBase::new(1, 25), stream);
+    dec.send_packet(&packet).expect("send_packet");
+
+    // First frame: intra — should round-trip bit-exact at qindex 0.
+    let frame0 = match dec.receive_frame().expect("intra frame") {
+        Frame::Video(vf) => vf,
+        other => panic!("expected video frame, got {other:?}"),
+    };
+    assert_eq!(
+        frame0.planes[0].data,
+        y0.to_vec(),
+        "intra Y plane should be bit-exact at qindex 0"
+    );
+
+    // Second frame: inter — measure PSNR against the **encoder input**.
+    let frame1 = match dec.receive_frame().expect("inter frame") {
+        Frame::Video(vf) => vf,
+        other => panic!("expected video frame, got {other:?}"),
+    };
+    assert_eq!(frame1.planes[0].stride, 64);
+    assert_eq!(frame1.planes[0].data.len() / frame1.planes[0].stride, 64);
+
+    let psnr_y = psnr(&frame1.planes[0].data, &y1);
+    let psnr_u = psnr(&frame1.planes[1].data, &u1);
+    let psnr_v = psnr(&frame1.planes[2].data, &v1);
+    eprintln!("inter frame PSNR: Y={psnr_y:.2} dB  U={psnr_u:.2} dB  V={psnr_v:.2} dB");
+
+    // Translating-square w/ pure horizontal +4 shift, integer-pel MVs,
+    // 8x8 blocks with 4-pel stride: ME should find the exact MV per
+    // block; OBMC overlap then produces a near-bit-exact reconstruction
+    // for blocks fully inside the picture. Edge blocks suffer from
+    // edge clamping in the reference. Target: > 30 dB on Y.
+    assert!(
+        psnr_y > 30.0,
+        "inter Y PSNR {psnr_y:.2} dB below 30 dB target"
+    );
+    // Chroma is constant in this fixture — perfect copy expected.
+    assert!(
+        psnr_u >= 40.0,
+        "inter U PSNR {psnr_u:.2} dB below 40 dB threshold (chroma is constant!)"
+    );
+    assert!(
+        psnr_v >= 40.0,
+        "inter V PSNR {psnr_v:.2} dB below 40 dB threshold (chroma is constant!)"
+    );
+}
+
+/// A second, slightly harder fixture: vertical translation. Confirms
+/// the encoder isn't accidentally emitting only horizontal MVs (it
+/// would still pass the +4 horizontal test if vertical handling were
+/// silently broken).
+#[test]
+fn intra_then_inter_translate_vertical_yields_high_psnr() {
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let intra_params = EncoderParams::default_hq(WaveletFilter::LeGall5_3, 3);
+    let inter_params = InterEncoderParams::default();
+
+    let (y0, u0, v0, y1, u1, v1) = synthetic_translating_pair_64(0, -4);
+    let intra = InterInputPicture {
+        picture_number: 0,
+        y: &y0,
+        u: &u0,
+        v: &v0,
+    };
+    let inter = InterInputPicture {
+        picture_number: 1,
+        y: &y1,
+        u: &u1,
+        v: &v1,
+    };
+    let stream = encode_intra_then_inter_stream(&seq, &intra_params, &inter_params, &intra, &inter);
+
+    let mut reg = CodecRegistry::new();
+    oxideav_dirac::register(&mut reg);
+    let cp = CodecParameters::video(CodecId::new("dirac"));
+    let mut dec = reg.make_decoder(&cp).expect("make decoder");
+    let packet = Packet::new(0, TimeBase::new(1, 25), stream);
+    dec.send_packet(&packet).expect("send_packet");
+
+    let _intra_frame = dec.receive_frame().expect("intra frame");
+    let inter_frame = match dec.receive_frame().expect("inter frame") {
+        Frame::Video(vf) => vf,
+        other => panic!("expected video, got {other:?}"),
+    };
+    let psnr_y = psnr(&inter_frame.planes[0].data, &y1);
+    eprintln!("inter (vertical -4) PSNR Y: {psnr_y:.2} dB");
+    assert!(
+        psnr_y > 30.0,
+        "inter Y PSNR {psnr_y:.2} dB below 30 dB target on vertical motion"
+    );
+}
+
+/// Sanity: an inter frame with **no motion** (frame 1 = frame 0) should
+/// reconstruct nearly bit-exactly via OBMC, since every block's best
+/// MV is (0, 0) and the OBMC of an unshifted reference is the
+/// reference itself (modulo edge effects).
+#[test]
+fn intra_then_inter_zero_motion_is_near_lossless() {
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let intra_params = EncoderParams::default_hq(WaveletFilter::LeGall5_3, 3);
+    let inter_params = InterEncoderParams::default();
+
+    let (y0, u0, v0, ..) = synthetic_translating_pair_64(0, 0);
+    let intra = InterInputPicture {
+        picture_number: 0,
+        y: &y0,
+        u: &u0,
+        v: &v0,
+    };
+    let inter = InterInputPicture {
+        picture_number: 1,
+        y: &y0,
+        u: &u0,
+        v: &v0,
+    };
+    let stream = encode_intra_then_inter_stream(&seq, &intra_params, &inter_params, &intra, &inter);
+
+    let mut reg = CodecRegistry::new();
+    oxideav_dirac::register(&mut reg);
+    let cp = CodecParameters::video(CodecId::new("dirac"));
+    let mut dec = reg.make_decoder(&cp).expect("make decoder");
+    let packet = Packet::new(0, TimeBase::new(1, 25), stream);
+    dec.send_packet(&packet).expect("send_packet");
+
+    let _intra_frame = dec.receive_frame().expect("intra frame");
+    let inter_frame = match dec.receive_frame().expect("inter frame") {
+        Frame::Video(vf) => vf,
+        other => panic!("expected video, got {other:?}"),
+    };
+    let psnr_y = psnr(&inter_frame.planes[0].data, &y0);
+    eprintln!("inter (zero-motion) PSNR Y: {psnr_y:.2} dB");
+    // Without residual, OBMC at the edges still smooths the boundary —
+    // not exactly bit-exact but should comfortably exceed 35 dB.
+    assert!(
+        psnr_y > 35.0,
+        "zero-motion inter Y PSNR {psnr_y:.2} dB below 35 dB threshold"
+    );
+}

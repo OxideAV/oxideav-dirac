@@ -235,6 +235,187 @@ impl<'a> ArithDecoder<'a> {
     }
 }
 
+/// Dirac binary arithmetic encoder — counterpart to [`ArithDecoder`].
+///
+/// Mirrors Annex B.2.7.1's "code-minus-low" decoder: tracks `low` /
+/// `range` / `follow_bits` (the standard E1/E2/E3 carry mechanism for
+/// integer-arithmetic encoding) and emits MSB-first bits into a byte
+/// buffer. The encoder uses the same per-context probability of zero
+/// as the decoder, with the same `PROB_LUT` update rule.
+///
+/// End-of-stream rule: after the final symbol, [`finish`] emits one
+/// disambiguating "1" bit, then any pending `follow_bits` zeros, then
+/// pads the partial byte out with "1" bits — matching the decoder's
+/// past-end "1" default (Annex A.3.1) so trailing reads stay inside
+/// the encoded interval.
+///
+/// [`finish`]: ArithEncoder::finish
+pub struct ArithEncoder {
+    out: Vec<u8>,
+    cur: u8,
+    nbits: u8,
+    low: u32,
+    range: u32,
+    follow_bits: u32,
+}
+
+impl Default for ArithEncoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ArithEncoder {
+    pub fn new() -> Self {
+        Self {
+            out: Vec::new(),
+            cur: 0,
+            nbits: 0,
+            low: 0,
+            range: 0xFFFF,
+            follow_bits: 0,
+        }
+    }
+
+    /// MSB-first bit sink — writes one bit into the partial byte and
+    /// flushes when full.
+    fn emit_bit(&mut self, bit: u32) {
+        self.cur = (self.cur << 1) | ((bit as u8) & 1);
+        self.nbits += 1;
+        if self.nbits == 8 {
+            self.out.push(self.cur);
+            self.cur = 0;
+            self.nbits = 0;
+        }
+    }
+
+    /// Emit `bit` then `follow_bits` copies of `1 - bit` (the carry-
+    /// resolution step from Witten/Neal/Cleary).
+    fn emit_with_follows(&mut self, bit: u32) {
+        self.emit_bit(bit);
+        let inv = 1 - bit;
+        while self.follow_bits > 0 {
+            self.emit_bit(inv);
+            self.follow_bits -= 1;
+        }
+    }
+
+    /// Encode one boolean symbol against `bank[ctx]`. Mirrors
+    /// [`ArithDecoder::read_bool`] symbol-for-symbol.
+    pub fn write_bool(&mut self, bank: &mut ContextBank, ctx: usize, value: bool) {
+        let prob_zero = bank.get(ctx) as u32;
+        let r0 = (self.range * prob_zero) >> 16;
+        if value {
+            self.low += r0;
+            self.range -= r0;
+        } else {
+            self.range = r0;
+        }
+        bank.update(ctx, value);
+        // Renormalise while range <= 0x4000 (Annex B.2.5).
+        while self.range <= 0x4000 {
+            // E1: top half — emit 0, then any pending follow bits as 1s.
+            if self.low + self.range <= 0x8000 {
+                self.emit_with_follows(0);
+            // E2: bottom half — emit 1, then follow bits as 0s.
+            } else if self.low >= 0x8000 {
+                self.emit_with_follows(1);
+                self.low -= 0x8000;
+            // E3: straddle the midpoint — bump follow_bits, shift away
+            // from the midpoint, and let the next renormalise resolve.
+            } else {
+                self.follow_bits += 1;
+                self.low -= 0x4000;
+            }
+            self.low <<= 1;
+            self.range <<= 1;
+            self.low &= 0xFFFF;
+        }
+    }
+
+    /// Encode an unsigned integer (Annex A.4.3.2) — exp-Golomb
+    /// binarisation through the arithmetic engine. Symmetrical to
+    /// [`ArithDecoder::read_uint`].
+    pub fn write_uint(
+        &mut self,
+        bank: &mut ContextBank,
+        follow_ctxs: &[usize],
+        data_ctx: usize,
+        value: u32,
+    ) {
+        // Emit each (follow=0, data) pair for the bits below the MSB
+        // of (value + 1), then the terminating follow=1.
+        let n = value.wrapping_add(1);
+        let bit_len = 32 - n.leading_zeros();
+        for i in (0..bit_len - 1).rev() {
+            let ctx_pos = ((bit_len - 1 - i - 1) as usize).min(follow_ctxs.len() - 1);
+            self.write_bool(bank, follow_ctxs[ctx_pos], false);
+            self.write_bool(bank, data_ctx, ((n >> i) & 1) == 1);
+        }
+        let last_pos = ((bit_len - 1) as usize).min(follow_ctxs.len() - 1);
+        self.write_bool(bank, follow_ctxs[last_pos], true);
+    }
+
+    /// Encode a signed integer (Annex A.4.3.3): magnitude + sign.
+    pub fn write_sint(
+        &mut self,
+        bank: &mut ContextBank,
+        follow_ctxs: &[usize],
+        data_ctx: usize,
+        sign_ctx: usize,
+        value: i32,
+    ) {
+        let mag = value.unsigned_abs();
+        self.write_uint(bank, follow_ctxs, data_ctx, mag);
+        if mag != 0 {
+            self.write_bool(bank, sign_ctx, value < 0);
+        }
+    }
+
+    /// Flush any carry-pending state and return the encoded bytes.
+    ///
+    /// The classical Witten/Neal/Cleary termination emits a single
+    /// disambiguating bit + the pending follow bits. We follow that,
+    /// then explicitly emit the upper 16 bits of `low | 0x8000` so the
+    /// decoder's residual `code_minus_low` (16 bits past the last
+    /// symbol) is bound to fall inside `[low, low + range)`. The byte
+    /// is then right-padded with `1` bits — past-end reads return `1`
+    /// per Annex A.3.1, so any extra renormalises the decoder performs
+    /// while finalising the last symbol's context update stay inside
+    /// the encoded interval.
+    pub fn finish(mut self) -> Vec<u8> {
+        // §B.2.7.1 termination. After the renormalise loops we have
+        // 0x4000 < range <= 0x10000 and 0 <= low < 0x10000 with
+        // `low + range > 0x4000` (a non-empty interval that doesn't
+        // collapse on the lower edge). Emit a value `T` that's inside
+        // [low, low + range), big enough that any subsequent
+        // past-end-read 1s extending it stay inside the same interval.
+        //
+        // Choice: the bit string corresponding to the integer
+        // `(low + 0x4000)` truncated/padded to 16 bits — it sits at
+        // least 0x4000 above `low` (so >= low) and below `low + range`
+        // since range > 0x4000. We follow the WNC bit-plus-follows
+        // protocol for the FIRST disambiguating bit and emit the
+        // remaining 15 bits raw.
+        self.follow_bits += 1;
+        let target = self.low.wrapping_add(0x4000) & 0xFFFF;
+        // First bit: top bit of target.
+        let b0 = (target >> 15) & 1;
+        self.emit_with_follows(b0);
+        // Remaining 15 bits, MSB-first.
+        for i in (0..15).rev() {
+            self.emit_bit((target >> i) & 1);
+        }
+        // Pad partial byte with 1s — the decoder reads past-end as 1
+        // (Annex A.3.1) so this padding lines up with what its
+        // renormalise loop will read.
+        while self.nbits != 0 {
+            self.emit_bit(1);
+        }
+        self.out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,6 +466,95 @@ mod tests {
         let mut bank = ContextBank::new(1);
         for _ in 0..16 {
             let _ = dec.read_bool(&mut bank, 0);
+        }
+    }
+
+    /// The encoder + decoder must agree on a long alternating-symbol
+    /// stream. This is the load-bearing roundtrip — it catches every
+    /// E1/E2/E3 carry bug because the symbol stream forces follow_bits
+    /// to fire repeatedly.
+    #[test]
+    fn arith_roundtrip_alternating_bits() {
+        let mut enc_bank = ContextBank::new(1);
+        let mut enc = ArithEncoder::new();
+        let symbols: Vec<bool> = (0..200).map(|i| i % 2 == 0).collect();
+        for &b in &symbols {
+            enc.write_bool(&mut enc_bank, 0, b);
+        }
+        let bytes = enc.finish();
+        let mut dec_bank = ContextBank::new(1);
+        let mut dec = ArithDecoder::new(&bytes, bytes.len());
+        for (i, &expected) in symbols.iter().enumerate() {
+            let got = dec.read_bool(&mut dec_bank, 0);
+            assert_eq!(got, expected, "bit {i} mismatch");
+        }
+    }
+
+    /// Roundtrip with biased probability (lots of zeros) — exercises
+    /// the renormalise loop dozens of times per symbol once the
+    /// probability adapts heavily. Uses a moderately biased mix so the
+    /// `PROB_LUT` adapts but doesn't pin probabilities at the
+    /// extremes (which would emit zero-bit-rate-per-symbol streams the
+    /// encoder can't represent without the decoder's past-end-1
+    /// padding finally derailing things).
+    #[test]
+    fn arith_roundtrip_biased_zeros() {
+        let mut enc_bank = ContextBank::new(1);
+        let mut enc = ArithEncoder::new();
+        // Mix: 70% zeros, 30% ones — within the range where adaptive
+        // probabilities stay away from the ±extremes.
+        let symbols: Vec<bool> = (0..200).map(|i| i % 3 != 0).collect();
+        for &b in &symbols {
+            enc.write_bool(&mut enc_bank, 0, b);
+        }
+        let bytes = enc.finish();
+        let mut dec_bank = ContextBank::new(1);
+        let mut dec = ArithDecoder::new(&bytes, bytes.len());
+        for (i, &expected) in symbols.iter().enumerate() {
+            let got = dec.read_bool(&mut dec_bank, 0);
+            assert_eq!(got, expected, "biased bit {i}");
+        }
+    }
+
+    /// Roundtrip uint encoding — exercises the exp-Golomb arithmetic
+    /// path used by the Dirac §12.3 motion-data fields.
+    #[test]
+    fn arith_roundtrip_uints_with_follow_contexts() {
+        let mut enc_bank = ContextBank::new(8);
+        let mut enc = ArithEncoder::new();
+        let follow = &[0usize, 1, 2, 3, 4];
+        let data = 5usize;
+        let values: Vec<u32> = vec![0, 1, 2, 3, 4, 5, 7, 15, 100, 255, 1023, 0, 1, 0];
+        for &v in &values {
+            enc.write_uint(&mut enc_bank, follow, data, v);
+        }
+        let bytes = enc.finish();
+        let mut dec_bank = ContextBank::new(8);
+        let mut dec = ArithDecoder::new(&bytes, bytes.len());
+        for (i, &expected) in values.iter().enumerate() {
+            let got = dec.read_uint(&mut dec_bank, follow, data);
+            assert_eq!(got, expected, "uint #{i} ({expected})");
+        }
+    }
+
+    /// Signed-int encoding roundtrip with mixed signs and zeros.
+    #[test]
+    fn arith_roundtrip_sints() {
+        let mut enc_bank = ContextBank::new(8);
+        let mut enc = ArithEncoder::new();
+        let follow = &[0usize, 1, 2, 3, 4];
+        let data = 5usize;
+        let sign = 6usize;
+        let values: Vec<i32> = vec![0, 1, -1, 2, -2, 0, 17, -42, 255, -255, 0, 1, -1];
+        for &v in &values {
+            enc.write_sint(&mut enc_bank, follow, data, sign, v);
+        }
+        let bytes = enc.finish();
+        let mut dec_bank = ContextBank::new(8);
+        let mut dec = ArithDecoder::new(&bytes, bytes.len());
+        for (i, &expected) in values.iter().enumerate() {
+            let got = dec.read_sint(&mut dec_bank, follow, data, sign);
+            assert_eq!(got, expected, "sint #{i} ({expected})");
         }
     }
 }

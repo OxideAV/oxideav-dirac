@@ -27,7 +27,9 @@ the goal here is to land the bitstream framing and primitives first.
 | Wavelet transforms                  | Not yet wired up                                              |
 | VC-2 low-delay intra                | Parse-only (byte framing; no coefficient decode)              |
 | Dirac core-syntax intra / inter     | Parse-only                                                    |
-| Encoder                             | Not implemented                                               |
+| Encoder — VC-2 HQ intra             | Implemented (8/10-bit, 4:2:0/4:2:2/4:4:4, 6 wavelets)         |
+| Encoder — VC-2 LD intra             | Implemented (ffmpeg-bit-exact at q=0)                         |
+| Encoder — Dirac inter (r1)          | 1-ref, integer-pel ME, OBMC, no residue. ≥30 dB self-PSNR.   |
 
 ## Codec ID
 

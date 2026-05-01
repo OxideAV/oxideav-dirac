@@ -122,7 +122,10 @@ fn hq_q0_lossless_across_six_wavelets_and_three_chromas() {
             let stream = encode_single_hq_intra_stream(&seq, &params, 0, &y, &u, &v);
             let frame = decode_one(stream);
             // 8-bit planar: Y plane stride == width, height == data.len()/stride.
-            assert_eq!(frame.planes[0].stride, w as usize, "{filter:?} {chroma:?} width");
+            assert_eq!(
+                frame.planes[0].stride, w as usize,
+                "{filter:?} {chroma:?} width"
+            );
             assert_eq!(
                 frame.planes[0].data.len() / frame.planes[0].stride,
                 h as usize,
@@ -169,7 +172,10 @@ fn hq_q0_lossless_at_non_square_dimensions() {
         let frame = decode_one(stream);
         // 8-bit planar: Y plane stride == width, height == data.len()/stride.
         assert_eq!(frame.planes[0].stride, w as usize);
-        assert_eq!(frame.planes[0].data.len() / frame.planes[0].stride, h as usize);
+        assert_eq!(
+            frame.planes[0].data.len() / frame.planes[0].stride,
+            h as usize
+        );
         assert_eq!(
             frame.planes[0].data, y,
             "Y not bit-exact at {w}x{h} ({sx}x{sy} slices)"
