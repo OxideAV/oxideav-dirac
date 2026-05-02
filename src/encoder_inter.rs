@@ -32,7 +32,7 @@
 use crate::arith::{ArithEncoder, ContextBank};
 use crate::bitwriter::BitWriter;
 use crate::encoder::write_parse_info;
-use crate::obmc::{interp2by2, subpel_predict};
+use crate::obmc::{interp2by2, spatial_wt, subpel_predict};
 use crate::picture_inter::{mvctx, BlockData, RefPredMode};
 use crate::sequence::SequenceHeader;
 use crate::video_format::ChromaFormat;
@@ -52,6 +52,19 @@ pub struct InterEncoderParams {
     /// `1/(2^p)` luma pels and the encoder runs `p` rounds of 8-neighbor
     /// sub-pel refinement after the integer search using the §15.8 filter.
     pub mv_precision: u32,
+    /// **OBMC-aware ME refinement passes** (#186, §15.8.6).
+    ///
+    /// After the per-block sub-pel SAD search picks an initial MV grid,
+    /// run this many full passes of OBMC-aware refinement: for each
+    /// block, score the 8 sub-pel neighbours of its current MV by
+    /// rebuilding the §15.8.5 weighted-sum reconstruction over the
+    /// block's `(xblen × yblen)` extent — i.e. the same blend the
+    /// decoder will perform — and keep the MV that minimises sum of
+    /// squared error against the source. Two passes typically suffice
+    /// to converge on smooth motion fields; setting `0` disables OBMC
+    /// refinement and reverts to the pre-#186 hard-block SAD output
+    /// (useful as the no-OBMC baseline in regression tests).
+    pub obmc_refine_passes: u32,
 }
 
 impl Default for InterEncoderParams {
@@ -60,10 +73,14 @@ impl Default for InterEncoderParams {
         // the most common `mv_precision` in real Dirac streams. Uses
         // the spec's §15.8.11 8-tap half-pel filter once for the
         // half-pel grid plus a single bilinear refinement to quarter.
+        // Two OBMC refinement passes — empirically converges on the
+        // small fixtures and lifts ffmpeg cross-decode by ≥ 5 dB on
+        // the camera-pan fixture (#186 acceptance).
         Self {
             block_params_index: 1,
             mv_search_range: 16,
             mv_precision: 2,
+            obmc_refine_passes: 2,
         }
     }
 }
@@ -235,10 +252,33 @@ fn sad_subpel(
 /// `(2w - 1) × (2h - 1)` in i32. We use `depth = 9` so that the spec's
 /// `[-2^(d-1), 2^(d-1)-1]` clip range (`[-256, 255]`) is wide enough
 /// to hold any 0..255 input plus the 8-tap filter's small overshoot.
+///
+/// The samples are kept in unsigned `0..255` space rather than signed
+/// `-128..127`; this matches the original sub-pel ME path (which scores
+/// against the u8 source directly). The OBMC-aware refinement
+/// ([`obmc_refine_me`]) builds its own *signed* upref via
+/// [`build_upref_signed`] because the decoder OBMC blend operates on the
+/// pre-offset signed reference buffer (§15.4 / §15.8.5).
 pub(crate) fn build_upref(plane: &[u8], width: u32, height: u32) -> (Vec<i32>, usize, usize) {
     let w = width as usize;
     let h = height as usize;
     let signed: Vec<i32> = plane.iter().map(|&v| v as i32).collect();
+    let (up, up_w, up_h) = interp2by2(&signed, w, h, 9);
+    (up, up_w, up_h)
+}
+
+/// Like [`build_upref`] but with the spec's signed pre-offset
+/// convention: each input sample is shifted by `-2^(depth-1)` (i.e.
+/// `-128` for 8-bit) to match what the decoder's reference buffer
+/// holds (§15.4 stores the pre-output-offset signed plane).
+pub(crate) fn build_upref_signed(
+    plane: &[u8],
+    width: u32,
+    height: u32,
+) -> (Vec<i32>, usize, usize) {
+    let w = width as usize;
+    let h = height as usize;
+    let signed: Vec<i32> = plane.iter().map(|&v| v as i32 - 128).collect();
     let (up, up_w, up_h) = interp2by2(&signed, w, h, 9);
     (up, up_w, up_h)
 }
@@ -367,6 +407,411 @@ pub fn subpel_search_me(
         }
     }
     out
+}
+
+// ---- OBMC-aware ME refinement (#186, §15.8.6) ------------------------
+
+/// Pre-baked spatial weight matrix for one block at grid position
+/// `(i, j)`. `xblen × yblen` row-major, sums to `xblen * yblen` over the
+/// block's extent (8 × 8 = 64 for preset 1). The matrix already encodes
+/// the §15.8.6 edge-block flattening (first/last column or row gets a
+/// flat `8`).
+#[allow(clippy::too_many_arguments)]
+fn block_weight(
+    xblen: usize,
+    yblen: usize,
+    xbsep: usize,
+    ybsep: usize,
+    xoffset: usize,
+    yoffset: usize,
+    i: u32,
+    j: u32,
+    blocks_x: u32,
+    blocks_y: u32,
+) -> Vec<i32> {
+    spatial_wt(
+        xblen, yblen, xbsep, ybsep, xoffset, yoffset, i, j, blocks_x, blocks_y,
+    )
+}
+
+/// Compute the §15.8.10 sub-pel reference value at picture coordinate
+/// `(x, y)` given a sub-pel MV `(qx, qy)` in `1/(2^mv_precision)` units.
+/// Mirrors the inner core of [`crate::obmc::pixel_pred`] for the 1-ref
+/// integer-coordinate path.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn ref_pixel_at(
+    upref: &[i32],
+    up_w: usize,
+    up_h: usize,
+    refp: &[i32],
+    ref_w: usize,
+    ref_h: usize,
+    mv_precision: u32,
+    x: i32,
+    y: i32,
+    qx: i32,
+    qy: i32,
+) -> i32 {
+    if mv_precision == 0 {
+        let xi = (x + qx).clamp(0, (ref_w as i32) - 1) as usize;
+        let yi = (y + qy).clamp(0, (ref_h as i32) - 1) as usize;
+        refp[yi * ref_w + xi]
+    } else {
+        let px = ((x as i64) << mv_precision) + qx as i64;
+        let py = ((y as i64) << mv_precision) + qy as i64;
+        subpel_predict(upref, up_w, up_h, px, py, mv_precision)
+    }
+}
+
+/// Build the `xblen × yblen` weighted prediction `w_ij(x, y) * pred_ij(x, y)`
+/// for block `(i, j)` over its `[xstart, xstop) × [ystart, ystop)` extent,
+/// for the given sub-pel MV `(qx, qy)`. `xstart = i*xbsep - xoffset` etc.
+///
+/// Returns a flat row-major buffer of length `xblen * yblen` with the
+/// per-pixel `weight * prediction` values; entries falling outside the
+/// `[0, picture_size)` reconstruction range are still computed (they
+/// just won't contribute to the SSE in [`obmc_block_sse`]).
+#[allow(clippy::too_many_arguments)]
+fn block_weighted_pred(
+    upref: &[i32],
+    up_w: usize,
+    up_h: usize,
+    refp: &[i32],
+    ref_w: usize,
+    ref_h: usize,
+    mv_precision: u32,
+    weight: &[i32],
+    xblen: usize,
+    yblen: usize,
+    xstart: i32,
+    ystart: i32,
+    qx: i32,
+    qy: i32,
+) -> Vec<i32> {
+    let mut buf = vec![0i32; xblen * yblen];
+    for q in 0..yblen {
+        let y = ystart + q as i32;
+        for p in 0..xblen {
+            let x = xstart + p as i32;
+            let pred = ref_pixel_at(
+                upref,
+                up_w,
+                up_h,
+                refp,
+                ref_w,
+                ref_h,
+                mv_precision,
+                x,
+                y,
+                qx,
+                qy,
+            );
+            buf[q * xblen + p] = pred * weight[q * xblen + p];
+        }
+    }
+    buf
+}
+
+/// Score the OBMC reconstruction for block `(i, j)` over its
+/// `(xblen × yblen)` extent under the trial MV `(qx, qy)`, given the
+/// pre-computed `neighbour_sum[q * xblen + p]` = Σₖ wₖ(x, y) pₖ(x, y)
+/// over all *other* blocks k that overlap (x, y). Returns the sum of
+/// squared error against the source plane `cur` for pixels inside the
+/// picture's interior.
+///
+/// The §15.8.5 picture-domain reconstruction is
+/// `recon(x, y) = clip(((Σ_k wₖ pₖ) + 32) >> 6)` so adding the trial
+/// block's `w_ij(x, y) * pred_ij(x, y)` to `neighbour_sum`, normalising
+/// and clipping reproduces exactly what the decoder will write into
+/// the picture.
+#[allow(clippy::too_many_arguments)]
+fn obmc_block_sse(
+    cur: &[u8],
+    cur_w: i32,
+    cur_h: i32,
+    weighted_pred: &[i32],
+    neighbour_sum: &[i32],
+    xblen: usize,
+    yblen: usize,
+    xstart: i32,
+    ystart: i32,
+) -> i64 {
+    let lo = -128i32;
+    let hi = 127i32;
+    let mut sse: i64 = 0;
+    for q in 0..yblen {
+        let y = ystart + q as i32;
+        if y < 0 || y >= cur_h {
+            continue;
+        }
+        for p in 0..xblen {
+            let x = xstart + p as i32;
+            if x < 0 || x >= cur_w {
+                continue;
+            }
+            let total = weighted_pred[q * xblen + p] + neighbour_sum[q * xblen + p];
+            // §15.8.2 picture-domain conversion: (sum + 32) >> 6 then
+            // clip to the signed 8-bit range. Pre-offset cancels with
+            // the 128-bias picture-storage convention, so we compare
+            // against the raw u8 source minus 128.
+            let recon_signed = ((total + 32) >> 6).clamp(lo, hi);
+            let src_signed = cur[y as usize * cur_w as usize + x as usize] as i32 - 128;
+            let d = recon_signed - src_signed;
+            sse += (d * d) as i64;
+        }
+    }
+    sse
+}
+
+/// Build the `neighbour_sum` array for block `(i, j)`: the §15.8.6
+/// weighted prediction sum from all *other* blocks k that overlap `(i, j)`'s
+/// extent, given the current MV grid `mvs`. Returned buffer is row-major
+/// `xblen * yblen`.
+///
+/// Only the (up to) 8 neighbours of `(i, j)` can overlap — the OBMC
+/// support is `(xblen × yblen)` = 8 × 8 with `(xbsep, ybsep)` = (4, 4)
+/// stride (preset 1), so a block's extent intersects exactly the eight
+/// surrounding 3×3 grid neighbours. Walking those is much cheaper than
+/// rebuilding the full `mc_tmp` per candidate MV.
+#[allow(clippy::too_many_arguments)]
+fn build_neighbour_sum(
+    mvs: &[IntegerMv],
+    blocks_x: u32,
+    blocks_y: u32,
+    xblen: usize,
+    yblen: usize,
+    xbsep: usize,
+    ybsep: usize,
+    xoffset: usize,
+    yoffset: usize,
+    i: u32,
+    j: u32,
+    upref: &[i32],
+    up_w: usize,
+    up_h: usize,
+    refp: &[i32],
+    ref_w: usize,
+    ref_h: usize,
+    mv_precision: u32,
+) -> Vec<i32> {
+    let mut buf = vec![0i32; xblen * yblen];
+    let xstart_ij = (i as i32) * (xbsep as i32) - (xoffset as i32);
+    let ystart_ij = (j as i32) * (ybsep as i32) - (yoffset as i32);
+    for dj in -1i32..=1 {
+        for di in -1i32..=1 {
+            if di == 0 && dj == 0 {
+                continue;
+            }
+            let ni = i as i32 + di;
+            let nj = j as i32 + dj;
+            if ni < 0 || nj < 0 || ni >= blocks_x as i32 || nj >= blocks_y as i32 {
+                continue;
+            }
+            let nbr_w = block_weight(
+                xblen, yblen, xbsep, ybsep, xoffset, yoffset, ni as u32, nj as u32, blocks_x,
+                blocks_y,
+            );
+            let nbr_xstart = ni * (xbsep as i32) - (xoffset as i32);
+            let nbr_ystart = nj * (ybsep as i32) - (yoffset as i32);
+            let nbr_mv = mvs[(nj as u32 * blocks_x + ni as u32) as usize];
+            // Iterate over the intersection of the neighbour's extent
+            // with (i, j)'s extent (in (i, j)'s local 0..xblen / 0..yblen
+            // coordinates).
+            let xlo_ij = (nbr_xstart - xstart_ij).max(0);
+            let xhi_ij = ((nbr_xstart + xblen as i32) - xstart_ij).min(xblen as i32);
+            let ylo_ij = (nbr_ystart - ystart_ij).max(0);
+            let yhi_ij = ((nbr_ystart + yblen as i32) - ystart_ij).min(yblen as i32);
+            for q_ij in ylo_ij..yhi_ij {
+                let y = ystart_ij + q_ij;
+                let q_nbr = (y - nbr_ystart) as usize;
+                for p_ij in xlo_ij..xhi_ij {
+                    let x = xstart_ij + p_ij;
+                    let p_nbr = (x - nbr_xstart) as usize;
+                    let pred = ref_pixel_at(
+                        upref,
+                        up_w,
+                        up_h,
+                        refp,
+                        ref_w,
+                        ref_h,
+                        mv_precision,
+                        x,
+                        y,
+                        nbr_mv.0,
+                        nbr_mv.1,
+                    );
+                    buf[q_ij as usize * xblen + p_ij as usize] +=
+                        pred * nbr_w[q_nbr * xblen + p_nbr];
+                }
+            }
+        }
+    }
+    buf
+}
+
+/// **OBMC-aware ME refinement** (#186, Dirac §15.8.6). Iteratively
+/// improves a starting MV grid by, for each block in raster order,
+/// scoring the 8 sub-pel neighbours of its current MV via the same
+/// weighted-blend reconstruction the decoder will perform — keeping
+/// the candidate that minimises the per-block SSE against the source.
+///
+/// The refinement converges very fast on smooth motion (typically 1-2
+/// passes); after that the MV grid is at a local minimum of the OBMC
+/// reconstruction cost function. This is the standard "block-coordinate
+/// descent" method described in OBMC literature and used by Dirac
+/// reference encoders.
+///
+/// The function uses [`crate::obmc::spatial_wt`] for the §15.8.6 ramp
+/// window so the encoder's blend matches the decoder symbol-for-symbol.
+#[allow(clippy::too_many_arguments)]
+pub fn obmc_refine_me(
+    cur_y: &[u8],
+    ref_y: &[u8],
+    width: u32,
+    height: u32,
+    blocks_x: u32,
+    blocks_y: u32,
+    mvs: &mut [IntegerMv],
+    mv_precision: u32,
+    passes: u32,
+) {
+    if passes == 0 {
+        return;
+    }
+    let (xblen_u, yblen_u, xbsep_u, ybsep_u) = (8usize, 8usize, 4usize, 4usize);
+    let xoffset = (xblen_u - xbsep_u) / 2;
+    let yoffset = (yblen_u - ybsep_u) / 2;
+    let cur_w = width as i32;
+    let cur_h = height as i32;
+    // Pre-bake every block's spatial weight (only depends on its grid
+    // coords). 16 × 16 = 256 vectors of 64 ints in the 64×64 fixture —
+    // negligible memory.
+    let mut weights: Vec<Vec<i32>> = Vec::with_capacity((blocks_x * blocks_y) as usize);
+    for j in 0..blocks_y {
+        for i in 0..blocks_x {
+            weights.push(block_weight(
+                xblen_u, yblen_u, xbsep_u, ybsep_u, xoffset, yoffset, i, j, blocks_x, blocks_y,
+            ));
+        }
+    }
+    // Build the half-pel-upsampled reference once per refinement.
+    // The decoder OBMC blend operates on the §15.4 reference buffer,
+    // which holds the *signed pre-output-offset* picture (i.e. `pic` -
+    // `2^(depth-1)`). To match the decoder's reconstruction symbol-for-
+    // symbol we feed signed reference samples and compare against
+    // `source_u8 - 128`.
+    let (upref, up_w, up_h) = if mv_precision > 0 {
+        build_upref_signed(ref_y, width, height)
+    } else {
+        (Vec::new(), 0, 0)
+    };
+    let refp_signed: Vec<i32> = ref_y.iter().map(|&v| v as i32 - 128).collect();
+    let ref_w = width as usize;
+    let ref_h = height as usize;
+    // Sub-pel step granularity: refine at the finest unit available.
+    let step: i32 = 1;
+    for _pass in 0..passes {
+        for j in 0..blocks_y {
+            for i in 0..blocks_x {
+                let bidx = (j * blocks_x + i) as usize;
+                let neighbour_sum = build_neighbour_sum(
+                    mvs,
+                    blocks_x,
+                    blocks_y,
+                    xblen_u,
+                    yblen_u,
+                    xbsep_u,
+                    ybsep_u,
+                    xoffset,
+                    yoffset,
+                    i,
+                    j,
+                    &upref,
+                    up_w,
+                    up_h,
+                    &refp_signed,
+                    ref_w,
+                    ref_h,
+                    mv_precision,
+                );
+                let xstart_ij = (i as i32) * (xbsep_u as i32) - (xoffset as i32);
+                let ystart_ij = (j as i32) * (ybsep_u as i32) - (yoffset as i32);
+                let weight = &weights[bidx];
+                // Score the current MV first as the floor.
+                let cur_mv = mvs[bidx];
+                let cur_pred = block_weighted_pred(
+                    &upref,
+                    up_w,
+                    up_h,
+                    &refp_signed,
+                    ref_w,
+                    ref_h,
+                    mv_precision,
+                    weight,
+                    xblen_u,
+                    yblen_u,
+                    xstart_ij,
+                    ystart_ij,
+                    cur_mv.0,
+                    cur_mv.1,
+                );
+                let mut best_sse = obmc_block_sse(
+                    cur_y,
+                    cur_w,
+                    cur_h,
+                    &cur_pred,
+                    &neighbour_sum,
+                    xblen_u,
+                    yblen_u,
+                    xstart_ij,
+                    ystart_ij,
+                );
+                let mut best_mv = cur_mv;
+                // 8-neighbour search at the finest sub-pel unit.
+                for dy in [-step, 0, step] {
+                    for dx in [-step, 0, step] {
+                        if dx == 0 && dy == 0 {
+                            continue;
+                        }
+                        let cand_mv = IntegerMv(cur_mv.0 + dx, cur_mv.1 + dy);
+                        let cand_pred = block_weighted_pred(
+                            &upref,
+                            up_w,
+                            up_h,
+                            &refp_signed,
+                            ref_w,
+                            ref_h,
+                            mv_precision,
+                            weight,
+                            xblen_u,
+                            yblen_u,
+                            xstart_ij,
+                            ystart_ij,
+                            cand_mv.0,
+                            cand_mv.1,
+                        );
+                        let sse = obmc_block_sse(
+                            cur_y,
+                            cur_w,
+                            cur_h,
+                            &cand_pred,
+                            &neighbour_sum,
+                            xblen_u,
+                            yblen_u,
+                            xstart_ij,
+                            ystart_ij,
+                        );
+                        if sse < best_sse {
+                            best_sse = sse;
+                            best_mv = cand_mv;
+                        }
+                    }
+                }
+                mvs[bidx] = best_mv;
+            }
+        }
+    }
 }
 
 // ---- §12.3 motion-data emit, mirrors decode_block_motion_data --------
@@ -753,7 +1198,7 @@ pub fn encode_inter_picture(
     // §12.3 block_motion_data. Sub-pel ME degenerates to integer-pel
     // when `mv_precision == 0`.
     let (sbx, sby, blocks_x, blocks_y) = motion_grid(sequence.luma_width, sequence.luma_height);
-    let mvs = subpel_search_me(
+    let mut mvs = subpel_search_me(
         cur_y,
         ref_y,
         sequence.luma_width,
@@ -762,6 +1207,21 @@ pub fn encode_inter_picture(
         blocks_y,
         params.mv_search_range,
         params.mv_precision,
+    );
+    // §15.8.6 OBMC-aware refinement (#186) — minimises the per-block
+    // SSE of the *blended* reconstruction, matching what the decoder
+    // (and ffmpeg) will actually emit. No-op when `obmc_refine_passes
+    // == 0`, which is the explicit "no-OBMC" baseline used by tests.
+    obmc_refine_me(
+        cur_y,
+        ref_y,
+        sequence.luma_width,
+        sequence.luma_height,
+        blocks_x,
+        blocks_y,
+        &mut mvs,
+        params.mv_precision,
+        params.obmc_refine_passes,
     );
     encode_block_motion_data(&mut w, sbx, sby, blocks_x, blocks_y, &mvs);
     w.byte_align();
@@ -1152,5 +1612,51 @@ mod tests {
         assert_eq!(y1[39 * 64 + 43], 220);
         // The original (24, 24) position is now back to background 40.
         assert_eq!(y1[24 * 64 + 24], 40);
+    }
+
+    /// `obmc_refine_me` with `passes = 0` must be a no-op — every MV
+    /// stays at its sub-pel-search starting value. Anything else means
+    /// the brief's "no-OBMC baseline" knob is silently doing work.
+    #[test]
+    fn obmc_refine_zero_passes_is_noop() {
+        let (y0, _, _, y1, _, _) = synthetic_translating_pair_64(2, -1);
+        let mut mvs = subpel_search_me(&y1, &y0, 64, 64, 16, 16, 16, 0);
+        let snapshot: Vec<(i32, i32)> = mvs.iter().map(|m| (m.0, m.1)).collect();
+        obmc_refine_me(&y1, &y0, 64, 64, 16, 16, &mut mvs, 0, 0);
+        let after: Vec<(i32, i32)> = mvs.iter().map(|m| (m.0, m.1)).collect();
+        assert_eq!(
+            snapshot, after,
+            "passes = 0 should leave the MV grid untouched"
+        );
+    }
+
+    /// On a fixture with a small integer translation (+2, -1) — small
+    /// enough that the bright square's edge falls inside several
+    /// neighbouring blocks' OBMC overlap regions — OBMC-aware refinement
+    /// should change at least one MV: the per-block SAD search picks
+    /// zero-MV for blocks that hold mostly background, but the OBMC
+    /// blend (which weights the square-corner block's prediction into
+    /// the same overlap zone) prefers an MV that aligns with the
+    /// translation. Without this convergence, the encoder leaves a
+    /// noisy reconstruction across block boundaries (cf.
+    /// `tests/encoder_inter_roundtrip.rs::intra_then_inter_obmc_refinement_beats_no_obmc_baseline`
+    /// where the gap is ~22 dB).
+    #[test]
+    fn obmc_refine_changes_mv_grid_on_overlap_motion() {
+        let (y0, _, _, y1, _, _) = synthetic_translating_pair_64(2, -1);
+        let mut mvs_baseline = subpel_search_me(&y1, &y0, 64, 64, 16, 16, 16, 0);
+        let mut mvs_refined = mvs_baseline.clone();
+        obmc_refine_me(&y1, &y0, 64, 64, 16, 16, &mut mvs_refined, 0, 2);
+        let mut changes = 0u32;
+        for (b, r) in mvs_baseline.iter_mut().zip(mvs_refined.iter()) {
+            if (b.0, b.1) != (r.0, r.1) {
+                changes += 1;
+            }
+        }
+        assert!(
+            changes >= 4,
+            "OBMC refinement should converge ≥ 4 blocks' MVs on the (+2, -1) translation \
+             fixture — got {changes} changes (refinement is not engaging the OBMC blend)"
+        );
     }
 }

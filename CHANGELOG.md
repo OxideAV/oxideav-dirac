@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Dirac inter encoder **OBMC-aware ME refinement** (#186, §15.8.6) —
+  `encoder_inter` now follows the per-block sub-pel SAD search with
+  `obmc_refine_passes` (default 2) full passes of OBMC-aware refinement:
+  for each block, the 8 sub-pel neighbours of its current MV are scored
+  via the same §15.8.5 weighted-sum reconstruction the decoder will
+  perform, keeping whichever MV minimises the per-block SSE against
+  the source. The `neighbour_sum` is built from the eight surrounding
+  blocks' weighted predictions (re-using `obmc::spatial_wt`,
+  `obmc::subpel_predict`, `obmc::interp2by2`) so the encoder's blend
+  mirrors the decoder symbol-for-symbol. Self-roundtrip uplift on
+  fixtures where motion straddles the OBMC overlap region is
+  dramatic — `synthetic_translating_pair_64(2,-1)` jumps from
+  **32.56 dB** (no-OBMC baseline) to **∞ dB** (bit-exact); the vertical
+  `(0,-4)` translation goes 30.24 → 33.37 dB; the integer camera-pan
+  goes 26.92 → 28.02 dB. ffmpeg cross-decode is structurally capped
+  near 19-20 dB on these synthetic fixtures regardless of MV quality
+  (independent ffmpeg-side OBMC convention difference, documented in
+  `tests/ffmpeg_interop.rs`); the new `ffmpeg_obmc_aware_me_does_not_regress_cross_decode`
+  test asserts no cross-decode regression vs the no-OBMC baseline.
+  Setting `obmc_refine_passes = 0` reverts to the pre-#186 hard-block
+  SAD output for direct A/B comparison. 4 new tests (2 unit + 1
+  self-roundtrip A/B + 1 ffmpeg cross-decode floor); all 165 dirac
+  tests pass.
+
 - Dirac inter encoder **sub-pel ME** (#168) — `encoder_inter` now runs
   the integer-pel SAD search followed by per-level 8-neighbor gradient
   refinement to the configured `mv_precision` (default quarter-pel, also

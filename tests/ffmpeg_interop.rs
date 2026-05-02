@@ -984,3 +984,131 @@ fn ffmpeg_cross_decodes_camera_pan_with_subpel_me() {
          this gap further in #169)"
     );
 }
+
+/// **OBMC-aware ME cross-decode (#186)**. ffmpeg should cross-decode
+/// our quarter-pel core-syntax inter stream at least as well with our
+/// §15.8.6 OBMC-aware ME refinement (`obmc_refine_passes = 2`, the
+/// default) as without it (`obmc_refine_passes = 0`, the no-OBMC
+/// baseline). On these synthetic 64×64 fixtures the cross-decode is
+/// structurally capped by ffmpeg's reconstruction (~20 dB on the
+/// camera-pan, ~19 dB on the translating-square) — the *self-roundtrip*
+/// uplift from OBMC-aware ME is much larger (3 dB → ∞ dB on
+/// `tests/encoder_inter_roundtrip.rs::intra_then_inter_obmc_refinement_beats_no_obmc_baseline`).
+/// This test simply asserts no cross-decode regression vs the no-OBMC
+/// baseline; the dramatic gain happens on our spec-correct decoder
+/// where the OBMC blend the encoder modelled is exactly what reads
+/// the MV grid back.
+#[test]
+fn ffmpeg_obmc_aware_me_does_not_regress_cross_decode() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg not available; skipping OBMC cross-decode test");
+        return;
+    }
+    use oxideav_dirac::encoder::make_minimal_sequence;
+    use oxideav_dirac::encoder_inter::{
+        synthetic_translating_pair_64, InterEncoderParams, InterInputPicture,
+    };
+    use oxideav_dirac::encoder_intra_core::{
+        encode_core_intra_then_inter_stream, CoreIntraEncoderParams,
+    };
+    use oxideav_dirac::wavelet::WaveletFilter;
+
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let intra_params = CoreIntraEncoderParams::default_intra(WaveletFilter::LeGall5_3, 3);
+    let (y0, u0, v0, y1, u1, v1) = synthetic_translating_pair_64(2, -1);
+    let intra = InterInputPicture {
+        picture_number: 0,
+        y: &y0,
+        u: &u0,
+        v: &v0,
+    };
+    let inter = InterInputPicture {
+        picture_number: 1,
+        y: &y1,
+        u: &u1,
+        v: &v1,
+    };
+
+    fn psnr(a: &[u8], b: &[u8]) -> f64 {
+        let mut sse: u64 = 0;
+        for i in 0..a.len() {
+            let d = a[i] as i32 - b[i] as i32;
+            sse += (d * d) as u64;
+        }
+        if sse == 0 {
+            return f64::INFINITY;
+        }
+        let mse = sse as f64 / a.len() as f64;
+        20.0 * (255.0f64).log10() - 10.0 * mse.log10()
+    }
+
+    let measure = |inter_params: &InterEncoderParams, tag: &str| -> f64 {
+        let stream =
+            encode_core_intra_then_inter_stream(&seq, &intra_params, inter_params, &intra, &inter);
+        let tmpdir = std::env::temp_dir();
+        let drc = tmpdir.join(format!("oxideav_dirac_obmc_xref_{tag}.drc"));
+        let yuv = tmpdir.join(format!("oxideav_dirac_obmc_xref_{tag}.yuv"));
+        std::fs::write(&drc, &stream).expect("write drc");
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "dirac",
+                "-i",
+            ])
+            .arg(&drc)
+            .args(["-f", "rawvideo", "-pix_fmt", "yuv420p"])
+            .arg(&yuv)
+            .status()
+            .expect("run ffmpeg");
+        assert!(
+            status.success(),
+            "ffmpeg rejected our OBMC cross-decode stream ({tag})"
+        );
+        let out = std::fs::read(&yuv).expect("read ffmpeg yuv");
+        let frame_size = 64 * 64 + 2 * 32 * 32;
+        assert!(out.len() >= 2 * frame_size);
+        let inter_yuv = &out[frame_size..2 * frame_size];
+        let inter_y = &inter_yuv[..64 * 64];
+        psnr(inter_y, &y1)
+    };
+
+    let no_obmc_params = InterEncoderParams {
+        mv_precision: 2,
+        obmc_refine_passes: 0,
+        ..InterEncoderParams::default()
+    };
+    let obmc_params = InterEncoderParams {
+        mv_precision: 2,
+        obmc_refine_passes: 2,
+        ..InterEncoderParams::default()
+    };
+    let psnr_no_obmc = measure(&no_obmc_params, "no_obmc");
+    let psnr_obmc = measure(&obmc_params, "obmc");
+    eprintln!(
+        "translate(+2,-1) ffmpeg cross-decode: no-OBMC = {psnr_no_obmc:.2} dB, \
+         OBMC-aware = {psnr_obmc:.2} dB"
+    );
+    // The cross-decode floor: OBMC must not regress ffmpeg's
+    // reconstruction. ffmpeg's inter path differs from our spec-correct
+    // OBMC blend (cf. the longer note on
+    // `ffmpeg_decodes_our_inter_stream_translating_square`), so the
+    // absolute uplift here is small (~0.04 dB). The self-roundtrip
+    // counterpart of this test
+    // (`encoder_inter_roundtrip::intra_then_inter_obmc_refinement_beats_no_obmc_baseline`)
+    // measures the spec-correct gain (~22 dB). We require ffmpeg to
+    // be no worse than 0.25 dB below baseline — anything past that
+    // signals the encoder's OBMC convergence is corrupting the MV
+    // grid in ways ffmpeg actively penalises.
+    assert!(
+        psnr_obmc + 0.25 >= psnr_no_obmc,
+        "OBMC-aware ME regressed ffmpeg cross-decode by > 0.25 dB \
+         ({psnr_no_obmc:.2} dB → {psnr_obmc:.2} dB) on translate(+2,-1) \
+         (#186 cross-decode floor — OBMC must not actively harm ffmpeg \
+         reconstruction even when it can't help due to ffmpeg's structural \
+         OBMC differences)"
+    );
+}
