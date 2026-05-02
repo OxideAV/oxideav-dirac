@@ -867,3 +867,120 @@ fn ffmpeg_decodes_our_inter_stream_translating_square() {
         "ffmpeg inter Y PSNR {psnr_y:.2} dB below 15 dB cross-decode floor"
     );
 }
+
+/// **Sub-pel ME ffmpeg cross-decode (#168)**. The camera-pan fixture
+/// is a sub-pel-shifted vertical-bar pattern — exactly the case where
+/// integer-pel ME fails. With our quarter-pel encoder, ffmpeg should
+/// reconstruct the inter frame with measurably less error than on the
+/// integer-pel-only path.
+///
+/// The cross-decode delta is much smaller than the self-roundtrip
+/// uplift (~25 dB on the same fixture) because the encoder still
+/// emits hard 8x8 blocks without the §15.8.6 OBMC overlap window —
+/// ffmpeg's OBMC reconstruction therefore mixes the sub-pel-correct
+/// predictions across block boundaries and the absolute fidelity is
+/// still capped near ~20 dB. Once the OBMC overlap encode lands
+/// (#169), this delta should grow to match the self-roundtrip uplift.
+#[test]
+fn ffmpeg_cross_decodes_camera_pan_with_subpel_me() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg not available; skipping camera-pan sub-pel cross-decode");
+        return;
+    }
+    use oxideav_dirac::encoder::make_minimal_sequence;
+    use oxideav_dirac::encoder_inter::{
+        synthetic_camera_pan_64, InterEncoderParams, InterInputPicture,
+    };
+    use oxideav_dirac::encoder_intra_core::{
+        encode_core_intra_then_inter_stream, CoreIntraEncoderParams,
+    };
+    use oxideav_dirac::wavelet::WaveletFilter;
+
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let intra_params = CoreIntraEncoderParams::default_intra(WaveletFilter::LeGall5_3, 3);
+    let (y0, u0, v0, y1, u1, v1) = synthetic_camera_pan_64(1, 0);
+    let intra = InterInputPicture {
+        picture_number: 0,
+        y: &y0,
+        u: &u0,
+        v: &v0,
+    };
+    let inter = InterInputPicture {
+        picture_number: 1,
+        y: &y1,
+        u: &u1,
+        v: &v1,
+    };
+
+    fn psnr(a: &[u8], b: &[u8]) -> f64 {
+        let mut sse: u64 = 0;
+        for i in 0..a.len() {
+            let d = a[i] as i32 - b[i] as i32;
+            sse += (d * d) as u64;
+        }
+        if sse == 0 {
+            return f64::INFINITY;
+        }
+        let mse = sse as f64 / a.len() as f64;
+        20.0 * (255.0f64).log10() - 10.0 * mse.log10()
+    }
+
+    let measure = |inter_params: &InterEncoderParams, tag: &str| -> f64 {
+        let stream =
+            encode_core_intra_then_inter_stream(&seq, &intra_params, inter_params, &intra, &inter);
+        let tmpdir = std::env::temp_dir();
+        let drc = tmpdir.join(format!("oxideav_dirac_camera_pan_{tag}.drc"));
+        let yuv = tmpdir.join(format!("oxideav_dirac_camera_pan_{tag}.yuv"));
+        std::fs::write(&drc, &stream).expect("write drc");
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "dirac",
+                "-i",
+            ])
+            .arg(&drc)
+            .args(["-f", "rawvideo", "-pix_fmt", "yuv420p"])
+            .arg(&yuv)
+            .status()
+            .expect("run ffmpeg");
+        assert!(
+            status.success(),
+            "ffmpeg rejected our camera-pan stream ({tag}) — see {drc:?}"
+        );
+        let out = std::fs::read(&yuv).expect("read ffmpeg yuv");
+        let frame_size = 64 * 64 + 2 * 32 * 32;
+        assert!(out.len() >= 2 * frame_size);
+        let inter_yuv = &out[frame_size..2 * frame_size];
+        let inter_y = &inter_yuv[..64 * 64];
+        psnr(inter_y, &y1)
+    };
+
+    let int_params = InterEncoderParams {
+        mv_precision: 0,
+        ..InterEncoderParams::default()
+    };
+    let qpel_params = InterEncoderParams {
+        mv_precision: 2,
+        ..InterEncoderParams::default()
+    };
+    let psnr_int = measure(&int_params, "int");
+    let psnr_qpel = measure(&qpel_params, "qpel");
+    eprintln!(
+        "camera-pan ffmpeg cross-decode: integer-pel = {psnr_int:.2} dB, \
+         quarter-pel = {psnr_qpel:.2} dB"
+    );
+    // Cross-decode acceptance: quarter-pel must measurably beat
+    // integer-pel. The bar is intentionally modest (≥ 0.5 dB) until
+    // OBMC overlap encoding lands — see the doc comment above.
+    assert!(
+        psnr_qpel >= psnr_int + 0.5,
+        "ffmpeg cross-decode quarter-pel PSNR {psnr_qpel:.2} dB did not \
+         beat integer-pel {psnr_int:.2} dB by ≥ 0.5 dB on the sub-pel \
+         camera-pan fixture (#168 acceptance — OBMC overlap will widen \
+         this gap further in #169)"
+    );
+}

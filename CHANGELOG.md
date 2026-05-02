@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Dirac inter encoder **sub-pel ME** (#168) — `encoder_inter` now runs
+  the integer-pel SAD search followed by per-level 8-neighbor gradient
+  refinement to the configured `mv_precision` (default quarter-pel, also
+  half- and eighth-pel supported). Sub-pel candidates are evaluated
+  against the spec's §15.8.10 / §15.8.11 reference (8-tap half-pel
+  filter + bilinear sub-half) so SAD evaluated at the encoder matches
+  the eventual reconstruction error pixel-for-pixel. New
+  `synthetic_camera_pan_64` fixture with a vertical-bar pattern panned
+  by a configurable quarter-pel offset exposes the gain: self-roundtrip
+  Y PSNR jumps from **26.92 dB** (integer-pel) to **52.04 dB**
+  (quarter-pel) on a 1/4-pel pan. ffmpeg cross-decode improves modestly
+  (~1 dB) — that gap will widen once OBMC overlap encoding lands
+  (#169). 5 new tests (3 unit + 1 self-roundtrip + 1 ffmpeg
+  cross-decode); all 161 dirac tests pass. `mv_precision` is also
+  exposed via `InterEncoderParams` so callers can pick integer-pel
+  (`0`), half- (`1`), quarter- (`2`, default), or eighth-pel (`3`).
+
 ### Changed
 
 - ffmpeg interop hard-asserts the homogeneous core-syntax I+P chain

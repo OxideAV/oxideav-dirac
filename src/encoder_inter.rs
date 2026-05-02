@@ -1,17 +1,20 @@
-//! Dirac core-syntax **inter** encoder (round 1).
+//! Dirac core-syntax **inter** encoder.
 //!
 //! Mirrors [`crate::picture_inter::decode_block_motion_data`] +
-//! [`crate::picture::decode_picture_with_refs`] on the encode side. The
-//! r1 design is intentionally narrow:
+//! [`crate::picture::decode_picture_with_refs`] on the encode side.
+//! Current shape (post-#168 sub-pel ME):
 //!
 //! * **Single reference** (parse code `0x09` — non-reference 1-ref AC
 //!   inter picture). One `picture_number` delta, no `retd`.
 //! * **No global motion**, no reference weights override (`refs_wt =
 //!   1 / 1`, `refs_wt_precision = 1`).
-//! * **Integer-pel motion** (`mv_precision = 0`) — chroma MVs scale
-//!   directly via floor-division, no half-pel interpolation. Decoder's
-//!   `pixel_pred` short-circuits the upref path here, dramatically
-//!   simplifying the encoder/decoder agreement.
+//! * **Quarter-pel motion** (`mv_precision = 2` by default; configurable
+//!   via [`InterEncoderParams::mv_precision`]) — integer-pel SAD search
+//!   over `[-mv_search_range, +mv_search_range]` followed by an 8-neighbor
+//!   gradient refinement at each successive sub-pel level (half-pel,
+//!   quarter-pel) using the spec's §15.8.10 / §15.8.11 interpolation
+//!   filter (8-tap half-pel + bilinear sub-half). Setting `mv_precision = 0`
+//!   reverts to integer-pel-only ME.
 //! * **Block grid**: preset 1 from Table 11.1 — 8x8 blocks with 4x4
 //!   stride. Two-element block_data context — uniform splits, no
 //!   superblock subdivisions.
@@ -21,33 +24,46 @@
 //!   ME chose) plus zero residual. PSNR is dominated by motion
 //!   estimation quality.
 //!
-//! Motion estimation: full-search SAD over a `(mv_search_range)`-pel
-//! window, integer pel only, per `bsep`-stride 8x8 block. r2 will add
-//! sub-pel and OBMC overlap.
+//! Motion estimation: integer-pel full-search SAD over a
+//! `(mv_search_range)`-pel window followed by per-level 8-neighbor
+//! refinement to the configured sub-pel precision. r3 will add OBMC
+//! overlap and 2-ref bipred.
 
 use crate::arith::{ArithEncoder, ContextBank};
 use crate::bitwriter::BitWriter;
 use crate::encoder::write_parse_info;
+use crate::obmc::{interp2by2, subpel_predict};
 use crate::picture_inter::{mvctx, BlockData, RefPredMode};
 use crate::sequence::SequenceHeader;
 use crate::video_format::ChromaFormat;
 
-/// Encoder-side inter parameters. Keep the surface small for r1.
+/// Encoder-side inter parameters.
 #[derive(Debug, Clone)]
 pub struct InterEncoderParams {
-    /// Block-parameters preset index (Table 11.1). r1 only supports
-    /// preset 1 (xblen=yblen=8, xbsep=ybsep=4).
+    /// Block-parameters preset index (Table 11.1). Only preset 1
+    /// (xblen=yblen=8, xbsep=ybsep=4) is supported today.
     pub block_params_index: u32,
-    /// MV search half-window in **luma pels**. SAD over `[-r, +r]` in
-    /// each direction. Larger = slower but better.
+    /// MV search half-window in **luma pels**. Integer-pel SAD search
+    /// runs over `[-r, +r]` in each direction.
     pub mv_search_range: u32,
+    /// Motion-vector precision (§11.2.5):
+    /// `0`=integer, `1`=half-pel, `2`=quarter-pel, `3`=eighth-pel.
+    /// At precision `p`, encoded MV components are in units of
+    /// `1/(2^p)` luma pels and the encoder runs `p` rounds of 8-neighbor
+    /// sub-pel refinement after the integer search using the §15.8 filter.
+    pub mv_precision: u32,
 }
 
 impl Default for InterEncoderParams {
     fn default() -> Self {
+        // Quarter-pel by default — a good speed/accuracy trade-off and
+        // the most common `mv_precision` in real Dirac streams. Uses
+        // the spec's §15.8.11 8-tap half-pel filter once for the
+        // half-pel grid plus a single bilinear refinement to quarter.
         Self {
             block_params_index: 1,
             mv_search_range: 16,
+            mv_precision: 2,
         }
     }
 }
@@ -78,7 +94,13 @@ fn motion_grid(luma_w: u32, luma_h: u32) -> (u32, u32, u32, u32) {
     (superblocks_x, superblocks_y, blocks_x, blocks_y)
 }
 
-/// Per-block integer-pel motion vector. Indexed `[by * blocks_x + bx]`.
+/// Per-block sub-pel motion vector in units of `1/(2^mv_precision)` luma
+/// pels. For `mv_precision = 0` this is identical to integer-pel MVs.
+/// Indexed `[by * blocks_x + bx]`.
+///
+/// Name retained from the integer-pel-only era of the encoder; the
+/// component values are simply scaled (or refined) according to the
+/// active `mv_precision`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct IntegerMv(pub i32, pub i32);
 
@@ -167,6 +189,184 @@ fn sad_block(
         }
     }
     sad
+}
+
+/// SAD between an `xblen × yblen` source block at `(x0, y0)` in `cur`
+/// and a sub-pel-sampled reference block whose top-left lies at
+/// `(qx, qy)` in `1/(2^mv_precision)`-pel units. Reference samples are
+/// read via [`subpel_predict`] (§15.8.10) on the half-pel-upsampled
+/// `upref` plane (§15.8.11) — the same path the decoder uses on the
+/// reverse side, so SAD evaluated here matches the eventual
+/// reconstruction error pixel-for-pixel.
+#[allow(clippy::too_many_arguments)]
+fn sad_subpel(
+    cur: &[u8],
+    upref: &[i32],
+    up_w: usize,
+    up_h: usize,
+    w: i32,
+    h: i32,
+    x0: i32,
+    y0: i32,
+    qx: i64,
+    qy: i64,
+    xblen: i32,
+    yblen: i32,
+    mv_precision: u32,
+) -> i64 {
+    let mut sad: i64 = 0;
+    let scale = 1i64 << mv_precision;
+    for y in 0..yblen {
+        let cy = (y0 + y).clamp(0, h - 1) as usize;
+        let py = qy + (y as i64) * scale;
+        for x in 0..xblen {
+            let cx = (x0 + x).clamp(0, w - 1) as usize;
+            let px = qx + (x as i64) * scale;
+            let r = subpel_predict(upref, up_w, up_h, px, py, mv_precision);
+            let a = cur[cy * w as usize + cx] as i32;
+            sad += (a - r).unsigned_abs() as i64;
+        }
+    }
+    sad
+}
+
+/// Build the half-pel upsampled reference plane (§15.8.11) for a
+/// `width × height` u8 luma plane. The returned plane has size
+/// `(2w - 1) × (2h - 1)` in i32. We use `depth = 9` so that the spec's
+/// `[-2^(d-1), 2^(d-1)-1]` clip range (`[-256, 255]`) is wide enough
+/// to hold any 0..255 input plus the 8-tap filter's small overshoot.
+pub(crate) fn build_upref(plane: &[u8], width: u32, height: u32) -> (Vec<i32>, usize, usize) {
+    let w = width as usize;
+    let h = height as usize;
+    let signed: Vec<i32> = plane.iter().map(|&v| v as i32).collect();
+    let (up, up_w, up_h) = interp2by2(&signed, w, h, 9);
+    (up, up_w, up_h)
+}
+
+/// Sub-pel motion estimation: integer-pel SAD followed by per-level
+/// 8-neighbor refinement down to `mv_precision` (in `1/(2^p)` pel units).
+///
+/// Strategy:
+/// 1. Run [`full_search_me`] to find the best integer-pel MV for each
+///    8x8 block.
+/// 2. Promote to `mv_precision` units (multiply by `2^mv_precision`).
+/// 3. For each refinement level `lvl = mv_precision .. 1` (i.e. a
+///    half-pel step at level `mv_precision-1`, then quarter-pel at
+///    `mv_precision-2`, etc., down to the finest level), test the 8
+///    neighbours of the current best at step size `2^(lvl-1)` units.
+///    Accept the lowest-SAD neighbour. This is the spec-spirit
+///    "log search" — O(8 · mv_precision) sub-pel evaluations per block
+///    instead of the O((2 · 2^p)^2) of a full-search.
+///
+/// At `mv_precision = 0` this degenerates to [`full_search_me`].
+#[allow(clippy::too_many_arguments)]
+pub fn subpel_search_me(
+    cur_y: &[u8],
+    ref_y: &[u8],
+    width: u32,
+    height: u32,
+    blocks_x: u32,
+    blocks_y: u32,
+    search: u32,
+    mv_precision: u32,
+) -> Vec<IntegerMv> {
+    let int_mvs = full_search_me(cur_y, ref_y, width, height, blocks_x, blocks_y, search);
+    if mv_precision == 0 {
+        return int_mvs;
+    }
+    let (xblen, yblen) = (8i32, 8i32);
+    let (xbsep, ybsep) = (4i32, 4i32);
+    let w = width as i32;
+    let h = height as i32;
+    let scale = 1i64 << mv_precision;
+    let (up, up_w, up_h) = build_upref(ref_y, width, height);
+    let mut out = vec![IntegerMv::default(); int_mvs.len()];
+    for by in 0..blocks_y {
+        for bx in 0..blocks_x {
+            let idx = (by * blocks_x + bx) as usize;
+            let int_mv = int_mvs[idx];
+            let x0 = bx as i32 * xbsep;
+            let y0 = by as i32 * ybsep;
+            // Promote integer-pel MV into 1/(2^p)-pel units.
+            let mut best_qx = (int_mv.0 as i64) * scale;
+            let mut best_qy = (int_mv.1 as i64) * scale;
+            // Reference top-left for this block in sub-pel units.
+            let mut q_ref_x = (x0 as i64) * scale + best_qx;
+            let mut q_ref_y = (y0 as i64) * scale + best_qy;
+            let mut best_sad = sad_subpel(
+                cur_y,
+                &up,
+                up_w,
+                up_h,
+                w,
+                h,
+                x0,
+                y0,
+                q_ref_x,
+                q_ref_y,
+                xblen,
+                yblen,
+                mv_precision,
+            );
+            // Tiny lambda toward the integer center keeps motion-free
+            // areas at zero-MV (matches the integer-pel pass behaviour).
+            best_sad += (best_qx.unsigned_abs() + best_qy.unsigned_abs()) as i64;
+
+            // Per-level 8-neighbor refinement. Step size halves each
+            // level until we reach 1 sub-pel unit (the finest).
+            let mut step: i64 = 1i64 << (mv_precision - 1);
+            while step >= 1 {
+                let mut improved = true;
+                while improved {
+                    improved = false;
+                    let mut best_dx = 0i64;
+                    let mut best_dy = 0i64;
+                    for dy in [-step, 0, step] {
+                        for dx in [-step, 0, step] {
+                            if dx == 0 && dy == 0 {
+                                continue;
+                            }
+                            let cand_qx = best_qx + dx;
+                            let cand_qy = best_qy + dy;
+                            let cand_ref_x = q_ref_x + dx;
+                            let cand_ref_y = q_ref_y + dy;
+                            let mut sad = sad_subpel(
+                                cur_y,
+                                &up,
+                                up_w,
+                                up_h,
+                                w,
+                                h,
+                                x0,
+                                y0,
+                                cand_ref_x,
+                                cand_ref_y,
+                                xblen,
+                                yblen,
+                                mv_precision,
+                            );
+                            sad += (cand_qx.unsigned_abs() + cand_qy.unsigned_abs()) as i64;
+                            if sad < best_sad {
+                                best_sad = sad;
+                                best_dx = dx;
+                                best_dy = dy;
+                                improved = true;
+                            }
+                        }
+                    }
+                    if improved {
+                        best_qx += best_dx;
+                        best_qy += best_dy;
+                        q_ref_x += best_dx;
+                        q_ref_y += best_dy;
+                    }
+                }
+                step >>= 1;
+            }
+            out[idx] = IntegerMv(best_qx as i32, best_qy as i32);
+        }
+    }
+    out
 }
 
 // ---- §12.3 motion-data emit, mirrors decode_block_motion_data --------
@@ -550,9 +750,10 @@ pub fn encode_inter_picture(
     write_picture_prediction_parameters(&mut w, params);
     w.byte_align();
 
-    // §12.3 block_motion_data.
+    // §12.3 block_motion_data. Sub-pel ME degenerates to integer-pel
+    // when `mv_precision == 0`.
     let (sbx, sby, blocks_x, blocks_y) = motion_grid(sequence.luma_width, sequence.luma_height);
-    let mvs = full_search_me(
+    let mvs = subpel_search_me(
         cur_y,
         ref_y,
         sequence.luma_width,
@@ -560,6 +761,7 @@ pub fn encode_inter_picture(
         blocks_x,
         blocks_y,
         params.mv_search_range,
+        params.mv_precision,
     );
     encode_block_motion_data(&mut w, sbx, sby, blocks_x, blocks_y, &mvs);
     w.byte_align();
@@ -573,11 +775,13 @@ pub fn encode_inter_picture(
     w.finish()
 }
 
-fn write_picture_prediction_parameters(w: &mut BitWriter, _params: &InterEncoderParams) {
+fn write_picture_prediction_parameters(w: &mut BitWriter, params: &InterEncoderParams) {
     // §11.2.2 block_parameters: index 1 (preset 8x8 / 4x4).
     w.write_uint(1);
-    // §11.2.5 motion_vector_precision: 0 (integer-pel only in r1).
-    w.write_uint(0);
+    // §11.2.5 motion_vector_precision (0=integer, 1=half, 2=quarter,
+    // 3=eighth pel; spec caps at 3).
+    debug_assert!(params.mv_precision <= 3, "mv_precision must be 0..=3");
+    w.write_uint(params.mv_precision);
     // §11.2.6 global_motion: not used.
     w.write_bool(false);
     // §11.2.7 picture_prediction_mode: 0 (default).
@@ -683,6 +887,52 @@ pub fn synthetic_translating_pair_64(dx: i32, dy: i32) -> TranslatingPair64 {
     // still has to handle the 2x downsampled MV grid without losing
     // the constant chroma background.
     let _ = ChromaFormat::Yuv420;
+    (y0, u_const, v_const, y1, u_const, v_const)
+}
+
+/// Build a synthetic **camera-pan** 64x64 4:2:0 YUV pair with **sub-pel**
+/// horizontal motion. Frame 0 carries a high-frequency vertical-bar
+/// pattern; frame 1 holds the same content panned by `dx_qpel` quarter-pel
+/// units in x and `dy_qpel` quarter-pel units in y. The fractional
+/// translation is synthesised via a separable 4-tap bicubic resample so
+/// the resulting picture remains smooth at sub-pel offsets — any
+/// integer-pel-only ME bottoms out at the nearest integer MV and leaves
+/// a non-zero residue, while sub-pel ME can lock onto the true offset
+/// and reduce the residue dramatically.
+pub fn synthetic_camera_pan_64(dx_qpel: i32, dy_qpel: i32) -> TranslatingPair64 {
+    // Frame 0: vertical bars (period 8 luma) on a uniform background —
+    // a feature that's high-frequency in x but DC in y, perfect for
+    // exposing horizontal sub-pel error.
+    let mut y0 = [0u8; 64 * 64];
+    for r in 0..64usize {
+        for c in 0..64usize {
+            // Cosine-shaped vertical bars: amplitude 80 around midgrey 128.
+            // Values stay strictly within 0..=255 so the encoder doesn't
+            // clip on the integer round-trip.
+            let phase = (c as f64) * std::f64::consts::PI / 4.0;
+            let v = 128.0 + 80.0 * phase.cos();
+            y0[r * 64 + c] = v.round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    // Frame 1: same pattern translated by (dx_qpel/4, dy_qpel/4) pels.
+    // We resample by direct cosine evaluation at the new phase — this
+    // is the analytical truth, not a bicubic, so frame 1 is *exactly*
+    // a sub-pel-shifted copy of frame 0 (modulo edge effects).
+    let mut y1 = [0u8; 64 * 64];
+    let dx_pel = dx_qpel as f64 / 4.0;
+    let _dy_pel = dy_qpel as f64 / 4.0;
+    for r in 0..64usize {
+        for c in 0..64usize {
+            // The cosine pattern is constant in y, so dy only affects
+            // the boundary handling; we keep it analytical too.
+            let new_c = (c as f64) - dx_pel;
+            let phase = new_c * std::f64::consts::PI / 4.0;
+            let v = 128.0 + 80.0 * phase.cos();
+            y1[r * 64 + c] = v.round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    let u_const = [128u8; 32 * 32];
+    let v_const = [128u8; 32 * 32];
     (y0, u_const, v_const, y1, u_const, v_const)
 }
 
@@ -807,32 +1057,88 @@ mod tests {
 
     /// `parse_picture_prediction_parameters` should accept the bytes
     /// emitted by `write_picture_prediction_parameters` and produce
-    /// matching dims for our standard 64x64 grid.
+    /// matching dims for our standard 64x64 grid. We sweep the supported
+    /// `mv_precision` values to make sure the §11.2.5 read-uint maps
+    /// back to the encoder-chosen precision.
     #[test]
     fn picture_prediction_parameters_roundtrips() {
         let seq = crate::encoder::make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
-        let mut w = BitWriter::new();
-        let params = InterEncoderParams::default();
-        write_picture_prediction_parameters(&mut w, &params);
-        w.byte_align();
-        let bytes = w.finish();
         let _ = parse_sequence_header; // re-export check.
+        for mv_precision in [0u32, 1, 2, 3] {
+            let mut w = BitWriter::new();
+            let params = InterEncoderParams {
+                mv_precision,
+                ..InterEncoderParams::default()
+            };
+            write_picture_prediction_parameters(&mut w, &params);
+            w.byte_align();
+            let bytes = w.finish();
 
-        let mut r = crate::bits::BitReader::new(&bytes);
-        let pred = parse_picture_prediction_parameters(&mut r, &seq, 1).expect("parse PPP");
-        assert_eq!(pred.luma_xblen, 8);
-        assert_eq!(pred.luma_yblen, 8);
-        assert_eq!(pred.luma_xbsep, 4);
-        assert_eq!(pred.luma_ybsep, 4);
-        assert_eq!(pred.mv_precision, 0);
-        assert!(!pred.using_global);
-        assert_eq!(pred.superblocks_x, 4);
-        assert_eq!(pred.superblocks_y, 4);
-        assert_eq!(pred.blocks_x, 16);
-        assert_eq!(pred.blocks_y, 16);
-        assert_eq!(pred.refs_wt_precision, 1);
-        assert_eq!(pred.ref1_wt, 1);
-        assert_eq!(pred.ref2_wt, 1);
+            let mut r = crate::bits::BitReader::new(&bytes);
+            let pred = parse_picture_prediction_parameters(&mut r, &seq, 1).expect("parse PPP");
+            assert_eq!(pred.luma_xblen, 8);
+            assert_eq!(pred.luma_yblen, 8);
+            assert_eq!(pred.luma_xbsep, 4);
+            assert_eq!(pred.luma_ybsep, 4);
+            assert_eq!(pred.mv_precision, mv_precision);
+            assert!(!pred.using_global);
+            assert_eq!(pred.superblocks_x, 4);
+            assert_eq!(pred.superblocks_y, 4);
+            assert_eq!(pred.blocks_x, 16);
+            assert_eq!(pred.blocks_y, 16);
+            assert_eq!(pred.refs_wt_precision, 1);
+            assert_eq!(pred.ref1_wt, 1);
+            assert_eq!(pred.ref2_wt, 1);
+        }
+    }
+
+    /// At `mv_precision == 0`, [`subpel_search_me`] must be identical
+    /// to [`full_search_me`].
+    #[test]
+    fn subpel_search_degenerates_to_integer_at_precision_0() {
+        let (y0, _, _, y1, _, _) = synthetic_translating_pair_64(4, 0);
+        let int_mvs = full_search_me(&y1, &y0, 64, 64, 16, 16, 16);
+        let sub_mvs = subpel_search_me(&y1, &y0, 64, 64, 16, 16, 16, 0);
+        assert_eq!(int_mvs.len(), sub_mvs.len());
+        for (a, b) in int_mvs.iter().zip(sub_mvs.iter()) {
+            assert_eq!((a.0, a.1), (b.0, b.1));
+        }
+    }
+
+    /// Quarter-pel ME on an integer translation should produce the
+    /// integer MV scaled by 4 (one quarter-pel unit per i32 step).
+    #[test]
+    fn subpel_search_qpel_matches_integer_scaled_for_integer_motion() {
+        let (y0, _, _, y1, _, _) = synthetic_translating_pair_64(4, 0);
+        let int_mvs = full_search_me(&y1, &y0, 64, 64, 16, 16, 16);
+        let sub_mvs = subpel_search_me(&y1, &y0, 64, 64, 16, 16, 16, 2);
+        for (i, (a, b)) in int_mvs.iter().zip(sub_mvs.iter()).enumerate() {
+            assert_eq!(
+                (b.0, b.1),
+                (a.0 * 4, a.1 * 4),
+                "block {i}: sub-pel MV {:?} not equal to integer MV {:?} × 4",
+                (b.0, b.1),
+                (a.0, a.1)
+            );
+        }
+    }
+
+    /// On the camera-pan fixture (vertical bars panned by 1 quarter-pel
+    /// unit) the sub-pel search should snap to a non-integer MV at
+    /// least somewhere inside the picture interior — proving the sub-pel
+    /// refinement is actually firing rather than no-op'ing on the
+    /// integer pass.
+    #[test]
+    fn subpel_search_finds_subpel_motion_on_pan_fixture() {
+        let (y0, _, _, y1, _, _) = synthetic_camera_pan_64(1, 0);
+        let mvs = subpel_search_me(&y1, &y0, 64, 64, 16, 16, 16, 2);
+        // At least one block should have an x-MV that's not a multiple
+        // of 4 — that's the signature of true sub-pel snapping.
+        let any_subpel = mvs.iter().any(|m| (m.0 % 4) != 0 || (m.1 % 4) != 0);
+        assert!(
+            any_subpel,
+            "sub-pel ME never produced a fractional MV on a 1/4-pel pan"
+        );
     }
 
     #[test]

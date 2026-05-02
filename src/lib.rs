@@ -65,12 +65,14 @@
 //! * **VC-2 LD intra** ([`encoder::encode_single_ld_intra_stream`]) —
 //!   ffmpeg-validated with the Round 9 `slice_y_length` width fix.
 //! * **Dirac core-syntax inter** ([`encoder_inter::encode_intra_then_inter_stream`])
-//!   — round 1: 1-ref non-reference inter (parse code `0x09`) over
-//!   integer-pel full-search ME, preset-1 8x8 blocks, no OBMC overlap
-//!   reduction, no residue. Self-roundtrip ≥30 dB Y PSNR on a
-//!   translating-square fixture; zero-motion is bit-exact. Driven by
-//!   the new [`arith::ArithEncoder`] (Annex B.2 mirror of
-//!   `ArithDecoder`).
+//!   — 1-ref non-reference inter (parse code `0x09`) over integer-pel
+//!   full-search SAD ME with per-level 8-neighbor sub-pel refinement
+//!   (configurable `mv_precision`; quarter-pel is the default), preset-1
+//!   8x8 blocks, no OBMC overlap reduction, no residue. Self-roundtrip
+//!   ≥30 dB Y PSNR on the integer-pel translating-square fixture and
+//!   ~52 dB Y PSNR on a sub-pel `synthetic_camera_pan_64` fixture
+//!   (#168); zero-motion is bit-exact. Driven by the
+//!   [`arith::ArithEncoder`] (Annex B.2 mirror of `ArithDecoder`).
 //! * **Dirac core-syntax intra** ([`encoder_intra_core::encode_single_core_intra_stream`]
 //!   and [`encoder_intra_core::encode_core_intra_then_inter_stream`])
 //!   — round 2: AC-coded intra reference picture (parse code `0x0C`),
@@ -82,9 +84,9 @@
 //!   intra Y PSNR ≈ 52 dB).
 //!
 //! Still unsupported (planned): v3 extended transform parameters
-//! (horizontal-only transforms); sub-pel ME, OBMC window weighting at
-//! the encoder, and 2-reference bi-prediction; wavelet residue under
-//! inter pictures (currently `ZERO_RESIDUAL = true` only).
+//! (horizontal-only transforms); OBMC window weighting at the encoder
+//! and 2-reference bi-prediction; wavelet residue under inter pictures
+//! (currently `ZERO_RESIDUAL = true` only).
 
 #![allow(clippy::needless_range_loop)]
 

@@ -11,8 +11,8 @@ use oxideav_core::CodecRegistry;
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
 use oxideav_dirac::encoder::{make_minimal_sequence, EncoderParams};
 use oxideav_dirac::encoder_inter::{
-    encode_intra_then_inter_stream, synthetic_translating_pair_64, InterEncoderParams,
-    InterInputPicture,
+    encode_intra_then_inter_stream, synthetic_camera_pan_64, synthetic_translating_pair_64,
+    InterEncoderParams, InterInputPicture,
 };
 use oxideav_dirac::video_format::ChromaFormat;
 use oxideav_dirac::wavelet::WaveletFilter;
@@ -150,6 +150,83 @@ fn intra_then_inter_translate_vertical_yields_high_psnr() {
     assert!(
         psnr_y > 30.0,
         "inter Y PSNR {psnr_y:.2} dB below 30 dB target on vertical motion"
+    );
+}
+
+/// **Sub-pel ME PSNR uplift** (#168). On a camera-pan fixture with
+/// 1/4-pel horizontal motion (vertical-bar pattern smoothly translated
+/// by 0.25 luma pels between frames), integer-pel ME bottoms out at the
+/// nearest integer MV and leaves substantial residue. Quarter-pel ME
+/// can lock onto the true motion and dramatically reduce that error.
+///
+/// We measure both modes back-to-back. Recording the integer-pel PSNR
+/// as a floor: if quarter-pel doesn't beat it by a clear margin, the
+/// sub-pel refinement isn't actually contributing.
+#[test]
+fn intra_then_inter_camera_pan_subpel_beats_integer() {
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let intra_params = EncoderParams::default_hq(WaveletFilter::LeGall5_3, 3);
+
+    // 1/4-pel horizontal pan: one quarter-pel unit in x, none in y.
+    let (y0, u0, v0, y1, u1, v1) = synthetic_camera_pan_64(1, 0);
+    let intra = InterInputPicture {
+        picture_number: 0,
+        y: &y0,
+        u: &u0,
+        v: &v0,
+    };
+    let inter = InterInputPicture {
+        picture_number: 1,
+        y: &y1,
+        u: &u1,
+        v: &v1,
+    };
+
+    let decode_psnr = |inter_params: &InterEncoderParams| -> f64 {
+        let stream =
+            encode_intra_then_inter_stream(&seq, &intra_params, inter_params, &intra, &inter);
+        let mut reg = CodecRegistry::new();
+        oxideav_dirac::register(&mut reg);
+        let cp = CodecParameters::video(CodecId::new("dirac"));
+        let mut dec = reg.make_decoder(&cp).expect("make decoder");
+        let packet = Packet::new(0, TimeBase::new(1, 25), stream);
+        dec.send_packet(&packet).expect("send_packet");
+        let _intra_frame = dec.receive_frame().expect("intra frame");
+        let inter_frame = match dec.receive_frame().expect("inter frame") {
+            Frame::Video(vf) => vf,
+            other => panic!("expected video, got {other:?}"),
+        };
+        psnr(&inter_frame.planes[0].data, &y1)
+    };
+
+    // Integer-pel ME baseline.
+    let int_params = InterEncoderParams {
+        mv_precision: 0,
+        ..InterEncoderParams::default()
+    };
+    let psnr_int = decode_psnr(&int_params);
+
+    // Quarter-pel ME — the new path.
+    let qpel_params = InterEncoderParams {
+        mv_precision: 2,
+        ..InterEncoderParams::default()
+    };
+    let psnr_qpel = decode_psnr(&qpel_params);
+
+    eprintln!(
+        "camera-pan 1/4 pel: integer-pel PSNR Y = {psnr_int:.2} dB, \
+         quarter-pel PSNR Y = {psnr_qpel:.2} dB"
+    );
+    // Quarter-pel must beat integer by at least 5 dB on a fixture with
+    // explicit sub-pel motion. Anything less means the sub-pel
+    // refinement isn't actually finding fractional MVs (or the OBMC
+    // path is throwing the gain away).
+    assert!(
+        psnr_qpel >= psnr_int + 5.0,
+        "quarter-pel ME PSNR {psnr_qpel:.2} dB did not beat \
+         integer-pel {psnr_int:.2} dB by ≥ 5 dB on the 1/4-pel pan \
+         fixture (#168 acceptance: sub-pel ME must measurably reduce \
+         residue on sub-pel motion)"
     );
 }
 
