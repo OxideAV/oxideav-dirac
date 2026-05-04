@@ -250,19 +250,38 @@ pub fn decode_picture_with_refs(
     Err(PictureError::CoreSyntaxNotImplemented)
 }
 
+/// Decode the profile (`HQ` / `LD`) implied by a low-delay picture
+/// parse code, or `None` for an unrecognised pattern.
+///
+/// Parse code layout (Dirac BBC spec §9.5.1 + VC-2 ST 2042-1
+/// Table 10.1):
+/// * bit 7 set + bit 3 set → low-delay picture (`ParseInfo::is_low_delay`)
+/// * bit 5 set → HQ profile (parse_code 0xE8 family)
+/// * bit 5 clear → LD profile (parse_code 0x88 or 0xC8 family)
+///
+/// `bit 6` distinguishes the two LD encodings (0x88 = legacy /
+/// VC-2 SD-Profile, 0xC8 = AC-coded variant), but both decode
+/// through the same Golomb-coded slice path here so we accept both.
+/// `bits 2-0` encode num_refs / reference flag and don't affect
+/// profile dispatch.
+pub(crate) fn low_delay_profile_for(parse_code: u8) -> Option<LowDelayProfile> {
+    if (parse_code & 0xF8) == 0xE8 {
+        Some(LowDelayProfile::HQ)
+    } else if (parse_code & 0xB8) == 0x88 {
+        Some(LowDelayProfile::LD)
+    } else {
+        None
+    }
+}
+
 /// Full low-delay picture decode (LD or HQ profile).
 fn decode_low_delay_picture(
     payload: &[u8],
     parse_info: ParseInfo,
     sequence: &SequenceHeader,
 ) -> Result<DecodedPicture, PictureError> {
-    let profile = if (parse_info.parse_code & 0xF8) == 0xE8 {
-        LowDelayProfile::HQ
-    } else if (parse_info.parse_code & 0xF8) == 0xC8 {
-        LowDelayProfile::LD
-    } else {
-        return Err(PictureError::CoreSyntaxNotImplemented);
-    };
+    let profile = low_delay_profile_for(parse_info.parse_code)
+        .ok_or(PictureError::CoreSyntaxNotImplemented)?;
     if parse_info.is_inter() {
         return Err(PictureError::InterNotImplemented);
     }
@@ -1106,6 +1125,47 @@ mod tests {
         assert_eq!((l, r, t, b), (0, 4, 0, 4));
         let (l, r, t, b) = slice_bounds(1, 1, 2, 2, 8, 8);
         assert_eq!((l, r, t, b), (4, 8, 4, 8));
+    }
+
+    /// LD parse codes: 0x88 (VC-2 SD-Profile / legacy), 0xC8 (AC-coded
+    /// variant), and their reference siblings 0x8C / 0xCC. Real ffmpeg
+    /// `vc2enc` output uses 0x88 — the in-tree `corpus_vc2_low_delay_*`
+    /// fixtures sliced from a vc2enc-produced stream were rejected as
+    /// "unsupported core-syntax parse code" until the `0x88` family
+    /// was admitted. HQ is parse 0xE8 and must NOT be misclassified as
+    /// LD; core-syntax parse 0x08 must remain unmatched here.
+    #[test]
+    fn low_delay_profile_recognises_88_and_c8_families() {
+        for code in [0x88u8, 0x89, 0x8C, 0x8D] {
+            assert_eq!(
+                low_delay_profile_for(code),
+                Some(LowDelayProfile::LD),
+                "0x{code:02X} should be LD"
+            );
+        }
+        for code in [0xC8u8, 0xC9, 0xCC, 0xCD] {
+            assert_eq!(
+                low_delay_profile_for(code),
+                Some(LowDelayProfile::LD),
+                "0x{code:02X} should be LD"
+            );
+        }
+        for code in [0xE8u8, 0xE9, 0xEC, 0xED] {
+            assert_eq!(
+                low_delay_profile_for(code),
+                Some(LowDelayProfile::HQ),
+                "0x{code:02X} should be HQ"
+            );
+        }
+        // Core-syntax (parse 0x08 / 0x0C / 0x0D / 0x0A) must NOT be
+        // dispatched through the low-delay decoder.
+        for code in [0x08u8, 0x0C, 0x0D, 0x0A, 0x09, 0x00, 0x10, 0x20, 0x30] {
+            assert_eq!(
+                low_delay_profile_for(code),
+                None,
+                "0x{code:02X} should not be LD/HQ"
+            );
+        }
     }
 
     #[test]

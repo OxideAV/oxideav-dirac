@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (parse code recognition)
+
+- VC-2 LD pictures with parse code `0x88` (and the rest of the
+  `0x88`-family: `0x89`, `0x8C`, `0x8D`) now decode through the
+  low-delay path. The decoder previously only recognised the `0xC8`
+  family and rejected the `0x88` family with "unsupported core-syntax
+  parse code" — but `0x88` is the parse code that real ffmpeg /
+  libschroedinger `vc2enc` emits for VC-2 SD-Profile (the in-tree
+  `corpus_vc2_low_delay_tiny_320x240` and `corpus_vc2_low_delay_3pics_320x240`
+  fixtures, sliced from a vc2enc stream, both use it). Both LD
+  variants share the Golomb-coded slice path so accepting both cost
+  one extra mask. Per Dirac BBC §9.5.1 + VC-2 ST 2042-1 Table 10.1,
+  `bit 6` distinguishes the two LD encodings (legacy vs AC-coded
+  variant) but is irrelevant to the decode path. Both fixtures now
+  report Y PSNR ≈ 49 dB instead of an unsupported-parse-code error.
+  HQ (`0xE8` family) and core-syntax (`0x08` family) classification
+  is unchanged. New `low_delay_profile_recognises_88_and_c8_families`
+  unit test pins the matrix.
+
 ### Changed
 
 - `tests/docs_corpus.rs` driver now drains every decoded `VideoFrame`
