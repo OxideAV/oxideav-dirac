@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Decoder no longer panics on 2-ref bipred (B-picture, parse `0x0a`)
+  bitstreams in debug builds. Three spec-modular i32/u32 sums in the
+  motion-data path — `block_dc` (§13.4 DC residual + spatial pred),
+  `block_vector` (§12.3.6 MV residual + median pred), and
+  `decode_sb_splits` (§12.3.4 split residual + neighbour pred), plus
+  the §15.8.2 OBMC accumulator in `obmc::block_mc` — used direct `+`
+  / `+=` and aborted in debug when a malformed/unsupported stream
+  produced a wrapped sum. They now use `wrapping_add` (matching the
+  `subband.rs::reconstruct_subband` precedent for §13.5.3 wavelet
+  prediction). The `corpus_i_p_b_320x240` ReportOnly fixture now
+  decodes end-to-end (intra ≈ 48.79 dB Y, ref-1 inter ≈ 19.68 dB Y,
+  bipred ≈ 7.25 dB Y — the bipred floor is the known
+  ffmpeg-OBMC-convention gap, not the panic).
+
 ### Added
 
 - Dirac inter encoder **OBMC-aware ME refinement** (#186, §15.8.6) —

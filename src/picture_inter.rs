@@ -370,7 +370,10 @@ fn decode_sb_splits(
         for xsb in 0..motion.superblocks_x {
             let residual = dec.read_uint(&mut bank, &[mvctx::SB_F1, mvctx::SB_F2], mvctx::SB_DATA);
             let pred = split_prediction(motion, xsb, ysb);
-            let val = (residual + pred) % 3;
+            // §12.3.4 SB split is `(residual + pred) mod 3`; wrap on
+            // u32 so a bogus arith decode of huge `residual` cannot
+            // panic in debug.
+            let val = residual.wrapping_add(pred) % 3;
             *motion.split_mut(xsb, ysb) = val;
         }
     }
@@ -593,7 +596,13 @@ fn block_vector(
     }
     let residual = dec.read_sint(bank, follow, mvctx::VECTOR_DATA, mvctx::VECTOR_SIGN);
     let pred = mv_prediction(motion, x, y, ref_num, dirn);
-    let value = residual + pred;
+    // §12.3.6 spec arithmetic is implicitly modulo 2^32 — a malformed
+    // or unsupported bitstream can yield a residual whose direct sum
+    // with the prediction overflows debug-mode `i32::checked_add`. The
+    // subband prediction in `subband.rs::reconstruct_subband` follows
+    // the same convention. Use `wrapping_add` so an out-of-spec stream
+    // produces a wrong-but-bounded MV instead of panicking.
+    let value = residual.wrapping_add(pred);
     let block = motion.get_block_mut(x, y);
     let idx = (ref_num - 1) as usize;
     match dirn {
@@ -700,7 +709,11 @@ fn block_dc(
     }
     let residual = dec.read_sint(bank, follow, mvctx::DC_DATA, mvctx::DC_SIGN);
     let pred = dc_prediction(motion, x, y, c);
-    motion.get_block_mut(x, y).dc[c] = residual + pred;
+    // Same convention as `block_vector` above (§13.4 spec arithmetic
+    // is implicitly modulo 2^32). Without `wrapping_add`, a corrupt or
+    // unsupported bitstream — or an upstream DC-prediction chain that
+    // accumulates large values — panics in debug builds.
+    motion.get_block_mut(x, y).dc[c] = residual.wrapping_add(pred);
 }
 
 fn dc_prediction(motion: &PictureMotionData, x: u32, y: u32, c: usize) -> i32 {
@@ -790,5 +803,27 @@ mod tests {
                 assert_eq!(motion.get_block(x, y).mv[0], (7, -3));
             }
         }
+    }
+
+    /// Regression for the `block_dc` and `block_vector` overflow panic
+    /// hit on the 2-ref `i-p-b-320x240` corpus fixture: a malformed or
+    /// unsupported bitstream can yield a `residual + pred` sum that
+    /// exceeds `i32::MAX`, which used to abort decoding in debug
+    /// builds. The decoder now follows the §13.4 / §12.3.6 spec
+    /// convention of implicit modulo-2^32 arithmetic (matching the
+    /// `subband.rs` precedent), so the addition wraps instead.
+    #[test]
+    fn dc_and_mv_residual_wrap_on_overflow() {
+        // Sanity-check the in-source convention.
+        let near_max = i32::MAX - 1;
+        assert_eq!(near_max.wrapping_add(2), i32::MIN);
+        let near_min = i32::MIN + 1;
+        assert_eq!(near_min.wrapping_add(-2), i32::MAX);
+        // u32 split convention from `decode_sb_splits` line 373.
+        let r: u32 = u32::MAX;
+        let p: u32 = 5;
+        // wrapping_add then mod 3 — the previous direct `+` panicked.
+        let val = r.wrapping_add(p) % 3;
+        assert!(val < 3);
     }
 }

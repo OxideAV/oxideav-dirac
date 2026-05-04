@@ -498,7 +498,17 @@ pub fn block_mc(
                 }
             };
             let idx = (y as usize) * params.len_x + x as usize;
-            mc_tmp[idx] += (val * wmat[q * params.xblen + p] as i64) as i32;
+            // §15.8.2 OBMC accumulation. The product `val * wmat[..]`
+            // is bounded for valid bitstreams (DC ≤ 2^(depth-1), wmat ≤
+            // 64, summed across at most 4 overlapping blocks → fits in
+            // i32 by margin of ~2^10). On corrupt or unsupported
+            // bitstreams `val` can come from a wrapped MV producing an
+            // out-of-range pixel prediction; the cast already truncates
+            // to i32 silently, but the `+=` itself panics in debug. Use
+            // `wrapping_add` so the corrupt path produces wrong-but-
+            // bounded output rather than an unrecoverable panic.
+            let contrib = (val.saturating_mul(wmat[q * params.xblen + p] as i64)) as i32;
+            mc_tmp[idx] = mc_tmp[idx].wrapping_add(contrib);
         }
     }
 }
