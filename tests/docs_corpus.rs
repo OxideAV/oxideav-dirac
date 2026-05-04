@@ -246,65 +246,24 @@ fn decode_fixture(case: &CorpusCase) -> Option<DecodeReport> {
     let y_size = case.width * case.height;
     let uv_size = cw * ch;
 
-    let mut visible_idx = 0usize;
-    let mut per_frame: Vec<Result<FrameDiff, String>> = Vec::with_capacity(case.n_frames);
+    // Drain every available `VideoFrame` first so we can sort them by
+    // pts (== picture_number when the packet has no explicit pts, which
+    // is the case here). The reference YUV is in **display order** —
+    // for fixtures with B-pictures (e.g. `i-p-b-320x240`) decode order
+    // differs from display order, and a naive in-order comparison
+    // would line up our P frame against the reference's B and vice
+    // versa, dragging both PSNRs down with off-content differences
+    // unrelated to the per-picture decode quality. Sorting by pts
+    // restores display order so the PSNR numbers measure what they
+    // claim to.
+    let mut decoded: Vec<oxideav_core::VideoFrame> = Vec::new();
     loop {
         match dec.receive_frame() {
-            Ok(Frame::Video(vf)) => {
-                if visible_idx >= case.n_frames {
-                    visible_idx += 1;
-                    continue;
-                }
-                let ref_off = visible_idx * frame_size;
-                let ref_y = &yuv_ref[ref_off..ref_off + y_size];
-                let ref_u = &yuv_ref[ref_off + y_size..ref_off + y_size + uv_size];
-                let ref_v = &yuv_ref[ref_off + y_size + uv_size..ref_off + frame_size];
-
-                if vf.planes.len() < 3 {
-                    per_frame.push(Err(format!(
-                        "visible {visible_idx}: decoder produced {} planes, expected 3",
-                        vf.planes.len()
-                    )));
-                    visible_idx += 1;
-                    continue;
-                }
-                let our_y = vf.planes[0].data.as_slice();
-                let our_u = vf.planes[1].data.as_slice();
-                let our_v = vf.planes[2].data.as_slice();
-                if our_y.len() != y_size || our_u.len() != uv_size || our_v.len() != uv_size {
-                    per_frame.push(Err(format!(
-                        "visible {visible_idx}: plane size mismatch \
-                         (Y {} U {} V {} expected {} {} {})",
-                        our_y.len(),
-                        our_u.len(),
-                        our_v.len(),
-                        y_size,
-                        uv_size,
-                        uv_size
-                    )));
-                    visible_idx += 1;
-                    continue;
-                }
-                let (yt, ye, ym, ys) = diff_plane(our_y, ref_y);
-                let (ut, ue, um, us) = diff_plane(our_u, ref_u);
-                let (vt, ve, vm, vs) = diff_plane(our_v, ref_v);
-                per_frame.push(Ok(FrameDiff {
-                    y_total: yt,
-                    y_exact: ye,
-                    y_max: ym,
-                    y_sse: ys,
-                    uv_total: ut + vt,
-                    uv_exact: ue + ve,
-                    uv_max: um.max(vm),
-                    uv_sse: us + vs,
-                }));
-                visible_idx += 1;
-            }
+            Ok(Frame::Video(vf)) => decoded.push(vf),
             Ok(_) => continue,
             Err(Error::NeedMore) | Err(Error::Eof) => break,
             Err(e) => {
-                let msg = format!("visible {visible_idx}: receive_frame: {e:?}");
-                per_frame.push(Err(msg.clone()));
+                let msg = format!("after {} frames: receive_frame: {e:?}", decoded.len());
                 if fatal.is_none() {
                     fatal = Some(msg);
                 }
@@ -312,6 +271,57 @@ fn decode_fixture(case: &CorpusCase) -> Option<DecodeReport> {
             }
         }
     }
+    decoded.sort_by_key(|f| f.pts.unwrap_or(0));
+    let visible_idx_total = decoded.len();
+
+    let mut per_frame: Vec<Result<FrameDiff, String>> = Vec::with_capacity(case.n_frames);
+    for (visible_idx, vf) in decoded.into_iter().enumerate() {
+        if visible_idx >= case.n_frames {
+            continue;
+        }
+        let ref_off = visible_idx * frame_size;
+        let ref_y = &yuv_ref[ref_off..ref_off + y_size];
+        let ref_u = &yuv_ref[ref_off + y_size..ref_off + y_size + uv_size];
+        let ref_v = &yuv_ref[ref_off + y_size + uv_size..ref_off + frame_size];
+
+        if vf.planes.len() < 3 {
+            per_frame.push(Err(format!(
+                "visible {visible_idx}: decoder produced {} planes, expected 3",
+                vf.planes.len()
+            )));
+            continue;
+        }
+        let our_y = vf.planes[0].data.as_slice();
+        let our_u = vf.planes[1].data.as_slice();
+        let our_v = vf.planes[2].data.as_slice();
+        if our_y.len() != y_size || our_u.len() != uv_size || our_v.len() != uv_size {
+            per_frame.push(Err(format!(
+                "visible {visible_idx}: plane size mismatch \
+                 (Y {} U {} V {} expected {} {} {})",
+                our_y.len(),
+                our_u.len(),
+                our_v.len(),
+                y_size,
+                uv_size,
+                uv_size
+            )));
+            continue;
+        }
+        let (yt, ye, ym, ys) = diff_plane(our_y, ref_y);
+        let (ut, ue, um, us) = diff_plane(our_u, ref_u);
+        let (vt, ve, vm, vs) = diff_plane(our_v, ref_v);
+        per_frame.push(Ok(FrameDiff {
+            y_total: yt,
+            y_exact: ye,
+            y_max: ym,
+            y_sse: ys,
+            uv_total: ut + vt,
+            uv_exact: ue + ve,
+            uv_max: um.max(vm),
+            uv_sse: us + vs,
+        }));
+    }
+    let visible_idx = visible_idx_total;
 
     Some(DecodeReport {
         per_frame,
@@ -455,9 +465,13 @@ fn corpus_i_then_p_320x240() {
 /// Intra + 1-ref inter + bidirectional inter (parse 0x0a, num_refs=2).
 /// The 0x0a picture is in stream-order position 2 but reorders for
 /// display — ffmpeg outputs three frames in display order in the
-/// reference YUV. Our decoder currently produces frames in decode
-/// order; under ReportOnly this surfaces as a per-frame mismatch,
-/// recorded but not asserted.
+/// reference YUV. Our decoder produces frames in decode order; the
+/// `decode_fixture` driver sorts them by `pts` (== `picture_number`
+/// when packets carry no explicit pts) before per-frame comparison
+/// so the PSNR numbers measure each picture against its true display
+/// counterpart. With this in place: I (frame 0) ≈ 48.79 dB Y, B
+/// (frame 1) ≈ 7.31 dB Y (the bipred OBMC convention gap), P (frame
+/// 2) ≈ 47.96 dB Y.
 /// Trace: docs/video/dirac/fixtures/i-p-b-320x240/trace.txt.gz
 #[test]
 fn corpus_i_p_b_320x240() {

@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `tests/docs_corpus.rs` driver now drains every decoded `VideoFrame`
+  first and sorts by `pts` (== `picture_number` when the packet has
+  no explicit pts, which is the case throughout the corpus) before
+  per-frame comparison against `expected.yuv`. The reference YUVs are
+  in display order; the previous in-order draw paired our P frame
+  against the reference's B and vice versa for `corpus_i_p_b_320x240`,
+  reporting Y PSNR 19.68 dB (P-vs-B) and 7.25 dB (B-vs-P) — both off
+  by content, neither measuring true per-picture quality. The sorted
+  comparison reports the actual numbers: I 48.79 dB Y, B 7.31 dB Y
+  (the bipred OBMC convention gap), P 47.96 dB Y. Aggregate Y goes
+  from 11.78 → 12.08 dB; the move is small because the I dominates
+  but the per-frame numbers are now meaningful.
+
 ### Fixed
 
 - Decoder no longer panics on 2-ref bipred (B-picture, parse `0x0a`)
