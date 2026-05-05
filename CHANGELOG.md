@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.4](https://github.com/OxideAV/oxideav-dirac/compare/v0.0.3...v0.0.4) - 2026-05-05
+
+### Other
+
+- encoder-side §11.3 wavelet residue (~+15 dB ffmpeg cross-decode)
+- accept VC-2 LD parse code 0x88 (SD-Profile variant)
+- docs_corpus driver compares frames in display order
+- panic-safe i32/u32 sums in inter motion-data + OBMC paths
+- integrate docs/video/dirac fixture corpus
+- replace never-match regex with semver_check = false
+- migrate to centralized OxideAV/.github reusable workflows
+- inter encoder OBMC-aware ME refinement ([#186](https://github.com/OxideAV/oxideav-dirac/pull/186))
+- inter encoder sub-pel ME ([#168](https://github.com/OxideAV/oxideav-dirac/pull/168))
+- hard-assert ffmpeg I+P interop on homogeneous core-syntax chain
+- core-syntax intra encoder (round 2) — 0x0C AC ref
+- inter encoder (round 1) — 1-ref OBMC + arith encoder
+- adopt slim VideoFrame/AudioFrame shape
+- encoder/decoder quality matrix — 13 new regression tests
+- pin release-plz to patch-only bumps
+
 ### Added
 
 - Dirac inter encoder **wavelet residue** (§11.3 / §13.4) — the
