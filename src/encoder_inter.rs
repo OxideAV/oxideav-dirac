@@ -32,10 +32,16 @@
 use crate::arith::{ArithEncoder, ContextBank};
 use crate::bitwriter::BitWriter;
 use crate::encoder::write_parse_info;
-use crate::obmc::{interp2by2, spatial_wt, subpel_predict};
-use crate::picture_inter::{mvctx, BlockData, RefPredMode};
+use crate::obmc::{interp2by2, spatial_wt, subpel_predict, McParams};
+use crate::picture_core::ctx;
+use crate::picture_inter::{
+    mvctx, BlockData, PictureMotionData, PicturePredictionParams, RefPredMode,
+};
+use crate::quant::quant_factor;
 use crate::sequence::SequenceHeader;
+use crate::subband::{padded_component_dims, Orient, SubbandData};
 use crate::video_format::ChromaFormat;
+use crate::wavelet::{dwt, WaveletFilter};
 
 /// Encoder-side inter parameters.
 #[derive(Debug, Clone)]
@@ -65,6 +71,57 @@ pub struct InterEncoderParams {
     /// refinement and reverts to the pre-#186 hard-block SAD output
     /// (useful as the no-OBMC baseline in regression tests).
     pub obmc_refine_passes: u32,
+    /// **Wavelet residue** (§11.3 / §13.4).
+    ///
+    /// When `Some(residue)`, the encoder emits the §11.3 ZERO_RESIDUAL
+    /// flag as `false`, computes `source - decoder_OBMC_reconstruction`
+    /// in the spec's signed pre-output-offset domain, forward-transforms
+    /// the difference (single-codeblock per subband, no per-codeblock
+    /// quant offset, AC-coded), and emits the per-component subband
+    /// blocks. The decoder adds this back to its OBMC reconstruction at
+    /// §15.8.2 — closing the prediction-error loop.
+    ///
+    /// `None` (or `enable_residue = false`) keeps the round-1 behaviour:
+    /// `ZERO_RESIDUAL = true`, no transform parameters, no coefficient
+    /// stream. PSNR is then determined entirely by ME quality.
+    ///
+    /// Residue encoding lifts the inter-encoder's quality ceiling
+    /// dramatically on real-world content (where ME alone leaves
+    /// edge-clamp / OBMC-blend residuals across block boundaries).
+    pub residue: Option<ResidueParams>,
+}
+
+/// Wavelet residue encoder parameters. Mirrors
+/// [`crate::encoder_intra_core::CoreIntraEncoderParams`] but for the
+/// inter-residue path: same `WaveletFilter` and `dwt_depth` knobs, plus
+/// a single per-picture `qindex` (no Annex E.1 weighting).
+#[derive(Debug, Clone)]
+pub struct ResidueParams {
+    /// DWT filter for the residue. LeGall 5/3 is bit-reversible at
+    /// `qindex = 0` so the encode + AC + IDWT round-trip is exact when
+    /// the residue values fit in the dynamic range of the filter.
+    pub wavelet: WaveletFilter,
+    /// Number of DWT levels. Same constraint as the intra path:
+    /// component sizes must accommodate `2^dwt_depth` rounding
+    /// (handled by [`crate::subband::padded_component_dims`]).
+    pub dwt_depth: u32,
+    /// Per-subband quantisation index (`0..=127`). `0` is near-lossless
+    /// for small coefficients; the encoder + decoder use the same
+    /// dead-zone forward / inverse pair as the intra path.
+    pub qindex: u32,
+}
+
+impl ResidueParams {
+    /// Default residue parameters: LeGall 5/3 at depth 3 with
+    /// `qindex = 0` (near-lossless on small residues, matches the
+    /// intra encoder's default).
+    pub fn default_for(wavelet: WaveletFilter, dwt_depth: u32) -> Self {
+        Self {
+            wavelet,
+            dwt_depth,
+            qindex: 0,
+        }
+    }
 }
 
 impl Default for InterEncoderParams {
@@ -76,11 +133,16 @@ impl Default for InterEncoderParams {
         // Two OBMC refinement passes — empirically converges on the
         // small fixtures and lifts ffmpeg cross-decode by ≥ 5 dB on
         // the camera-pan fixture (#186 acceptance).
+        // Wavelet residue on by default: LeGall 5/3 / depth 3 /
+        // qindex=0. Set `residue = None` to revert to the round-1
+        // ZERO_RESIDUAL=true path (used by the no-residue regression
+        // tests).
         Self {
             block_params_index: 1,
             mv_search_range: 16,
             mv_precision: 2,
             obmc_refine_passes: 2,
+            residue: Some(ResidueParams::default_for(WaveletFilter::LeGall5_3, 3)),
         }
     }
 }
@@ -1153,6 +1215,466 @@ fn encode_dc_values(
     enc.finish()
 }
 
+// ---- §11.3 wavelet residue emit ---------------------------------------
+
+/// Build the OBMC reference reconstruction the decoder will compute for
+/// one component, given the current MV grid. Returns the §15.8.5
+/// per-pixel `(Σ_k wₖ pₖ + 32) >> 6` value clipped to
+/// `[-2^(depth-1), 2^(depth-1) - 1]` — the **signed pre-output-offset**
+/// reference, which is also the domain in which the residue lives.
+///
+/// This is essentially [`crate::obmc::motion_compensate`] called with
+/// `pic = 0` everywhere — but written out so the encoder can reuse the
+/// same reference plane for later residue subtraction without doubling
+/// the work or rebuilding `mc_tmp` per pixel.
+#[allow(clippy::too_many_arguments)]
+fn build_obmc_prediction(
+    sequence: &SequenceHeader,
+    pred: &PicturePredictionParams,
+    motion: &PictureMotionData,
+    is_chroma: bool,
+    ref_y: &[u8],
+    ref_u: &[u8],
+    ref_v: &[u8],
+) -> (Vec<i32>, Vec<i32>, Vec<i32>) {
+    let chroma_h_ratio = sequence.video_params.chroma_format.h_ratio();
+    let chroma_v_ratio = sequence.video_params.chroma_format.v_ratio();
+    let _ = is_chroma;
+    let pred_y = build_obmc_prediction_one(
+        sequence,
+        pred,
+        motion,
+        false,
+        chroma_h_ratio,
+        chroma_v_ratio,
+        ref_y,
+        sequence.luma_width as usize,
+        sequence.luma_height as usize,
+    );
+    let pred_u = build_obmc_prediction_one(
+        sequence,
+        pred,
+        motion,
+        true,
+        chroma_h_ratio,
+        chroma_v_ratio,
+        ref_u,
+        sequence.chroma_width as usize,
+        sequence.chroma_height as usize,
+    );
+    let pred_v = build_obmc_prediction_one(
+        sequence,
+        pred,
+        motion,
+        true,
+        chroma_h_ratio,
+        chroma_v_ratio,
+        ref_v,
+        sequence.chroma_width as usize,
+        sequence.chroma_height as usize,
+    );
+    (pred_y, pred_u, pred_v)
+}
+
+/// Reconstruct one component's OBMC prediction by calling the same
+/// [`crate::obmc::motion_compensate`] entry the decoder uses, with a
+/// zero-residue input plane. The returned plane is the post-clip,
+/// signed pre-output-offset reconstruction — exactly the shape the
+/// decoder will emit before §15.10's output offset pass.
+#[allow(clippy::too_many_arguments)]
+fn build_obmc_prediction_one(
+    sequence: &SequenceHeader,
+    pred: &PicturePredictionParams,
+    motion: &PictureMotionData,
+    is_chroma: bool,
+    chroma_h_ratio: u32,
+    chroma_v_ratio: u32,
+    ref_plane: &[u8],
+    comp_w: usize,
+    comp_h: usize,
+) -> Vec<i32> {
+    let depth = if is_chroma {
+        sequence.chroma_depth
+    } else {
+        sequence.luma_depth
+    };
+    let half = 1i32 << (depth - 1);
+    // Reference plane in the spec's signed pre-offset convention.
+    let ref_signed: Vec<i32> = ref_plane.iter().map(|&v| v as i32 - half).collect();
+    let (xblen, yblen, xbsep, ybsep) = if is_chroma {
+        (
+            (pred.luma_xblen / chroma_h_ratio) as usize,
+            (pred.luma_yblen / chroma_v_ratio) as usize,
+            (pred.luma_xbsep / chroma_h_ratio) as usize,
+            (pred.luma_ybsep / chroma_v_ratio) as usize,
+        )
+    } else {
+        (
+            pred.luma_xblen as usize,
+            pred.luma_yblen as usize,
+            pred.luma_xbsep as usize,
+            pred.luma_ybsep as usize,
+        )
+    };
+    let mc_params = McParams {
+        len_x: comp_w,
+        len_y: comp_h,
+        xblen,
+        yblen,
+        xbsep,
+        ybsep,
+        blocks_x: pred.blocks_x,
+        blocks_y: pred.blocks_y,
+        mv_precision: pred.mv_precision,
+        is_chroma,
+        chroma_h_ratio,
+        chroma_v_ratio,
+        refs_wt_precision: pred.refs_wt_precision,
+        ref1_wt: pred.ref1_wt,
+        ref2_wt: pred.ref2_wt,
+        luma_depth: sequence.luma_depth,
+        chroma_depth: sequence.chroma_depth,
+    };
+    let mut pic = vec![0i32; comp_w * comp_h];
+    crate::obmc::motion_compensate(
+        &mut pic,
+        &mc_params,
+        motion,
+        Some((&ref_signed, comp_w, comp_h)),
+        None,
+    );
+    pic
+}
+
+/// Build the §11.2.1-shaped `PicturePredictionParams` the residue path
+/// needs to drive the OBMC reconstruction. Mirrors
+/// [`write_picture_prediction_parameters`] symbol-for-symbol — what the
+/// decoder will read back from those bytes.
+fn picture_prediction_params_from(
+    sequence: &SequenceHeader,
+    iep: &InterEncoderParams,
+) -> PicturePredictionParams {
+    let (sbx, sby, blocks_x, blocks_y) = motion_grid(sequence.luma_width, sequence.luma_height);
+    let (xblen, yblen, xbsep, ybsep) = PRESET1;
+    PicturePredictionParams {
+        luma_xblen: xblen,
+        luma_yblen: yblen,
+        luma_xbsep: xbsep,
+        luma_ybsep: ybsep,
+        mv_precision: iep.mv_precision,
+        using_global: false,
+        prediction_mode: 0,
+        superblocks_x: sbx,
+        superblocks_y: sby,
+        blocks_x,
+        blocks_y,
+        refs_wt_precision: 1,
+        ref1_wt: 1,
+        ref2_wt: 1,
+        global1: None,
+        global2: None,
+    }
+}
+
+/// Build the same `PictureMotionData` the decoder will reconstruct from
+/// the `block_motion_data` block this encoder emits — every block is
+/// `Ref1Only` with the chosen MV, all superblocks at split=2.
+fn build_motion_from_mv_grid(
+    sbx: u32,
+    sby: u32,
+    blocks_x: u32,
+    blocks_y: u32,
+    mvs: &[IntegerMv],
+) -> PictureMotionData {
+    let blocks: Vec<BlockData> = (0..blocks_x * blocks_y)
+        .map(|i| BlockData {
+            rmode: RefPredMode::Ref1Only,
+            gmode: false,
+            mv: [(mvs[i as usize].0, mvs[i as usize].1), (0, 0)],
+            dc: [0; 3],
+        })
+        .collect();
+    PictureMotionData {
+        blocks_x,
+        blocks_y,
+        superblocks_x: sbx,
+        superblocks_y: sby,
+        sb_split: vec![2u32; (sbx * sby) as usize],
+        blocks,
+        global1: None,
+        global2: None,
+    }
+}
+
+/// Subtract the OBMC prediction from the source picture in the spec's
+/// **signed pre-output-offset** domain — i.e.
+/// `residue[x] = (source_u8[x] - half) - prediction_signed[x]`.
+/// The result is a signed plane the wavelet residue encoder forward-
+/// transforms as if it were a tiny intra picture.
+fn build_residue_plane(source_u8: &[u8], prediction_signed: &[i32], depth: u32) -> Vec<i32> {
+    debug_assert_eq!(source_u8.len(), prediction_signed.len());
+    let half = 1i32 << (depth - 1);
+    source_u8
+        .iter()
+        .zip(prediction_signed.iter())
+        .map(|(&s, &p)| (s as i32 - half) - p)
+        .collect()
+}
+
+/// Forward-DWT then dead-zone quantise one residue plane. Mirrors
+/// [`crate::encoder_intra_core::forward_and_quantise`] but operates on
+/// a pre-signed `i32` source (no `- half` step — the residue is already
+/// in the signed pre-offset domain).
+fn forward_and_quantise_residue(
+    residue: &[i32],
+    comp_w: u32,
+    comp_h: u32,
+    rp: &ResidueParams,
+) -> Vec<[SubbandData; 4]> {
+    let (pw, ph) = padded_component_dims(comp_w, comp_h, rp.dwt_depth);
+    let mut pic = SubbandData::new(pw, ph);
+    let comp_w_u = comp_w as usize;
+    let comp_h_u = comp_h as usize;
+    for y in 0..ph {
+        for x in 0..pw {
+            let src_x = x.min(comp_w_u - 1);
+            let src_y = y.min(comp_h_u - 1);
+            pic.set(y, x, residue[src_y * comp_w_u + src_x]);
+        }
+    }
+    let py = dwt(&pic, rp.wavelet, rp.dwt_depth);
+    let mut out: Vec<[SubbandData; 4]> = Vec::with_capacity(py.len());
+    for bands in py.iter() {
+        let mut level_out: [SubbandData; 4] = [
+            SubbandData::new(bands[0].width, bands[0].height),
+            SubbandData::new(bands[1].width, bands[1].height),
+            SubbandData::new(bands[2].width, bands[2].height),
+            SubbandData::new(bands[3].width, bands[3].height),
+        ];
+        for orient_idx in 0..4 {
+            let src = &bands[orient_idx];
+            if src.width == 0 || src.height == 0 {
+                continue;
+            }
+            let dst = &mut level_out[orient_idx];
+            for y in 0..src.height {
+                for x in 0..src.width {
+                    let v = src.get(y, x);
+                    dst.set(y, x, residue_quantise_coeff(v, rp.qindex));
+                }
+            }
+        }
+        out.push(level_out);
+    }
+    out
+}
+
+/// Dead-zone forward quantisation — same formula as the intra encoder.
+fn residue_quantise_coeff(x: i32, q: u32) -> i32 {
+    if x == 0 {
+        return 0;
+    }
+    let qf = quant_factor(q) as i64;
+    let mag = (x.unsigned_abs() as i64 * 4) / qf;
+    if x < 0 {
+        -(mag as i32)
+    } else {
+        mag as i32
+    }
+}
+
+/// Emit `transform_parameters` for the residue path. Mirrors
+/// [`crate::encoder_intra_core::write_core_transform_parameters`] —
+/// the inter decoder's residue path uses the same syntax (no
+/// `is_intra` distinction at the parameter level).
+fn write_residue_transform_parameters(w: &mut BitWriter, rp: &ResidueParams) {
+    w.write_uint(wavelet_index(rp.wavelet));
+    w.write_uint(rp.dwt_depth);
+    // §11.3.3 codeblock_parameters: spatial_partition_flag = 0 →
+    // single codeblock per subband at every level.
+    w.write_bool(false);
+}
+
+fn wavelet_index(filter: WaveletFilter) -> u32 {
+    match filter {
+        WaveletFilter::DeslauriersDubuc9_7 => 0,
+        WaveletFilter::LeGall5_3 => 1,
+        WaveletFilter::DeslauriersDubuc13_7 => 2,
+        WaveletFilter::Haar0 => 3,
+        WaveletFilter::Haar1 => 4,
+        WaveletFilter::Fidelity => 5,
+        WaveletFilter::Daubechies9_7 => 6,
+    }
+}
+
+/// Emit one component's quantised residue pyramid as a sequence of
+/// length-prefixed AC-coded subband blocks. Mirrors
+/// [`crate::encoder_intra_core::write_component_subbands`] — the
+/// decoder treats inter and intra subband bytes identically apart
+/// from the LL DC-prediction step (which is gated on `is_intra` and
+/// therefore skipped here).
+fn write_residue_component_subbands(
+    w: &mut BitWriter,
+    rp: &ResidueParams,
+    qpy: &[[SubbandData; 4]],
+) {
+    write_residue_subband_block(w, rp, qpy, 0, Orient::LL);
+    for level in 1..=rp.dwt_depth {
+        for orient in [Orient::HL, Orient::LH, Orient::HH] {
+            write_residue_subband_block(w, rp, qpy, level, orient);
+        }
+    }
+}
+
+/// Emit a single subband block: byte-align, length, qindex,
+/// byte-align, AC bytes. Empty bands (after IDWT padding) emit
+/// `length = 0` only.
+fn write_residue_subband_block(
+    w: &mut BitWriter,
+    rp: &ResidueParams,
+    qpy: &[[SubbandData; 4]],
+    level: u32,
+    orient: Orient,
+) {
+    w.byte_align();
+    let band = &qpy[level as usize][orient.as_index()];
+    if band.width == 0 || band.height == 0 {
+        w.write_uint(0);
+        w.byte_align();
+        return;
+    }
+    let bytes = encode_residue_subband_ac(qpy, level, orient);
+    if bytes.is_empty() {
+        w.write_uint(0);
+        w.byte_align();
+        return;
+    }
+    w.write_uint(bytes.len() as u32);
+    w.write_uint(rp.qindex);
+    w.byte_align();
+    w.write_bytes(&bytes);
+}
+
+/// Encode one residue subband under the §13.4.4 AC contexts — same
+/// raster walk and same `parent_zero / nhood_zero / sign_predict`
+/// helpers as the intra path.
+fn encode_residue_subband_ac(pyramid: &[[SubbandData; 4]], level: u32, orient: Orient) -> Vec<u8> {
+    let mut bank = ContextBank::new(ctx::NUM_CONTEXTS);
+    let mut enc = ArithEncoder::new();
+    let level_idx = level as usize;
+    let orient_idx = orient.as_index();
+    let band_w = pyramid[level_idx][orient_idx].width;
+    let band_h = pyramid[level_idx][orient_idx].height;
+    let band = &pyramid[level_idx][orient_idx];
+    let parent: Option<&SubbandData> = if level >= 2 {
+        Some(&pyramid[level_idx - 1][orient_idx])
+    } else {
+        None
+    };
+    for y in 0..band_h {
+        for x in 0..band_w {
+            let parent_zero = match parent {
+                Some(p) => p.get(y / 2, x / 2) == 0,
+                None => true,
+            };
+            let nhood_zero = residue_zero_nhood(band, x, y);
+            let sign_pred = residue_sign_predict(band, orient, x, y);
+            let (follow, data_ctx, sign_ctx) =
+                residue_select_coeff_ctxs(parent_zero, nhood_zero, sign_pred);
+            let qc = band.get(y, x);
+            enc.write_sint(&mut bank, follow, data_ctx, sign_ctx, qc);
+        }
+    }
+    enc.finish()
+}
+
+// Local mirrors of `picture_core::{zero_nhood, sign_predict,
+// select_coeff_ctxs}` — same logic, kept here so the inter encoder
+// doesn't have to depend on private helpers in another module. They
+// match the spec's pseudo-code directly.
+fn residue_zero_nhood(band: &SubbandData, x: usize, y: usize) -> bool {
+    if y > 0 && x > 0 {
+        band.get(y - 1, x - 1) == 0 && band.get(y, x - 1) == 0 && band.get(y - 1, x) == 0
+    } else if y > 0 && x == 0 {
+        band.get(y - 1, 0) == 0
+    } else if y == 0 && x > 0 {
+        band.get(0, x - 1) == 0
+    } else {
+        true
+    }
+}
+
+fn residue_sign_predict(band: &SubbandData, orient: Orient, x: usize, y: usize) -> i32 {
+    match orient {
+        Orient::HL if y > 0 => residue_signum(band.get(y - 1, x)),
+        Orient::LH if x > 0 => residue_signum(band.get(y, x - 1)),
+        _ => 0,
+    }
+}
+
+fn residue_signum(v: i32) -> i32 {
+    if v > 0 {
+        1
+    } else if v < 0 {
+        -1
+    } else {
+        0
+    }
+}
+
+fn residue_select_coeff_ctxs(
+    parent_zero: bool,
+    nhood_zero: bool,
+    sign_pred: i32,
+) -> (&'static [usize], usize, usize) {
+    static ZP_ZN: [usize; 6] = [
+        ctx::ZPZN_F1,
+        ctx::ZP_F2,
+        ctx::ZP_F3,
+        ctx::ZP_F4,
+        ctx::ZP_F5,
+        ctx::ZP_F6_PLUS,
+    ];
+    static ZP_NN: [usize; 6] = [
+        ctx::ZPNN_F1,
+        ctx::ZP_F2,
+        ctx::ZP_F3,
+        ctx::ZP_F4,
+        ctx::ZP_F5,
+        ctx::ZP_F6_PLUS,
+    ];
+    static NP_ZN: [usize; 6] = [
+        ctx::NPZN_F1,
+        ctx::NP_F2,
+        ctx::NP_F3,
+        ctx::NP_F4,
+        ctx::NP_F5,
+        ctx::NP_F6_PLUS,
+    ];
+    static NP_NN: [usize; 6] = [
+        ctx::NPNN_F1,
+        ctx::NP_F2,
+        ctx::NP_F3,
+        ctx::NP_F4,
+        ctx::NP_F5,
+        ctx::NP_F6_PLUS,
+    ];
+    let follow: &'static [usize] = match (parent_zero, nhood_zero) {
+        (true, true) => &ZP_ZN,
+        (true, false) => &ZP_NN,
+        (false, true) => &NP_ZN,
+        (false, false) => &NP_NN,
+    };
+    let sign_ctx = if sign_pred == 0 {
+        ctx::SIGN_ZERO
+    } else if sign_pred < 0 {
+        ctx::SIGN_NEG
+    } else {
+        ctx::SIGN_POS
+    };
+    (follow, ctx::COEFF_DATA, sign_ctx)
+}
+
 // ---- Picture-level inter emission ------------------------------------
 
 /// Encode one core-syntax 1-ref inter picture, parse code `0x09`. The
@@ -1176,7 +1698,6 @@ pub fn encode_inter_picture(
     ref_v: &[u8],
 ) -> Vec<u8> {
     assert_eq!(params.block_params_index, 1, "r1 only supports preset 1");
-    let _ = (cur_u, cur_v, ref_u, ref_v); // reserved for future chroma ME
 
     let mut w = BitWriter::new();
 
@@ -1226,11 +1747,57 @@ pub fn encode_inter_picture(
     encode_block_motion_data(&mut w, sbx, sby, blocks_x, blocks_y, &mvs);
     w.byte_align();
 
-    // §11.3 wavelet_transform — emit zero_residual = true so we skip
-    // the entire transform_parameters / coefficient stream. The
-    // decoder will treat the residue as zero everywhere.
-    w.write_bool(true);
-    w.byte_align();
+    // §11.3 wavelet_transform.
+    if let Some(ref residue) = params.residue {
+        // ZERO_RESIDUAL = false → emit transform parameters + per-
+        // component subbands. Build the same `PictureMotionData` the
+        // decoder will reconstruct from the bytes we just wrote so the
+        // OBMC prediction matches symbol-for-symbol.
+        let pred = picture_prediction_params_from(sequence, params);
+        let motion = build_motion_from_mv_grid(sbx, sby, blocks_x, blocks_y, &mvs);
+        let (pred_y, pred_u, pred_v) =
+            build_obmc_prediction(sequence, &pred, &motion, false, ref_y, ref_u, ref_v);
+        let res_y = build_residue_plane(cur_y, &pred_y, sequence.luma_depth);
+        let res_u = build_residue_plane(cur_u, &pred_u, sequence.chroma_depth);
+        let res_v = build_residue_plane(cur_v, &pred_v, sequence.chroma_depth);
+
+        // §11.3 ZERO_RESIDUAL bool. Per spec, transform_parameters
+        // immediately follows in the same byte (no align), and only
+        // *after* transform_parameters does the decoder byte-align before
+        // pulling per-component subband bytes.
+        w.write_bool(false);
+        write_residue_transform_parameters(&mut w, residue);
+        w.byte_align();
+
+        let qpy_y = forward_and_quantise_residue(
+            &res_y,
+            sequence.luma_width,
+            sequence.luma_height,
+            residue,
+        );
+        let qpy_u = forward_and_quantise_residue(
+            &res_u,
+            sequence.chroma_width,
+            sequence.chroma_height,
+            residue,
+        );
+        let qpy_v = forward_and_quantise_residue(
+            &res_v,
+            sequence.chroma_width,
+            sequence.chroma_height,
+            residue,
+        );
+        write_residue_component_subbands(&mut w, residue, &qpy_y);
+        write_residue_component_subbands(&mut w, residue, &qpy_u);
+        write_residue_component_subbands(&mut w, residue, &qpy_v);
+        w.byte_align();
+    } else {
+        // ZERO_RESIDUAL = true so we skip the entire transform_parameters
+        // / coefficient stream. The decoder treats the residue as zero
+        // everywhere and reconstruction = OBMC(reference).
+        w.write_bool(true);
+        w.byte_align();
+    }
 
     w.finish()
 }
@@ -1658,5 +2225,72 @@ mod tests {
             "OBMC refinement should converge ≥ 4 blocks' MVs on the (+2, -1) translation \
              fixture — got {changes} changes (refinement is not engaging the OBMC blend)"
         );
+    }
+
+    /// Residue dead-zone forward + decoder inverse_quant must round-trip
+    /// at qindex = 0 (the lossless mode the encoder uses by default).
+    /// This is the §13.2 / §13.3 invariant the residue path relies on.
+    #[test]
+    fn residue_quantise_q0_roundtrip() {
+        for &x in &[-200i32, -33, -1, 0, 1, 5, 42, 199] {
+            let q = residue_quantise_coeff(x, 0);
+            assert_eq!(q, x, "qindex=0 dead-zone forward should be identity");
+            assert_eq!(
+                crate::quant::inverse_quant(q, 0),
+                x,
+                "qindex=0 forward+inverse should round-trip",
+            );
+        }
+    }
+
+    /// `build_residue_plane` must reproduce
+    /// `(source - 128) - prediction_signed` element-wise. This is the
+    /// invariant that links the encoder's residue-domain math to the
+    /// decoder's signed pre-output-offset reconstruction.
+    #[test]
+    fn build_residue_plane_subtracts_signed_prediction() {
+        let src: Vec<u8> = vec![128, 200, 50, 10, 255, 0];
+        let pred: Vec<i32> = vec![0, 50, -50, -100, 100, -128];
+        let res = build_residue_plane(&src, &pred, 8);
+        // (128-128)-0=0; (200-128)-50=22; (50-128)-(-50)=-28;
+        // (10-128)-(-100)=-18; (255-128)-100=27; (0-128)-(-128)=0.
+        assert_eq!(res, vec![0, 22, -28, -18, 27, 0]);
+    }
+
+    /// The `picture_prediction_params_from` helper must produce the
+    /// same `PicturePredictionParams` shape the decoder reconstructs
+    /// from `write_picture_prediction_parameters`. We assert the
+    /// invariant by writing + reparsing and comparing the dimensions —
+    /// this is the load-bearing piece for the residue encoder's OBMC
+    /// reconstruction (the dims must match symbol-for-symbol).
+    #[test]
+    fn picture_prediction_params_from_matches_writer() {
+        let seq = crate::encoder::make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+        for mv_precision in [0u32, 1, 2, 3] {
+            let iep = InterEncoderParams {
+                mv_precision,
+                ..InterEncoderParams::default()
+            };
+            let mut w = BitWriter::new();
+            write_picture_prediction_parameters(&mut w, &iep);
+            w.byte_align();
+            let bytes = w.finish();
+            let mut r = crate::bits::BitReader::new(&bytes);
+            let parsed = parse_picture_prediction_parameters(&mut r, &seq, 1).expect("PPP");
+            let synthesised = picture_prediction_params_from(&seq, &iep);
+            assert_eq!(parsed.luma_xblen, synthesised.luma_xblen);
+            assert_eq!(parsed.luma_yblen, synthesised.luma_yblen);
+            assert_eq!(parsed.luma_xbsep, synthesised.luma_xbsep);
+            assert_eq!(parsed.luma_ybsep, synthesised.luma_ybsep);
+            assert_eq!(parsed.mv_precision, synthesised.mv_precision);
+            assert_eq!(parsed.using_global, synthesised.using_global);
+            assert_eq!(parsed.superblocks_x, synthesised.superblocks_x);
+            assert_eq!(parsed.superblocks_y, synthesised.superblocks_y);
+            assert_eq!(parsed.blocks_x, synthesised.blocks_x);
+            assert_eq!(parsed.blocks_y, synthesised.blocks_y);
+            assert_eq!(parsed.refs_wt_precision, synthesised.refs_wt_precision);
+            assert_eq!(parsed.ref1_wt, synthesised.ref1_wt);
+            assert_eq!(parsed.ref2_wt, synthesised.ref2_wt);
+        }
     }
 }

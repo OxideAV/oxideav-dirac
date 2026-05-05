@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Dirac inter encoder **wavelet residue** (§11.3 / §13.4) — the
+  `encoder_inter` path now closes the prediction-error loop by
+  computing `source - decoder_OBMC_reconstruction` in the spec's
+  signed pre-output-offset domain, forward-DWT'ing the difference,
+  dead-zone quantising per the new `ResidueParams` (LeGall 5/3 /
+  depth 3 / qindex 0 by default), and emitting the §11.3
+  `ZERO_RESIDUAL=false` flag plus per-component AC-coded subbands
+  (single codeblock per subband, no per-codeblock quant offset, no
+  custom quant matrix) the decoder adds back at §15.8.2. The new
+  encoder-side helpers (`build_obmc_prediction`,
+  `build_residue_plane`, `forward_and_quantise_residue`,
+  `write_residue_component_subbands`) reuse `crate::obmc::motion_compensate`
+  and the §13.4.4 context machinery so the residue's reconstruction
+  matches the decoder symbol-for-symbol. New
+  `InterEncoderParams::residue: Option<ResidueParams>` knob — `Some(...)`
+  is the default (residue ON); set `None` to revert to the round-1
+  ZERO_RESIDUAL=true path for direct ME-only A/B comparison. PSNR
+  uplift on every synthetic fixture is dramatic: at qindex=0 with
+  LeGall 5/3 the inter self-roundtrip is **bit-exact (∞ dB)** on
+  `synthetic_translating_pair_64(4, 0)`, `(0, -4)`, `(0, 0)` and
+  `synthetic_camera_pan_64(1, 0)` — the residue captures everything
+  ME / OBMC couldn't reach. ffmpeg cross-decode jumps from
+  **19.39 dB → 34.38 dB** (~+15 dB) on the `+4`-pel translating-square
+  homogeneous-profile chain (`tests/ffmpeg_interop.rs::ffmpeg_cross_decodes_inter_residue_beats_no_residue`,
+  hard-asserted). 7 new tests (4 unit + 3 self-roundtrip / cross-decode
+  including 1 hard ffmpeg assert); all 182 dirac tests pass.
+  Existing OBMC / sub-pel tests now explicitly set `residue: None`
+  in the no-residue baseline so they keep measuring pure ME quality.
+
 ### Fixed (parse code recognition)
 
 - VC-2 LD pictures with parse code `0x88` (and the rest of the

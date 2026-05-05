@@ -70,13 +70,17 @@
 //!   (configurable `mv_precision`; quarter-pel is the default), preset-1
 //!   8x8 blocks, **§15.8.6 OBMC-aware ME refinement** (#186) that
 //!   converges the per-block MV grid on the same weighted-sum
-//!   reconstruction the decoder will perform, no residue. Self-roundtrip
-//!   ≥30 dB Y PSNR on the integer-pel translating-square fixture, ~52
-//!   dB Y PSNR on a sub-pel `synthetic_camera_pan_64` fixture (#168),
-//!   and bit-exact (∞ dB) on `synthetic_translating_pair_64(2, -1)`
-//!   after OBMC refinement (#186); zero-motion is also bit-exact.
-//!   Driven by the [`arith::ArithEncoder`] (Annex B.2 mirror of
-//!   `ArithDecoder`).
+//!   reconstruction the decoder will perform, and **§11.3 wavelet
+//!   residue** (default LeGall 5/3 / depth 3 / qindex 0; configurable
+//!   via [`encoder_inter::ResidueParams`]). The residue closes the
+//!   prediction-error loop: at the default `qindex = 0` the inter
+//!   self-roundtrip is bit-exact (∞ dB) on every synthetic translation
+//!   fixture in the test suite, and the homogeneous-profile ffmpeg
+//!   cross-decode jumps from ~19 dB (no-residue) to ~34 dB on the
+//!   `+4`-pel translating-square (~+15 dB). Setting `residue: None`
+//!   reverts to the round-1 ZERO_RESIDUAL=true behaviour for direct
+//!   ME-only A/B comparison. Driven by the [`arith::ArithEncoder`]
+//!   (Annex B.2 mirror of `ArithDecoder`).
 //! * **Dirac core-syntax intra** ([`encoder_intra_core::encode_single_core_intra_stream`]
 //!   and [`encoder_intra_core::encode_core_intra_then_inter_stream`])
 //!   — round 2: AC-coded intra reference picture (parse code `0x0C`),
@@ -88,9 +92,7 @@
 //!   intra Y PSNR ≈ 52 dB).
 //!
 //! Still unsupported (planned): v3 extended transform parameters
-//! (horizontal-only transforms); 2-reference bi-prediction;
-//! wavelet residue under inter pictures (currently `ZERO_RESIDUAL =
-//! true` only).
+//! (horizontal-only transforms); 2-reference bi-prediction.
 
 #![allow(clippy::needless_range_loop)]
 

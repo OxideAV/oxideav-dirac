@@ -1112,3 +1112,121 @@ fn ffmpeg_obmc_aware_me_does_not_regress_cross_decode() {
          OBMC differences)"
     );
 }
+
+/// **Wavelet residue ffmpeg cross-decode**. With the §11.3 residue path
+/// enabled (default), ffmpeg's `dirac` decoder should accept the
+/// homogeneous core-syntax intra + inter chain end-to-end and reconstruct
+/// the inter frame at *measurably* higher PSNR than the same encoder
+/// configured with `residue: None` (round-1 ZERO_RESIDUAL=true).
+///
+/// The cross-decode uplift on the translating-square is large because
+/// the residue compensates for ffmpeg's slightly different OBMC blend:
+/// what we couldn't get from ME alone, the residue captures and ffmpeg
+/// adds back. Measured: ~19 dB → ~34 dB on the +4-pel translation.
+#[test]
+fn ffmpeg_cross_decodes_inter_residue_beats_no_residue() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg not available; skipping residue cross-decode test");
+        return;
+    }
+    use oxideav_dirac::encoder::make_minimal_sequence;
+    use oxideav_dirac::encoder_inter::{
+        synthetic_translating_pair_64, InterEncoderParams, InterInputPicture,
+    };
+    use oxideav_dirac::encoder_intra_core::{
+        encode_core_intra_then_inter_stream, CoreIntraEncoderParams,
+    };
+    use oxideav_dirac::wavelet::WaveletFilter;
+
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let intra_params = CoreIntraEncoderParams::default_intra(WaveletFilter::LeGall5_3, 3);
+    let (y0, u0, v0, y1, u1, v1) = synthetic_translating_pair_64(4, 0);
+    let intra = InterInputPicture {
+        picture_number: 0,
+        y: &y0,
+        u: &u0,
+        v: &v0,
+    };
+    let inter = InterInputPicture {
+        picture_number: 1,
+        y: &y1,
+        u: &u1,
+        v: &v1,
+    };
+
+    fn psnr(a: &[u8], b: &[u8]) -> f64 {
+        let mut sse: u64 = 0;
+        for i in 0..a.len() {
+            let d = a[i] as i32 - b[i] as i32;
+            sse += (d * d) as u64;
+        }
+        if sse == 0 {
+            return f64::INFINITY;
+        }
+        let mse = sse as f64 / a.len() as f64;
+        20.0 * (255.0f64).log10() - 10.0 * mse.log10()
+    }
+
+    let measure = |inter_params: &InterEncoderParams, tag: &str| -> f64 {
+        let stream =
+            encode_core_intra_then_inter_stream(&seq, &intra_params, inter_params, &intra, &inter);
+        let tmpdir = std::env::temp_dir();
+        let drc = tmpdir.join(format!("oxideav_dirac_residue_xref_{tag}.drc"));
+        let yuv = tmpdir.join(format!("oxideav_dirac_residue_xref_{tag}.yuv"));
+        std::fs::write(&drc, &stream).expect("write drc");
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "dirac",
+                "-i",
+            ])
+            .arg(&drc)
+            .args(["-f", "rawvideo", "-pix_fmt", "yuv420p"])
+            .arg(&yuv)
+            .status()
+            .expect("run ffmpeg");
+        // HARD-asserted — ffmpeg must accept the residue stream. A
+        // rejection here means the encoder's §11.3 transform_parameters
+        // / per-component subband framing isn't what ffmpeg's dirac
+        // decoder expects.
+        assert!(
+            status.success(),
+            "ffmpeg rejected our inter-with-residue stream ({tag}) — see {drc:?}; \
+             this is a hard regression in the §11.3 wavelet residue path"
+        );
+        let out = std::fs::read(&yuv).expect("read ffmpeg yuv");
+        let frame_size = 64 * 64 + 2 * 32 * 32;
+        assert!(out.len() >= 2 * frame_size);
+        let inter_yuv = &out[frame_size..2 * frame_size];
+        let inter_y = &inter_yuv[..64 * 64];
+        psnr(inter_y, &y1)
+    };
+
+    let no_residue_params = InterEncoderParams {
+        residue: None,
+        ..InterEncoderParams::default()
+    };
+    let with_residue_params = InterEncoderParams::default();
+
+    let psnr_no_res = measure(&no_residue_params, "no_residue");
+    let psnr_with_res = measure(&with_residue_params, "with_residue");
+    eprintln!(
+        "translate(+4,0) ffmpeg cross-decode: no-residue = {psnr_no_res:.2} dB, \
+         with-residue = {psnr_with_res:.2} dB"
+    );
+    // Acceptance: residue must lift ffmpeg's cross-decode by ≥ 5 dB.
+    // On +4-pel translation the gap is ~14-15 dB (residue closes the
+    // OBMC-convention difference between our encoder and ffmpeg).
+    assert!(
+        psnr_with_res >= psnr_no_res + 5.0,
+        "wavelet residue did not lift ffmpeg cross-decode by ≥ 5 dB \
+         on the +4-pel translating-square fixture: \
+         no-residue = {psnr_no_res:.2} dB, with-residue = {psnr_with_res:.2} dB. \
+         §11.3 residue acceptance: ffmpeg must reconstruct the residue \
+         and add it to its OBMC prediction"
+    );
+}

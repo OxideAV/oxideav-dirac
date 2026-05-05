@@ -30,8 +30,8 @@ the goal here is to land the bitstream framing and primitives first.
 | Encoder — VC-2 HQ intra             | Implemented (8/10-bit, 4:2:0/4:2:2/4:4:4, 6 wavelets)         |
 | Encoder — VC-2 LD intra             | Implemented (ffmpeg-bit-exact at q=0)                         |
 | Encoder — Dirac core-syntax intra (r2) | AC-coded `0x0C` ref, single codeblock, q=0 near-lossless. ffmpeg-validated. |
-| Encoder — Dirac inter               | 1-ref, sub-pel ME (qpel default), OBMC-aware ME refinement (#186), no residue. ≥30 dB self-PSNR on integer-pel translation; ~52 dB Y on a quarter-pel camera-pan fixture (vs ~27 dB at integer-pel); OBMC refinement converges per-block MV grid on the §15.8.5 weighted-sum reconstruction (jumps `synthetic_translating_pair_64(2,-1)` from 32 dB to ∞ dB self-PSNR). |
-| Encoder — mixed I+P ffmpeg interop  | Homogeneous core-syntax `0x0C` + `0x09` chain — ffmpeg accepts end-to-end (no soft-skip; ~52 dB intra Y PSNR cross-decoded). |
+| Encoder — Dirac inter               | 1-ref, sub-pel ME (qpel default), OBMC-aware ME refinement (#186), **§11.3 wavelet residue** (LeGall 5/3 / depth 3 / qindex 0 default; `ResidueParams`-configurable). At qindex=0 inter self-roundtrip is bit-exact (∞ dB) on every synthetic translation / camera-pan fixture; setting `residue: None` reverts to the round-1 ZERO_RESIDUAL=true path for ME-only A/B comparison. |
+| Encoder — mixed I+P ffmpeg interop  | Homogeneous core-syntax `0x0C` + `0x09` chain — ffmpeg accepts end-to-end (~52 dB intra Y cross-decoded; **+15 dB inter cross-decode uplift** from residue: 19.39 dB → 34.38 dB on `+4`-pel translating-square). |
 
 ## Codec ID
 

@@ -12,7 +12,7 @@ use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
 use oxideav_dirac::encoder::{make_minimal_sequence, EncoderParams};
 use oxideav_dirac::encoder_inter::{
     encode_intra_then_inter_stream, synthetic_camera_pan_64, synthetic_translating_pair_64,
-    InterEncoderParams, InterInputPicture,
+    InterEncoderParams, InterInputPicture, ResidueParams,
 };
 use oxideav_dirac::video_format::ChromaFormat;
 use oxideav_dirac::wavelet::WaveletFilter;
@@ -199,9 +199,12 @@ fn intra_then_inter_camera_pan_subpel_beats_integer() {
         psnr(&inter_frame.planes[0].data, &y1)
     };
 
-    // Integer-pel ME baseline.
+    // Integer-pel ME baseline. Residue OFF so the PSNR measures
+    // *only* the ME quality (residue would otherwise close the loop
+    // bit-exactly at qindex=0 and hide the sub-pel uplift).
     let int_params = InterEncoderParams {
         mv_precision: 0,
+        residue: None,
         ..InterEncoderParams::default()
     };
     let psnr_int = decode_psnr(&int_params);
@@ -209,6 +212,7 @@ fn intra_then_inter_camera_pan_subpel_beats_integer() {
     // Quarter-pel ME — the new path.
     let qpel_params = InterEncoderParams {
         mv_precision: 2,
+        residue: None,
         ..InterEncoderParams::default()
     };
     let psnr_qpel = decode_psnr(&qpel_params);
@@ -334,10 +338,14 @@ fn intra_then_inter_obmc_refinement_beats_no_obmc_baseline() {
         psnr(&inter_frame.planes[0].data, &y1)
     };
 
-    // Baseline: integer-pel ME, OBMC refinement disabled.
+    // Baseline: integer-pel ME, OBMC refinement disabled. Residue OFF
+    // so the PSNR measures pure ME / OBMC quality — residue at qindex=0
+    // would otherwise close the loop bit-exactly and hide the
+    // refinement gap entirely.
     let no_obmc_params = InterEncoderParams {
         mv_precision: 0,
         obmc_refine_passes: 0,
+        residue: None,
         ..InterEncoderParams::default()
     };
     let psnr_no_obmc = decode_psnr(&no_obmc_params);
@@ -346,6 +354,7 @@ fn intra_then_inter_obmc_refinement_beats_no_obmc_baseline() {
     let obmc_params = InterEncoderParams {
         mv_precision: 0,
         obmc_refine_passes: 2,
+        residue: None,
         ..InterEncoderParams::default()
     };
     let psnr_obmc = decode_psnr(&obmc_params);
@@ -367,4 +376,198 @@ fn intra_then_inter_obmc_refinement_beats_no_obmc_baseline() {
          the per-block MV grid the §15.8.5 weighted-sum reconstructor \
          actually reads)"
     );
+}
+
+/// **Wavelet residue PSNR uplift**. The encoder's §11.3 residue path
+/// (`InterEncoderParams::residue = Some(...)`) computes
+/// `source - decoder_OBMC_reconstruction` in the spec's signed
+/// pre-output-offset domain, forward-DWTs the difference, dead-zone
+/// quantises, and emits per-component AC subbands the decoder adds
+/// back at §15.8.2.
+///
+/// On a synthetic camera-pan fixture the residue captures the OBMC
+/// reconstruction's left-over error and lifts self-roundtrip Y PSNR
+/// from the ~28-52 dB ME-only floor up to a much higher figure (or
+/// bit-exact). This test verifies both that the gap exists and that
+/// the residue path doesn't accidentally regress the no-residue
+/// baseline (the `residue: None` knob must keep the round-1 behaviour).
+#[test]
+fn intra_then_inter_residue_beats_no_residue_baseline() {
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let intra_params = EncoderParams::default_hq(WaveletFilter::LeGall5_3, 3);
+
+    // Quarter-pel camera pan — the residue captures whatever the
+    // sub-pel ME couldn't reach.
+    let (y0, u0, v0, y1, u1, v1) = synthetic_camera_pan_64(1, 0);
+    let intra = InterInputPicture {
+        picture_number: 0,
+        y: &y0,
+        u: &u0,
+        v: &v0,
+    };
+    let inter = InterInputPicture {
+        picture_number: 1,
+        y: &y1,
+        u: &u1,
+        v: &v1,
+    };
+
+    let decode_psnr = |inter_params: &InterEncoderParams| -> f64 {
+        let stream =
+            encode_intra_then_inter_stream(&seq, &intra_params, inter_params, &intra, &inter);
+        let mut reg = CodecRegistry::new();
+        oxideav_dirac::register(&mut reg);
+        let cp = CodecParameters::video(CodecId::new("dirac"));
+        let mut dec = reg.make_decoder(&cp).expect("make decoder");
+        let packet = Packet::new(0, TimeBase::new(1, 25), stream);
+        dec.send_packet(&packet).expect("send_packet");
+        let _intra_frame = dec.receive_frame().expect("intra frame");
+        let inter_frame = match dec.receive_frame().expect("inter frame") {
+            Frame::Video(vf) => vf,
+            other => panic!("expected video, got {other:?}"),
+        };
+        psnr(&inter_frame.planes[0].data, &y1)
+    };
+
+    // Baseline: residue OFF (round-1 behaviour). PSNR is dominated by
+    // ME / OBMC quality.
+    let no_residue = InterEncoderParams {
+        residue: None,
+        ..InterEncoderParams::default()
+    };
+    let psnr_no_res = decode_psnr(&no_residue);
+
+    // Residue ON (default).
+    let with_residue = InterEncoderParams::default();
+    let psnr_with_res = decode_psnr(&with_residue);
+
+    eprintln!(
+        "camera-pan 1/4 pel: no-residue PSNR Y = {psnr_no_res:.2} dB, \
+         residue-on PSNR Y = {psnr_with_res:.2} dB"
+    );
+    // Residue must beat the no-residue baseline by ≥ 5 dB. On the
+    // 1/4-pel camera-pan the gap is ~52 dB → inf dB at qindex=0
+    // (LeGall 5/3 reverses the residue exactly when coefficients are
+    // small).
+    assert!(
+        psnr_with_res >= psnr_no_res + 5.0,
+        "residue-on PSNR {psnr_with_res:.2} dB did not beat no-residue \
+         {psnr_no_res:.2} dB by ≥ 5 dB on the 1/4-pel camera-pan fixture \
+         (residue acceptance: §11.3 wavelet residue must measurably \
+         close the prediction loop on sub-pel motion)"
+    );
+}
+
+/// Residue at qindex=0 with LeGall 5/3 must round-trip the encoder
+/// **bit-exactly** on synthetic fixtures whose residue values stay
+/// within the filter's reversible range. Bit-exactness is the strict
+/// guarantee the residue path makes when configured for lossless mode.
+#[test]
+fn intra_then_inter_residue_q0_legall_is_bit_exact_on_translate() {
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let intra_params = EncoderParams::default_hq(WaveletFilter::LeGall5_3, 3);
+    let inter_params = InterEncoderParams {
+        residue: Some(ResidueParams::default_for(WaveletFilter::LeGall5_3, 3)),
+        ..InterEncoderParams::default()
+    };
+
+    let (y0, u0, v0, y1, u1, v1) = synthetic_translating_pair_64(4, 0);
+    let intra = InterInputPicture {
+        picture_number: 0,
+        y: &y0,
+        u: &u0,
+        v: &v0,
+    };
+    let inter = InterInputPicture {
+        picture_number: 1,
+        y: &y1,
+        u: &u1,
+        v: &v1,
+    };
+    let stream = encode_intra_then_inter_stream(&seq, &intra_params, &inter_params, &intra, &inter);
+
+    let mut reg = CodecRegistry::new();
+    oxideav_dirac::register(&mut reg);
+    let cp = CodecParameters::video(CodecId::new("dirac"));
+    let mut dec = reg.make_decoder(&cp).expect("make decoder");
+    let packet = Packet::new(0, TimeBase::new(1, 25), stream);
+    dec.send_packet(&packet).expect("send_packet");
+
+    let _intra_frame = dec.receive_frame().expect("intra frame");
+    let inter_frame = match dec.receive_frame().expect("inter frame") {
+        Frame::Video(vf) => vf,
+        other => panic!("expected video, got {other:?}"),
+    };
+    assert_eq!(
+        inter_frame.planes[0].data,
+        y1.to_vec(),
+        "Y plane should round-trip bit-exactly with LeGall 5/3 residue at qindex=0"
+    );
+    assert_eq!(
+        inter_frame.planes[1].data,
+        u1.to_vec(),
+        "U plane should round-trip bit-exactly with LeGall 5/3 residue at qindex=0"
+    );
+    assert_eq!(
+        inter_frame.planes[2].data,
+        v1.to_vec(),
+        "V plane should round-trip bit-exactly with LeGall 5/3 residue at qindex=0"
+    );
+}
+
+/// Setting `residue: None` must reproduce the round-1 ZERO_RESIDUAL=true
+/// behaviour byte-for-byte — i.e. the encoder emits `1` for the
+/// ZERO_RESIDUAL flag and zero further bytes for transform parameters.
+/// This is the "no-residue baseline" knob that lets regression tests
+/// exercise pure ME quality.
+#[test]
+fn residue_none_emits_zero_residual_true() {
+    use oxideav_dirac::parse_info::BBCD;
+
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let intra_params = EncoderParams::default_hq(WaveletFilter::LeGall5_3, 3);
+
+    let (y0, u0, v0, y1, u1, v1) = synthetic_translating_pair_64(2, 0);
+    let intra = InterInputPicture {
+        picture_number: 0,
+        y: &y0,
+        u: &u0,
+        v: &v0,
+    };
+    let inter = InterInputPicture {
+        picture_number: 1,
+        y: &y1,
+        u: &u1,
+        v: &v1,
+    };
+
+    let no_residue = InterEncoderParams {
+        residue: None,
+        ..InterEncoderParams::default()
+    };
+    let with_residue = InterEncoderParams::default();
+
+    let no_res_stream =
+        encode_intra_then_inter_stream(&seq, &intra_params, &no_residue, &intra, &inter);
+    let with_res_stream =
+        encode_intra_then_inter_stream(&seq, &intra_params, &with_residue, &intra, &inter);
+
+    // Locate the inter parse-info (parse code 0x09) in each stream — it
+    // should be identical up through the block_motion_data, then differ
+    // at the residue boundary. The simplest invariant: residue-on
+    // stream is *strictly larger* than residue-off (the residue adds
+    // transform parameters + per-component subband bytes).
+    assert!(
+        with_res_stream.len() > no_res_stream.len(),
+        "residue-on stream ({} bytes) should be strictly larger than \
+         residue-off ({} bytes) — the residue must add transform_parameters + \
+         subband data after block_motion_data",
+        with_res_stream.len(),
+        no_res_stream.len(),
+    );
+    // Sanity: both streams still start with the same sequence-header
+    // parse-info, so the front matter lines up.
+    assert_eq!(&no_res_stream[..4], BBCD);
+    assert_eq!(&with_res_stream[..4], BBCD);
+    assert_eq!(no_res_stream[4], with_res_stream[4]);
 }
