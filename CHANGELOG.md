@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Bipred B-picture encoder (`encode_bipred_inter_picture`) now uses
+  **integer-pel ME** by default (`bipred_mv_precision = 0`). Quarter-pel
+  ME produced an ~8 dB cross-decode penalty because our half-pel
+  interpolation convention differs from ffmpeg's at the 2-ref OBMC blend
+  stage, accumulating across blocks. Integer-pel eliminates all
+  convention differences; the wavelet residue then closes the
+  prediction-error loop exactly. ffmpeg cross-decode PSNR on the
+  complementary-bar fixture improves from ~42 dB to ~50 dB. The 1-ref
+  (P-picture) path is unaffected and continues to default to
+  quarter-pel (`mv_precision = 2`).
+
+### Added
+
+- `InterEncoderParams::bipred_mv_precision` field — controls MV
+  precision for B-pictures independently of the 1-ref `mv_precision`
+  knob. Default `0` (integer-pel). Set to `2` to restore the old
+  quarter-pel behaviour at an ~8 dB cross-decode cost.
+
 ## [0.0.5](https://github.com/OxideAV/oxideav-dirac/compare/v0.0.4...v0.0.5) - 2026-05-05
 
 ### Other

@@ -555,17 +555,19 @@ fn ffmpeg_cross_decodes_our_bipred_b_frame() {
     let bipred_y = &out[frame_size..frame_size + 64 * 64];
     let py = psnr(bipred_y, &ym);
     eprintln!("ffmpeg bipred B-frame cross-decode Y PSNR: {py:.2} dB");
-    // Cross-decode floor: 25 dB. ffmpeg's bipred OBMC blend differs
-    // from ours in the same ways its 1-ref path does (overlap weighting,
-    // half-pel interp), so the cross-decode sits well below the
-    // self-roundtrip ∞ dB floor. 25 dB still proves the 0x0A
-    // parse code, two reference deltas, v2x/v2y MV blocks, and the
-    // residue stream all reached ffmpeg coherently — anything past
-    // that documents an ffmpeg-side OBMC convention difference rather
-    // than a framing regression.
+    // Cross-decode floor: 49 dB. Using integer-pel ME for bipred
+    // (bipred_mv_precision = 0, the default) eliminates the sub-pel
+    // interpolation convention mismatch with ffmpeg's OBMC blend,
+    // lifting the cross-decode from ~42 dB (quarter-pel) to ~50 dB.
+    // The wavelet residue closes the prediction-error loop: since
+    // integer-pel MVs produce no half-pel or quarter-pel samples,
+    // there is no convention difference to accumulate across blocks,
+    // and ffmpeg decodes our residue on top of the same integer-pel
+    // OBMC prediction we used when encoding the residue.
     assert!(
-        py >= 25.0,
-        "ffmpeg bipred B-frame Y PSNR {py:.2} dB below 25 dB floor — \
-         framing or 2-ref linkage broke"
+        py >= 49.0,
+        "ffmpeg bipred B-frame Y PSNR {py:.2} dB below 49 dB floor — \
+         bipred_mv_precision=0 + residue path regression; expected ~50 dB \
+         on the complementary-bar fixture"
     );
 }
