@@ -326,8 +326,21 @@ pub fn decode_block_motion_data(
 
     // 1. Superblock split modes.
     decode_sb_splits(r, &mut motion)?;
-    // 2. Prediction modes.
-    decode_prediction_modes(r, &mut motion, &params_with_global(params))?;
+    // 2. Prediction modes — the §12.3.5 `block_ref_mode` reads BOTH the
+    //    ref1 and ref2 bits when `num_refs == 2`, regardless of whether
+    //    the picture uses global motion. Pass `num_refs` through from
+    //    the parse-code-derived caller (the previous helper inferred it
+    //    from `params.global2.is_some()`, which silently dropped the
+    //    ref2 bit on the common non-global 2-ref case — i.e. parse code
+    //    `0x0A`).
+    decode_prediction_modes(
+        r,
+        &mut motion,
+        &MotionCtx {
+            num_refs,
+            using_global: params.using_global,
+        },
+    )?;
     // 3. Motion vectors.
     decode_vector_elements(r, &mut motion, 1, 0)?;
     decode_vector_elements(r, &mut motion, 1, 1)?;
@@ -347,16 +360,6 @@ pub fn decode_block_motion_data(
 struct MotionCtx {
     num_refs: u32,
     using_global: bool,
-}
-fn params_with_global(params: &PicturePredictionParams) -> MotionCtx {
-    // num_refs is determined by the parse code, not the prediction
-    // parameters — infer from whether global2 or ref2_wt exists. For
-    // our purposes, we always pass num_refs through decode_block_motion_data
-    // but structured code is simpler with this helper.
-    MotionCtx {
-        num_refs: if params.global2.is_some() { 2 } else { 1 },
-        using_global: params.using_global,
-    }
 }
 
 fn decode_sb_splits(

@@ -64,23 +64,29 @@
 //!   across LeGall / DD9-7 / DD13-7 / Haar / Fidelity / Daubechies).
 //! * **VC-2 LD intra** ([`encoder::encode_single_ld_intra_stream`]) —
 //!   ffmpeg-validated with the Round 9 `slice_y_length` width fix.
-//! * **Dirac core-syntax inter** ([`encoder_inter::encode_intra_then_inter_stream`])
-//!   — 1-ref non-reference inter (parse code `0x09`) over integer-pel
-//!   full-search SAD ME with per-level 8-neighbor sub-pel refinement
-//!   (configurable `mv_precision`; quarter-pel is the default), preset-1
-//!   8x8 blocks, **§15.8.6 OBMC-aware ME refinement** (#186) that
-//!   converges the per-block MV grid on the same weighted-sum
-//!   reconstruction the decoder will perform, and **§11.3 wavelet
-//!   residue** (default LeGall 5/3 / depth 3 / qindex 0; configurable
-//!   via [`encoder_inter::ResidueParams`]). The residue closes the
-//!   prediction-error loop: at the default `qindex = 0` the inter
-//!   self-roundtrip is bit-exact (∞ dB) on every synthetic translation
-//!   fixture in the test suite, and the homogeneous-profile ffmpeg
-//!   cross-decode jumps from ~19 dB (no-residue) to ~34 dB on the
-//!   `+4`-pel translating-square (~+15 dB). Setting `residue: None`
-//!   reverts to the round-1 ZERO_RESIDUAL=true behaviour for direct
-//!   ME-only A/B comparison. Driven by the [`arith::ArithEncoder`]
-//!   (Annex B.2 mirror of `ArithDecoder`).
+//! * **Dirac core-syntax inter** ([`encoder_inter::encode_intra_then_inter_stream`]
+//!   for 1-ref P, [`encoder_inter::encode_bipred_inter_picture`] +
+//!   [`encoder_intra_core::encode_core_intra_then_bipred_stream`] for
+//!   2-ref bipred B) — 1-ref non-reference inter (parse code `0x09`)
+//!   and 2-ref bipred B (parse code `0x0A`) over integer-pel full-search
+//!   SAD ME with per-level 8-neighbor sub-pel refinement (configurable
+//!   `mv_precision`; quarter-pel is the default), preset-1 8x8 blocks,
+//!   **§15.8.6 OBMC-aware ME refinement** (#186) that converges the
+//!   per-block MV grid on the same weighted-sum reconstruction the
+//!   decoder will perform, **per-block bipred decision search**
+//!   ([`encoder_inter::bipred_select_modes`]) that picks `Ref1Only` /
+//!   `Ref2Only` / `Ref1And2` per block by SAD against the source, and
+//!   **§11.3 wavelet residue** (default LeGall 5/3 / depth 3 /
+//!   qindex 0; configurable via [`encoder_inter::ResidueParams`]). The
+//!   residue closes the prediction-error loop: at the default
+//!   `qindex = 0` the inter self-roundtrip is bit-exact (∞ dB) on every
+//!   synthetic translation fixture in the test suite (1-ref and 2-ref
+//!   alike), and the homogeneous-profile ffmpeg cross-decode lands at
+//!   ~34 dB (1-ref `+4`-pel translating-square, +15 dB over no-residue)
+//!   and **~42 dB** (bipred B on the complementary-bar fixture). Setting
+//!   `residue: None` reverts to the round-1 ZERO_RESIDUAL=true behaviour
+//!   for direct ME-only A/B comparison. Driven by the
+//!   [`arith::ArithEncoder`] (Annex B.2 mirror of `ArithDecoder`).
 //! * **Dirac core-syntax intra** ([`encoder_intra_core::encode_single_core_intra_stream`]
 //!   and [`encoder_intra_core::encode_core_intra_then_inter_stream`])
 //!   — round 2: AC-coded intra reference picture (parse code `0x0C`),
@@ -92,7 +98,9 @@
 //!   intra Y PSNR ≈ 52 dB).
 //!
 //! Still unsupported (planned): v3 extended transform parameters
-//! (horizontal-only transforms); 2-reference bi-prediction.
+//! (horizontal-only transforms); per-codeblock partitioning beyond
+//! the single-codeblock-per-subband encoder default; tunable rate-
+//! controlled residue qindex (currently a single `qindex` per picture).
 
 #![allow(clippy::needless_range_loop)]
 

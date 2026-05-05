@@ -507,6 +507,96 @@ pub fn encode_core_intra_then_inter_stream(
     out
 }
 
+/// Encode a 3-picture stream: two core-syntax intra references (`0x0C`)
+/// followed by a single 2-reference bipred B picture (`0x0A`)
+/// referencing both. This is the minimal validator for the bipred
+/// encoder path — the simplest legal Dirac sequence whose B-frame
+/// blends predictions from two distinct references.
+///
+/// Picture-number ordering matches the standard low-latency layout:
+/// `intra_a` at `t-1` (anchor), `intra_b` at `t+1` (future anchor),
+/// `bipred` at `t` (the in-between B). The encoder emits them in
+/// **decode order** — both intras first so the decoder's reference
+/// buffer is populated by the time the B picture arrives.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_core_intra_then_bipred_stream(
+    sequence: &SequenceHeader,
+    intra_params: &CoreIntraEncoderParams,
+    inter_params: &crate::encoder_inter::InterEncoderParams,
+    intra_a: &crate::encoder_inter::InterInputPicture<'_>,
+    intra_b: &crate::encoder_inter::InterInputPicture<'_>,
+    bipred: &crate::encoder_inter::InterInputPicture<'_>,
+) -> Vec<u8> {
+    let sh_payload = crate::encoder::encode_sequence_header(sequence);
+    let intra_a_payload = encode_core_intra_picture(
+        sequence,
+        intra_params,
+        intra_a.picture_number,
+        intra_a.y,
+        intra_a.u,
+        intra_a.v,
+    );
+    let intra_b_payload = encode_core_intra_picture(
+        sequence,
+        intra_params,
+        intra_b.picture_number,
+        intra_b.y,
+        intra_b.u,
+        intra_b.v,
+    );
+    let bipred_payload = crate::encoder_inter::encode_bipred_inter_picture(
+        sequence,
+        inter_params,
+        bipred.picture_number,
+        intra_a.picture_number,
+        intra_b.picture_number,
+        bipred.y,
+        bipred.u,
+        bipred.v,
+        intra_a.y,
+        intra_a.u,
+        intra_a.v,
+        intra_b.y,
+        intra_b.u,
+        intra_b.v,
+    );
+
+    let pi_size = 13usize;
+    let sh_unit_len = pi_size + sh_payload.len();
+    let intra_a_unit_len = pi_size + intra_a_payload.len();
+    let intra_b_unit_len = pi_size + intra_b_payload.len();
+    let bipred_unit_len = pi_size + bipred_payload.len();
+
+    let mut out = Vec::with_capacity(
+        sh_unit_len + intra_a_unit_len + intra_b_unit_len + bipred_unit_len + pi_size,
+    );
+    write_parse_info(&mut out, 0x00, sh_unit_len as u32, 0);
+    out.extend_from_slice(&sh_payload);
+    // First reference: 0x0C (core-syntax intra reference, num_refs=0).
+    write_parse_info(&mut out, 0x0C, intra_a_unit_len as u32, sh_unit_len as u32);
+    out.extend_from_slice(&intra_a_payload);
+    // Second reference: same parse code so the decoder retains it as
+    // another reference picture.
+    write_parse_info(
+        &mut out,
+        0x0C,
+        intra_b_unit_len as u32,
+        intra_a_unit_len as u32,
+    );
+    out.extend_from_slice(&intra_b_payload);
+    // Bipred B picture: 0x0A — core-syntax inter, AC-coded, 2 refs,
+    // non-reference.
+    write_parse_info(
+        &mut out,
+        0x0A,
+        bipred_unit_len as u32,
+        intra_b_unit_len as u32,
+    );
+    out.extend_from_slice(&bipred_payload);
+    write_parse_info(&mut out, 0x10, 0, bipred_unit_len as u32);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

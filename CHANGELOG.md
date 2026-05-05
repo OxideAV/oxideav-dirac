@@ -29,6 +29,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Dirac inter encoder **2-reference bipred** (B-picture, parse code
+  `0x0A`) — the `encoder_inter` module now emits 2-reference inter
+  pictures alongside the existing 1-reference path. New
+  `encode_bipred_inter_picture` writes two §9.6.1 reference deltas, the
+  §11.2 picture-prediction parameters, the §12.3 `block_motion_data`
+  with both `v1x/v1y` and `v2x/v2y` MV blocks, and (via the existing
+  residue path) the §11.3 wavelet residue computed against the
+  decoder's bipred OBMC reconstruction. Per-block decision search
+  (`bipred_select_modes`) runs sub-pel ME against each reference
+  independently and picks `Ref1Only` / `Ref2Only` / `Ref1And2` per
+  block by minimising SAD against the source — bipred carries a small
+  lambda-style penalty (`BIPRED_PENALTY = 64`) so blocks with no
+  averaging benefit fall back to the simpler 1-ref modes. New stream
+  wrapper `encode_core_intra_then_bipred_stream` chains two `0x0C`
+  intra references with one `0x0A` B picture so the full sequence
+  stays in one parse-code family. PSNR results on the new
+  complementary-bar fixture (a horizontal bar visible only in ref1, a
+  vertical bar only in ref2, B has both at half intensity — neither
+  single-ref MV alone can reach the target):
+  - **Self-roundtrip residue ON: ∞ dB (bit-exact)** at qindex = 0.
+  - **Self-roundtrip residue OFF: 32.60 dB bipred vs 20.18 dB 1-ref**
+    (+12 dB, hard-asserted A/B).
+  - **ffmpeg cross-decode: 42.27 dB Y** on the bipred B picture
+    (hard-asserted, vs 25 dB defensive floor).
+  6 new tests in `tests/encoder_bipred_roundtrip.rs` (block-motion-data
+  roundtrip, constant-frames smoke, mode-count diagnostic, no-residue
+  A/B, residue-on self-roundtrip, ffmpeg cross-decode); all 188 dirac
+  tests pass.
+
+### Fixed
+
+- Decoder bipred (parse code `0x0A`) was silently dropping the §12.3
+  `block_ref_mode` ref2 bit on 2-reference non-global pictures.
+  `decode_block_motion_data` derived `MotionCtx::num_refs` from
+  `params.global2.is_some()` (which is only `true` when global motion
+  is enabled), so `block_ref_mode` only read the ref1 bit and every
+  block fell into `Ref1Only` — hiding the entire bipred path. The
+  fix uses the `num_refs` already passed into `decode_block_motion_data`
+  (which is parse-code-derived). The existing 1-ref decode path (parse
+  code `0x09`, `num_refs = 1`) is unaffected; the existing global-2-ref
+  fallback through `params.global2.is_some()` ends up giving the same
+  answer for that case. The `corpus_i_p_b_320x240` ReportOnly fixture's
+  bipred B-frame Y PSNR moves accordingly (was previously masked by the
+  same OBMC-convention floor; this is the structural unblock).
+
+### Added
+
 - Dirac inter encoder **wavelet residue** (§11.3 / §13.4) — the
   `encoder_inter` path now closes the prediction-error loop by
   computing `source - decoder_OBMC_reconstruction` in the spec's

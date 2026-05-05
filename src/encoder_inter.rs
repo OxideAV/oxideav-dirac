@@ -906,8 +906,10 @@ pub fn encode_block_motion_data(
     let split_block = encode_sb_splits(superblocks_x, superblocks_y, &sb_split);
     write_uint_then_bytes(w, &split_block);
 
-    // 2) Prediction modes — Ref1Only everywhere, no global.
-    let pmode_block = encode_prediction_modes(superblocks_x, superblocks_y, &sb_split, &blocks, bx);
+    // 2) Prediction modes — Ref1Only everywhere, no global. num_refs=1
+    //    means we only emit the ref1 bit per block.
+    let pmode_block =
+        encode_prediction_modes(superblocks_x, superblocks_y, &sb_split, &blocks, bx, 1);
     write_uint_then_bytes(w, &pmode_block);
 
     // 3) Motion vectors — ref 1, dirn 0 then dirn 1.
@@ -935,6 +937,121 @@ pub fn encode_block_motion_data(
     // 4) DC values for intra blocks — none in our r1 streams, so each
     //    component gets an empty arith block. We still must emit the
     //    length-prefixed empty block for each of Y/C1/C2.
+    for _c in 0..3 {
+        let dc_block = encode_dc_values(superblocks_x, superblocks_y, &sb_split, &blocks, bx);
+        write_uint_then_bytes(w, &dc_block);
+    }
+}
+
+/// Per-block bipred decision: which references this block uses and the
+/// MVs against each. Indexed `[by * blocks_x + bx]`.
+///
+/// `rmode` is one of `Ref1Only` / `Ref2Only` / `Ref1And2` (never Intra
+/// or gmode in our encoder); `mv1` is the MV against ref1 (only valid
+/// when `rmode.uses_ref(1)`); `mv2` against ref2 (only valid when
+/// `rmode.uses_ref(2)`). MVs are in `1/(2^mv_precision)` luma-pel units.
+#[derive(Debug, Clone, Copy)]
+pub struct BipredBlock {
+    pub rmode: RefPredMode,
+    pub mv1: IntegerMv,
+    pub mv2: IntegerMv,
+}
+
+impl Default for BipredBlock {
+    fn default() -> Self {
+        Self {
+            rmode: RefPredMode::Ref1Only,
+            mv1: IntegerMv::default(),
+            mv2: IntegerMv::default(),
+        }
+    }
+}
+
+/// Encode the §12.3 `block_motion_data` block for a **2-reference**
+/// inter picture (parse code `0x0A`). Mirrors
+/// [`encode_block_motion_data`] but writes the §11.2.7 prediction-mode
+/// pair (ref1 + ref2 bits) and the four MV blocks (v1x, v1y, v2x, v2y).
+///
+/// `decisions` is `blocks_x * blocks_y` row-major; each entry carries
+/// the per-block reference-mode + the two MVs the encoder chose.
+pub fn encode_block_motion_data_bipred(
+    w: &mut BitWriter,
+    superblocks_x: u32,
+    superblocks_y: u32,
+    blocks_x: u32,
+    blocks_y: u32,
+    decisions: &[BipredBlock],
+) {
+    let sb_split = vec![2u32; (superblocks_x * superblocks_y) as usize];
+    let mut blocks: Vec<BlockData> = (0..blocks_x * blocks_y)
+        .map(|i| {
+            let d = decisions[i as usize];
+            BlockData {
+                rmode: d.rmode,
+                gmode: false,
+                mv: [(d.mv1.0, d.mv1.1), (d.mv2.0, d.mv2.1)],
+                dc: [0; 3],
+            }
+        })
+        .collect();
+    let bx = blocks_x;
+    // 1) Superblock splits.
+    let split_block = encode_sb_splits(superblocks_x, superblocks_y, &sb_split);
+    write_uint_then_bytes(w, &split_block);
+
+    // 2) Prediction modes — num_refs = 2 emits both bits per block.
+    let pmode_block =
+        encode_prediction_modes(superblocks_x, superblocks_y, &sb_split, &blocks, bx, 2);
+    write_uint_then_bytes(w, &pmode_block);
+
+    // 3a) ref1 vectors — dirn 0 then dirn 1. Skip blocks whose rmode
+    //     doesn't use ref1 (Ref2Only) — same convention as the decoder.
+    let v1x = encode_vector_elements(
+        superblocks_x,
+        superblocks_y,
+        &sb_split,
+        &mut blocks,
+        bx,
+        1,
+        0,
+    );
+    write_uint_then_bytes(w, &v1x);
+    let v1y = encode_vector_elements(
+        superblocks_x,
+        superblocks_y,
+        &sb_split,
+        &mut blocks,
+        bx,
+        1,
+        1,
+    );
+    write_uint_then_bytes(w, &v1y);
+
+    // 3b) ref2 vectors — dirn 0 then dirn 1. Skip blocks whose rmode
+    //     doesn't use ref2 (Ref1Only) — same convention as the decoder.
+    let v2x = encode_vector_elements(
+        superblocks_x,
+        superblocks_y,
+        &sb_split,
+        &mut blocks,
+        bx,
+        2,
+        0,
+    );
+    write_uint_then_bytes(w, &v2x);
+    let v2y = encode_vector_elements(
+        superblocks_x,
+        superblocks_y,
+        &sb_split,
+        &mut blocks,
+        bx,
+        2,
+        1,
+    );
+    write_uint_then_bytes(w, &v2y);
+
+    // 4) DC values for intra blocks — none here. Empty arith block per
+    //    component.
     for _c in 0..3 {
         let dc_block = encode_dc_values(superblocks_x, superblocks_y, &sb_split, &blocks, bx);
         write_uint_then_bytes(w, &dc_block);
@@ -992,6 +1109,7 @@ fn encode_prediction_modes(
     sb_split: &[u32],
     blocks: &[BlockData],
     bx: u32,
+    num_refs: u32,
 ) -> Vec<u8> {
     let mut enc = ArithEncoder::new();
     let mut bank = ContextBank::new(3);
@@ -1010,10 +1128,16 @@ fn encode_prediction_modes(
                     let target = blocks[(blky * bx + blkx) as usize].rmode;
                     let pred = ref_mode_prediction(&current_rmode, bx, blkx, blky);
                     let bits = target.to_bits() ^ pred.to_bits();
-                    // num_refs = 1 → only emit ref1 bit.
+                    // ref1 bit always emitted.
                     enc.write_bool(&mut bank, mvctx::PMODE_REF1, (bits & 1) == 1);
-                    // No num_refs==2 path; no global block emit either
-                    // (using_global=false everywhere in r1).
+                    if num_refs == 2 {
+                        // ref2 bit only emitted on 2-ref pictures (parse
+                        // code 0x0A / 0x0B etc.). Mirrors the decoder's
+                        // `block_ref_mode` second `read_bool` gated on
+                        // `num_refs == 2`.
+                        enc.write_bool(&mut bank, mvctx::PMODE_REF2, ((bits >> 1) & 1) == 1);
+                    }
+                    // No global block emit (using_global=false everywhere).
                     propagate_rmode(&mut current_rmode, bx, blkx, blky, step, target);
                 }
             }
@@ -1092,7 +1216,11 @@ fn encode_vector_elements(
                     // Set the current block's rmode in `current` so
                     // mv_prediction's mv_available check matches.
                     current[bi].rmode = block.rmode;
-                    if block.rmode == RefPredMode::Intra || block.gmode {
+                    // Decoder-side `block_vector` returns early if the
+                    // block doesn't use this reference (or is global) —
+                    // mirror that exactly so 2-ref Ref1Only blocks skip
+                    // their unused ref2 residual (and vice versa).
+                    if !block.rmode.uses_ref(ref_num as usize) || block.gmode {
                         // Propagate the (unchanged) zero MV.
                         propagate_mv(&mut current, bx, blkx, blky, step, idx);
                         continue;
@@ -1816,6 +1944,495 @@ fn write_picture_prediction_parameters(w: &mut BitWriter, params: &InterEncoderP
     // §11.2.8 reference_picture_weights_flag: false → defaults
     // refs_wt_precision=1, ref1_wt=ref2_wt=1.
     w.write_bool(false);
+}
+
+// ---- 2-reference bipred encoding (#190 follow-up) --------------------
+
+/// **Bipred per-block decision search.** For each block, evaluates
+/// three candidate prediction modes against the source plane:
+///
+/// * `Ref1Only` with the best ref1 MV (§15.8.7 single-ref pixel pred);
+/// * `Ref2Only` with the best ref2 MV;
+/// * `Ref1And2` with the per-ref MVs averaged 50/50 by the OBMC blend
+///   (§15.8.5 weighted sum at `ref1_wt = ref2_wt = 1`,
+///   `refs_wt_precision = 1`).
+///
+/// The bipred SAD is the absolute difference between the source pixel
+/// and the rounded average of the two references' sub-pel-sampled
+/// predictions. The mode that minimises per-block SAD wins, with a
+/// tiny lambda-style tie-break preferring the simpler 1-ref modes
+/// (smaller MV residue + no second MV pair to encode).
+///
+/// `mv_precision` is in `1/(2^p)` luma pel units (matches
+/// [`InterEncoderParams::mv_precision`]).
+#[allow(clippy::too_many_arguments)]
+pub fn bipred_select_modes(
+    cur_y: &[u8],
+    ref1_y: &[u8],
+    ref2_y: &[u8],
+    width: u32,
+    height: u32,
+    blocks_x: u32,
+    blocks_y: u32,
+    search: u32,
+    mv_precision: u32,
+) -> Vec<BipredBlock> {
+    // Independent per-ref ME — same path the 1-ref encoder uses, just
+    // re-run against each reference.
+    let mvs1 = subpel_search_me(
+        cur_y,
+        ref1_y,
+        width,
+        height,
+        blocks_x,
+        blocks_y,
+        search,
+        mv_precision,
+    );
+    let mvs2 = subpel_search_me(
+        cur_y,
+        ref2_y,
+        width,
+        height,
+        blocks_x,
+        blocks_y,
+        search,
+        mv_precision,
+    );
+    let (xblen, yblen, xbsep, ybsep) = (8i32, 8i32, 4i32, 4i32);
+    let w_i = width as i32;
+    let h_i = height as i32;
+    // Build sub-pel upref planes for both references when needed —
+    // bipred SAD reads the same §15.8.10/§15.8.11 samples the decoder
+    // OBMC blend will, so the per-block ranking matches the eventual
+    // reconstruction error.
+    let (up1, up1_w, up1_h) = build_upref(ref1_y, width, height);
+    let (up2, up2_w, up2_h) = build_upref(ref2_y, width, height);
+    let mut out: Vec<BipredBlock> = Vec::with_capacity(mvs1.len());
+    for by in 0..blocks_y {
+        for bx in 0..blocks_x {
+            let idx = (by * blocks_x + bx) as usize;
+            let mv1 = mvs1[idx];
+            let mv2 = mvs2[idx];
+            let x0 = bx as i32 * xbsep;
+            let y0 = by as i32 * ybsep;
+            // Per-mode SAD. For 1-ref modes we re-evaluate at the
+            // chosen sub-pel MV via `sad_subpel` so the score lines up
+            // exactly with the bipred path's resampling convention.
+            let sad1 = if mv_precision == 0 {
+                sad_block(cur_y, ref1_y, w_i, h_i, x0, y0, mv1.0, mv1.1, xblen, yblen)
+            } else {
+                let scale = 1i64 << mv_precision;
+                let qx = (x0 as i64) * scale + mv1.0 as i64;
+                let qy = (y0 as i64) * scale + mv1.1 as i64;
+                sad_subpel(
+                    cur_y,
+                    &up1,
+                    up1_w,
+                    up1_h,
+                    w_i,
+                    h_i,
+                    x0,
+                    y0,
+                    qx,
+                    qy,
+                    xblen,
+                    yblen,
+                    mv_precision,
+                )
+            };
+            let sad2 = if mv_precision == 0 {
+                sad_block(cur_y, ref2_y, w_i, h_i, x0, y0, mv2.0, mv2.1, xblen, yblen)
+            } else {
+                let scale = 1i64 << mv_precision;
+                let qx = (x0 as i64) * scale + mv2.0 as i64;
+                let qy = (y0 as i64) * scale + mv2.1 as i64;
+                sad_subpel(
+                    cur_y,
+                    &up2,
+                    up2_w,
+                    up2_h,
+                    w_i,
+                    h_i,
+                    x0,
+                    y0,
+                    qx,
+                    qy,
+                    xblen,
+                    yblen,
+                    mv_precision,
+                )
+            };
+            // Bipred SAD: `(p1 + p2 + 1) >> 1` per pixel (the §15.8.5
+            // weighted sum at `ref_wt=(1,1)` and `refs_wt_precision=1`,
+            // i.e. shift by 1, round-to-nearest at `+1`). This is what
+            // the decoder will accumulate into `mc_tmp` for `Ref1And2`
+            // blocks (post-spatial-weight, post-OBMC-blend).
+            let sad12 = sad_bipred(
+                cur_y,
+                &up1,
+                up1_w,
+                up1_h,
+                ref1_y,
+                &up2,
+                up2_w,
+                up2_h,
+                ref2_y,
+                w_i,
+                h_i,
+                x0,
+                y0,
+                mv1,
+                mv2,
+                xblen,
+                yblen,
+                mv_precision,
+            );
+            // Lambda-style tie-break: bipred carries an extra 2 MV
+            // components so it must win by a clear margin to be picked.
+            // Without this, equal-SAD ties default to bipred and the
+            // decoder spends bits on a second MV pair that doesn't
+            // improve reconstruction.
+            const BIPRED_PENALTY: i64 = 64; // ~1 LSB per pixel over an 8x8 block.
+            let mut best_mode = RefPredMode::Ref1Only;
+            let mut best_sad = sad1;
+            if sad2 < best_sad {
+                best_sad = sad2;
+                best_mode = RefPredMode::Ref2Only;
+            }
+            if sad12 + BIPRED_PENALTY < best_sad {
+                best_mode = RefPredMode::Ref1And2;
+            }
+            out.push(BipredBlock {
+                rmode: best_mode,
+                mv1,
+                mv2,
+            });
+        }
+    }
+    out
+}
+
+/// SAD of one block under the bipred prediction
+/// `(pred_ref1 + pred_ref2 + 1) >> 1` against the source. Matches the
+/// §15.8.5 reconstruction at `ref1_wt = ref2_wt = 1`,
+/// `refs_wt_precision = 1` (post-OBMC blend, pre-spatial-weight scale).
+#[allow(clippy::too_many_arguments)]
+fn sad_bipred(
+    cur: &[u8],
+    up1: &[i32],
+    up1_w: usize,
+    up1_h: usize,
+    ref1: &[u8],
+    up2: &[i32],
+    up2_w: usize,
+    up2_h: usize,
+    ref2: &[u8],
+    w: i32,
+    h: i32,
+    x0: i32,
+    y0: i32,
+    mv1: IntegerMv,
+    mv2: IntegerMv,
+    xblen: i32,
+    yblen: i32,
+    mv_precision: u32,
+) -> i64 {
+    let mut sad: i64 = 0;
+    if mv_precision == 0 {
+        for y in 0..yblen {
+            let cy = (y0 + y).clamp(0, h - 1) as usize;
+            for x in 0..xblen {
+                let cx = (x0 + x).clamp(0, w - 1) as usize;
+                let r1x = (x0 + x + mv1.0).clamp(0, w - 1) as usize;
+                let r1y = (y0 + y + mv1.1).clamp(0, h - 1) as usize;
+                let r2x = (x0 + x + mv2.0).clamp(0, w - 1) as usize;
+                let r2y = (y0 + y + mv2.1).clamp(0, h - 1) as usize;
+                let p1 = ref1[r1y * w as usize + r1x] as i32;
+                let p2 = ref2[r2y * w as usize + r2x] as i32;
+                let pavg = (p1 + p2 + 1) >> 1;
+                let s = cur[cy * w as usize + cx] as i32;
+                sad += (s - pavg).unsigned_abs() as i64;
+            }
+        }
+    } else {
+        let scale = 1i64 << mv_precision;
+        for y in 0..yblen {
+            let cy = (y0 + y).clamp(0, h - 1) as usize;
+            let py = (y0 as i64) * scale + mv1.1 as i64 + (y as i64) * scale;
+            let py2 = (y0 as i64) * scale + mv2.1 as i64 + (y as i64) * scale;
+            for x in 0..xblen {
+                let cx = (x0 + x).clamp(0, w - 1) as usize;
+                let px = (x0 as i64) * scale + mv1.0 as i64 + (x as i64) * scale;
+                let px2 = (x0 as i64) * scale + mv2.0 as i64 + (x as i64) * scale;
+                let p1 = subpel_predict(up1, up1_w, up1_h, px, py, mv_precision);
+                let p2 = subpel_predict(up2, up2_w, up2_h, px2, py2, mv_precision);
+                let pavg = (p1 + p2 + 1) >> 1;
+                let s = cur[cy * w as usize + cx] as i32;
+                sad += (s - pavg).unsigned_abs() as i64;
+            }
+        }
+    }
+    sad
+}
+
+/// Build the same `PictureMotionData` the decoder will reconstruct from
+/// the 2-ref `block_motion_data` block this encoder emits — preserves
+/// the per-block `RefPredMode` and both MVs.
+fn build_motion_from_bipred_grid(
+    sbx: u32,
+    sby: u32,
+    blocks_x: u32,
+    blocks_y: u32,
+    decisions: &[BipredBlock],
+) -> PictureMotionData {
+    let blocks: Vec<BlockData> = (0..blocks_x * blocks_y)
+        .map(|i| {
+            let d = decisions[i as usize];
+            BlockData {
+                rmode: d.rmode,
+                gmode: false,
+                mv: [(d.mv1.0, d.mv1.1), (d.mv2.0, d.mv2.1)],
+                dc: [0; 3],
+            }
+        })
+        .collect();
+    PictureMotionData {
+        blocks_x,
+        blocks_y,
+        superblocks_x: sbx,
+        superblocks_y: sby,
+        sb_split: vec![2u32; (sbx * sby) as usize],
+        blocks,
+        global1: None,
+        global2: None,
+    }
+}
+
+/// Build the §11.8.5 OBMC reference reconstruction for a 2-ref bipred
+/// picture. Same shape as [`build_obmc_prediction`] but feeds both
+/// reference planes through `crate::obmc::motion_compensate`.
+#[allow(clippy::too_many_arguments)]
+fn build_obmc_prediction_bipred(
+    sequence: &SequenceHeader,
+    pred: &PicturePredictionParams,
+    motion: &PictureMotionData,
+    ref1_y: &[u8],
+    ref1_u: &[u8],
+    ref1_v: &[u8],
+    ref2_y: &[u8],
+    ref2_u: &[u8],
+    ref2_v: &[u8],
+) -> (Vec<i32>, Vec<i32>, Vec<i32>) {
+    let chroma_h_ratio = sequence.video_params.chroma_format.h_ratio();
+    let chroma_v_ratio = sequence.video_params.chroma_format.v_ratio();
+    let pred_y = build_obmc_prediction_one_bipred(
+        sequence,
+        pred,
+        motion,
+        false,
+        chroma_h_ratio,
+        chroma_v_ratio,
+        ref1_y,
+        ref2_y,
+        sequence.luma_width as usize,
+        sequence.luma_height as usize,
+    );
+    let pred_u = build_obmc_prediction_one_bipred(
+        sequence,
+        pred,
+        motion,
+        true,
+        chroma_h_ratio,
+        chroma_v_ratio,
+        ref1_u,
+        ref2_u,
+        sequence.chroma_width as usize,
+        sequence.chroma_height as usize,
+    );
+    let pred_v = build_obmc_prediction_one_bipred(
+        sequence,
+        pred,
+        motion,
+        true,
+        chroma_h_ratio,
+        chroma_v_ratio,
+        ref1_v,
+        ref2_v,
+        sequence.chroma_width as usize,
+        sequence.chroma_height as usize,
+    );
+    (pred_y, pred_u, pred_v)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_obmc_prediction_one_bipred(
+    sequence: &SequenceHeader,
+    pred: &PicturePredictionParams,
+    motion: &PictureMotionData,
+    is_chroma: bool,
+    chroma_h_ratio: u32,
+    chroma_v_ratio: u32,
+    ref1_plane: &[u8],
+    ref2_plane: &[u8],
+    comp_w: usize,
+    comp_h: usize,
+) -> Vec<i32> {
+    let depth = if is_chroma {
+        sequence.chroma_depth
+    } else {
+        sequence.luma_depth
+    };
+    let half = 1i32 << (depth - 1);
+    let ref1_signed: Vec<i32> = ref1_plane.iter().map(|&v| v as i32 - half).collect();
+    let ref2_signed: Vec<i32> = ref2_plane.iter().map(|&v| v as i32 - half).collect();
+    let (xblen, yblen, xbsep, ybsep) = if is_chroma {
+        (
+            (pred.luma_xblen / chroma_h_ratio) as usize,
+            (pred.luma_yblen / chroma_v_ratio) as usize,
+            (pred.luma_xbsep / chroma_h_ratio) as usize,
+            (pred.luma_ybsep / chroma_v_ratio) as usize,
+        )
+    } else {
+        (
+            pred.luma_xblen as usize,
+            pred.luma_yblen as usize,
+            pred.luma_xbsep as usize,
+            pred.luma_ybsep as usize,
+        )
+    };
+    let mc_params = McParams {
+        len_x: comp_w,
+        len_y: comp_h,
+        xblen,
+        yblen,
+        xbsep,
+        ybsep,
+        blocks_x: pred.blocks_x,
+        blocks_y: pred.blocks_y,
+        mv_precision: pred.mv_precision,
+        is_chroma,
+        chroma_h_ratio,
+        chroma_v_ratio,
+        refs_wt_precision: pred.refs_wt_precision,
+        ref1_wt: pred.ref1_wt,
+        ref2_wt: pred.ref2_wt,
+        luma_depth: sequence.luma_depth,
+        chroma_depth: sequence.chroma_depth,
+    };
+    let mut pic = vec![0i32; comp_w * comp_h];
+    crate::obmc::motion_compensate(
+        &mut pic,
+        &mc_params,
+        motion,
+        Some((&ref1_signed, comp_w, comp_h)),
+        Some((&ref2_signed, comp_w, comp_h)),
+    );
+    pic
+}
+
+/// Encode one 2-reference (bipred) core-syntax inter picture, parse
+/// code `0x0A` (non-reference, AC-coded, 2 refs). Mirrors
+/// [`encode_inter_picture`] but emits two reference deltas, the 2-ref
+/// `block_motion_data` (incl. v2x / v2y), and feeds both reference
+/// planes into the residue's OBMC prediction.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_bipred_inter_picture(
+    sequence: &SequenceHeader,
+    params: &InterEncoderParams,
+    picture_number: u32,
+    ref1_picture_number: u32,
+    ref2_picture_number: u32,
+    cur_y: &[u8],
+    cur_u: &[u8],
+    cur_v: &[u8],
+    ref1_y: &[u8],
+    ref1_u: &[u8],
+    ref1_v: &[u8],
+    ref2_y: &[u8],
+    ref2_u: &[u8],
+    ref2_v: &[u8],
+) -> Vec<u8> {
+    assert_eq!(params.block_params_index, 1, "only preset 1 is supported");
+
+    let mut w = BitWriter::new();
+
+    // §12.2 picture_header.
+    w.byte_align();
+    w.write_uint_lit(4, picture_number);
+
+    // §9.6.1 reference deltas — two signed deltas for ref1, ref2.
+    let d1: i32 = ref1_picture_number.wrapping_sub(picture_number) as i32;
+    let d2: i32 = ref2_picture_number.wrapping_sub(picture_number) as i32;
+    w.write_sint(d1);
+    w.write_sint(d2);
+    // No retd — parse code 0x0A is non-reference.
+
+    w.byte_align();
+
+    // §11.2 picture_prediction_parameters.
+    write_picture_prediction_parameters(&mut w, params);
+    w.byte_align();
+
+    // §12.3 block_motion_data — 2-ref bipred path.
+    let (sbx, sby, blocks_x, blocks_y) = motion_grid(sequence.luma_width, sequence.luma_height);
+    let decisions = bipred_select_modes(
+        cur_y,
+        ref1_y,
+        ref2_y,
+        sequence.luma_width,
+        sequence.luma_height,
+        blocks_x,
+        blocks_y,
+        params.mv_search_range,
+        params.mv_precision,
+    );
+    encode_block_motion_data_bipred(&mut w, sbx, sby, blocks_x, blocks_y, &decisions);
+    w.byte_align();
+
+    // §11.3 wavelet_transform.
+    if let Some(ref residue) = params.residue {
+        let pred = picture_prediction_params_from(sequence, params);
+        let motion = build_motion_from_bipred_grid(sbx, sby, blocks_x, blocks_y, &decisions);
+        let (pred_y, pred_u, pred_v) = build_obmc_prediction_bipred(
+            sequence, &pred, &motion, ref1_y, ref1_u, ref1_v, ref2_y, ref2_u, ref2_v,
+        );
+        let res_y = build_residue_plane(cur_y, &pred_y, sequence.luma_depth);
+        let res_u = build_residue_plane(cur_u, &pred_u, sequence.chroma_depth);
+        let res_v = build_residue_plane(cur_v, &pred_v, sequence.chroma_depth);
+
+        w.write_bool(false);
+        write_residue_transform_parameters(&mut w, residue);
+        w.byte_align();
+
+        let qpy_y = forward_and_quantise_residue(
+            &res_y,
+            sequence.luma_width,
+            sequence.luma_height,
+            residue,
+        );
+        let qpy_u = forward_and_quantise_residue(
+            &res_u,
+            sequence.chroma_width,
+            sequence.chroma_height,
+            residue,
+        );
+        let qpy_v = forward_and_quantise_residue(
+            &res_v,
+            sequence.chroma_width,
+            sequence.chroma_height,
+            residue,
+        );
+        write_residue_component_subbands(&mut w, residue, &qpy_y);
+        write_residue_component_subbands(&mut w, residue, &qpy_u);
+        write_residue_component_subbands(&mut w, residue, &qpy_v);
+        w.byte_align();
+    } else {
+        w.write_bool(true);
+        w.byte_align();
+    }
+
+    w.finish()
 }
 
 /// Encode a 2-picture stream: an HQ intra reference (`0xEC`) followed
