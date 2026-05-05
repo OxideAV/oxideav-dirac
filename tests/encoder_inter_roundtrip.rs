@@ -58,7 +58,7 @@ fn intra_then_inter_translate_4_pixels_yields_high_psnr() {
     let stream = encode_intra_then_inter_stream(&seq, &intra_params, &inter_params, &intra, &inter);
 
     let mut reg = CodecRegistry::new();
-    oxideav_dirac::register(&mut reg);
+    oxideav_dirac::register_codecs(&mut reg);
     let cp = CodecParameters::video(CodecId::new("dirac"));
     let mut dec = reg.make_decoder(&cp).expect("make decoder");
     let packet = Packet::new(0, TimeBase::new(1, 25), stream);
@@ -134,7 +134,7 @@ fn intra_then_inter_translate_vertical_yields_high_psnr() {
     let stream = encode_intra_then_inter_stream(&seq, &intra_params, &inter_params, &intra, &inter);
 
     let mut reg = CodecRegistry::new();
-    oxideav_dirac::register(&mut reg);
+    oxideav_dirac::register_codecs(&mut reg);
     let cp = CodecParameters::video(CodecId::new("dirac"));
     let mut dec = reg.make_decoder(&cp).expect("make decoder");
     let packet = Packet::new(0, TimeBase::new(1, 25), stream);
@@ -186,7 +186,7 @@ fn intra_then_inter_camera_pan_subpel_beats_integer() {
         let stream =
             encode_intra_then_inter_stream(&seq, &intra_params, inter_params, &intra, &inter);
         let mut reg = CodecRegistry::new();
-        oxideav_dirac::register(&mut reg);
+        oxideav_dirac::register_codecs(&mut reg);
         let cp = CodecParameters::video(CodecId::new("dirac"));
         let mut dec = reg.make_decoder(&cp).expect("make decoder");
         let packet = Packet::new(0, TimeBase::new(1, 25), stream);
@@ -260,7 +260,7 @@ fn intra_then_inter_zero_motion_is_near_lossless() {
     let stream = encode_intra_then_inter_stream(&seq, &intra_params, &inter_params, &intra, &inter);
 
     let mut reg = CodecRegistry::new();
-    oxideav_dirac::register(&mut reg);
+    oxideav_dirac::register_codecs(&mut reg);
     let cp = CodecParameters::video(CodecId::new("dirac"));
     let mut dec = reg.make_decoder(&cp).expect("make decoder");
     let packet = Packet::new(0, TimeBase::new(1, 25), stream);
@@ -325,7 +325,7 @@ fn intra_then_inter_obmc_refinement_beats_no_obmc_baseline() {
         let stream =
             encode_intra_then_inter_stream(&seq, &intra_params, inter_params, &intra, &inter);
         let mut reg = CodecRegistry::new();
-        oxideav_dirac::register(&mut reg);
+        oxideav_dirac::register_codecs(&mut reg);
         let cp = CodecParameters::video(CodecId::new("dirac"));
         let mut dec = reg.make_decoder(&cp).expect("make decoder");
         let packet = Packet::new(0, TimeBase::new(1, 25), stream);
@@ -416,7 +416,7 @@ fn intra_then_inter_residue_beats_no_residue_baseline() {
         let stream =
             encode_intra_then_inter_stream(&seq, &intra_params, inter_params, &intra, &inter);
         let mut reg = CodecRegistry::new();
-        oxideav_dirac::register(&mut reg);
+        oxideav_dirac::register_codecs(&mut reg);
         let cp = CodecParameters::video(CodecId::new("dirac"));
         let mut dec = reg.make_decoder(&cp).expect("make decoder");
         let packet = Packet::new(0, TimeBase::new(1, 25), stream);
@@ -487,7 +487,7 @@ fn intra_then_inter_residue_q0_legall_is_bit_exact_on_translate() {
     let stream = encode_intra_then_inter_stream(&seq, &intra_params, &inter_params, &intra, &inter);
 
     let mut reg = CodecRegistry::new();
-    oxideav_dirac::register(&mut reg);
+    oxideav_dirac::register_codecs(&mut reg);
     let cp = CodecParameters::video(CodecId::new("dirac"));
     let mut dec = reg.make_decoder(&cp).expect("make decoder");
     let packet = Packet::new(0, TimeBase::new(1, 25), stream);

@@ -28,7 +28,7 @@ fn encode_then_decode_lossless_q0_64x64_yuv420() {
 
     // Pipe through the decoder.
     let mut reg = CodecRegistry::new();
-    oxideav_dirac::register(&mut reg);
+    oxideav_dirac::register_codecs(&mut reg);
     let cp = CodecParameters::video(CodecId::new("dirac"));
     let mut dec = reg.make_decoder(&cp).expect("decoder");
     let packet = Packet::new(0, TimeBase::new(1, 25), stream);
@@ -89,7 +89,7 @@ fn encode_then_decode_lossy_q8_psnr_is_reasonable() {
     }
     let stream = encode_single_hq_intra_stream(&seq, &params, 0, &y_flat, &u_flat, &v_flat);
     let mut reg = CodecRegistry::new();
-    oxideav_dirac::register(&mut reg);
+    oxideav_dirac::register_codecs(&mut reg);
     let cp = CodecParameters::video(CodecId::new("dirac"));
     let mut dec = reg.make_decoder(&cp).expect("decoder");
     let packet = Packet::new(0, TimeBase::new(1, 25), stream);
@@ -134,7 +134,7 @@ fn encode_then_decode_ld_qindex0_psnr_over_35() {
     let stream = encode_single_ld_intra_stream(&seq, &params, 0, &y_flat, &u_flat, &v_flat);
 
     let mut reg = CodecRegistry::new();
-    oxideav_dirac::register(&mut reg);
+    oxideav_dirac::register_codecs(&mut reg);
     let cp = CodecParameters::video(CodecId::new("dirac"));
     let mut dec = reg.make_decoder(&cp).expect("decoder");
     let packet = Packet::new(0, TimeBase::new(1, 25), stream);

@@ -52,7 +52,7 @@ fn synth_plane(w: usize, h: usize, seed: u32) -> Vec<u8> {
 /// frame is not 8-bit planar.
 fn decode_one(stream: Vec<u8>) -> oxideav_core::VideoFrame {
     let mut reg = CodecRegistry::new();
-    oxideav_dirac::register(&mut reg);
+    oxideav_dirac::register_codecs(&mut reg);
     let cp = CodecParameters::video(CodecId::new("dirac"));
     let mut dec = reg.make_decoder(&cp).expect("make decoder");
     let pkt = Packet::new(0, TimeBase::new(1, 25), stream);
@@ -230,7 +230,7 @@ fn hq_q0_lossless_three_frame_multi_stream() {
     let stream = encode_hq_intra_multi_stream(&seq, &params, &pics);
 
     let mut reg = CodecRegistry::new();
-    oxideav_dirac::register(&mut reg);
+    oxideav_dirac::register_codecs(&mut reg);
     let cp = CodecParameters::video(CodecId::new("dirac"));
     let mut dec = reg.make_decoder(&cp).expect("decoder");
     let pkt = Packet::new(0, TimeBase::new(1, 25), stream);

@@ -743,7 +743,7 @@ mod tests {
         let stream = encode_single_core_intra_stream(&seq, &params, 0, &y, &u, &v);
 
         let mut reg = CodecRegistry::new();
-        crate::register(&mut reg);
+        crate::register_codecs(&mut reg);
         let cp = CodecParameters::video(CodecId::new("dirac"));
         let mut dec = reg.make_decoder(&cp).expect("decoder");
         let packet = Packet::new(0, TimeBase::new(1, 25), stream);

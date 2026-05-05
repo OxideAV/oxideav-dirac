@@ -47,7 +47,7 @@ fn core_intra_self_roundtrip_yuv420_synth_testsrc() {
     let stream = encode_single_core_intra_stream(&seq, &params, 0, &y, &u, &v);
 
     let mut reg = CodecRegistry::new();
-    oxideav_dirac::register(&mut reg);
+    oxideav_dirac::register_codecs(&mut reg);
     let cp = CodecParameters::video(CodecId::new("dirac"));
     let mut dec = reg.make_decoder(&cp).expect("decoder");
     let packet = Packet::new(0, TimeBase::new(1, 25), stream);
@@ -82,7 +82,7 @@ fn core_intra_self_roundtrip_constant_frame_is_bit_exact() {
     let stream = encode_single_core_intra_stream(&seq, &params, 0, &y, &u, &v);
 
     let mut reg = CodecRegistry::new();
-    oxideav_dirac::register(&mut reg);
+    oxideav_dirac::register_codecs(&mut reg);
     let cp = CodecParameters::video(CodecId::new("dirac"));
     let mut dec = reg.make_decoder(&cp).expect("decoder");
     let packet = Packet::new(0, TimeBase::new(1, 25), stream);
@@ -122,7 +122,7 @@ fn core_intra_then_two_inter_chain_decodes_each_frame() {
         encode_core_intra_then_inter_stream(&seq, &intra_params, &inter_params, &intra, &inter);
 
     let mut reg = CodecRegistry::new();
-    oxideav_dirac::register(&mut reg);
+    oxideav_dirac::register_codecs(&mut reg);
     let cp = CodecParameters::video(CodecId::new("dirac"));
     let mut dec = reg.make_decoder(&cp).expect("decoder");
     let packet = Packet::new(0, TimeBase::new(1, 25), stream);

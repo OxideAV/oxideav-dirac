@@ -124,13 +124,13 @@ pub mod video_format;
 pub mod wavelet;
 
 use oxideav_core::{CodecCapabilities, CodecId, CodecTag};
-use oxideav_core::{CodecInfo, CodecRegistry};
+use oxideav_core::{CodecInfo, CodecRegistry, RuntimeContext};
 
 /// Canonical oxideav codec id.
 pub const CODEC_ID_STR: &str = "dirac";
 
 /// Register the Dirac decoder with a codec registry.
-pub fn register(reg: &mut CodecRegistry) {
+pub fn register_codecs(reg: &mut CodecRegistry) {
     // Core-syntax inter pictures with OBMC motion compensation are
     // implemented, so we no longer advertise `intra_only`.
     let caps = CodecCapabilities::video("dirac_sw")
@@ -145,4 +145,32 @@ pub fn register(reg: &mut CodecRegistry) {
             // own; the container tag is what the registry matches on.
             .tag(CodecTag::fourcc(b"drac")),
     );
+}
+
+/// Unified registration entry point: install the Dirac codec factories
+/// into the codec sub-registry of a [`RuntimeContext`].
+///
+/// This is the preferred entry point for new code — it matches the
+/// convention every sibling crate now follows. Direct callers that need
+/// only the codec sub-registry can keep using [`register_codecs`].
+pub fn register(ctx: &mut RuntimeContext) {
+    register_codecs(&mut ctx.codecs);
+}
+
+#[cfg(test)]
+mod register_tests {
+    use super::*;
+    use oxideav_core::{CodecId, CodecParameters, RuntimeContext};
+
+    #[test]
+    fn register_via_runtime_context_installs_codec_factory() {
+        let mut ctx = RuntimeContext::new();
+        register(&mut ctx);
+        let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+        let dec = ctx
+            .codecs
+            .make_decoder(&params)
+            .expect("dirac decoder factory");
+        assert_eq!(dec.codec_id().as_str(), CODEC_ID_STR);
+    }
 }

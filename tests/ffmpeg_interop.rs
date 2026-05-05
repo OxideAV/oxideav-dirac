@@ -71,7 +71,7 @@ fn parse_info_offsets_link_forward() {
 #[test]
 fn decoder_produces_first_frame_from_hq_vc2_intra() {
     let mut reg = CodecRegistry::new();
-    oxideav_dirac::register(&mut reg);
+    oxideav_dirac::register_codecs(&mut reg);
     let params = CodecParameters::video(CodecId::new("dirac"));
     let mut dec = reg.make_decoder(&params).expect("decoder");
     let packet = Packet::new(0, TimeBase::new(1, 25), TINY.to_vec());
@@ -167,7 +167,7 @@ fn ffmpeg_10bit_yuv420_produces_yuv420p10le_frame() {
     let data = std::fs::read(&tmp).expect("read generated fixture");
 
     let mut reg = CodecRegistry::new();
-    oxideav_dirac::register(&mut reg);
+    oxideav_dirac::register_codecs(&mut reg);
     let params = CodecParameters::video(CodecId::new("dirac"));
     let mut dec = reg.make_decoder(&params).expect("decoder");
     let packet = oxideav_core::Packet::new(0, oxideav_core::TimeBase::new(1, 25), data);
@@ -223,7 +223,7 @@ fn ffmpeg_8bit_yuv422_produces_yuv422p_frame() {
     let data = std::fs::read(&tmp).expect("read generated fixture");
 
     let mut reg = CodecRegistry::new();
-    oxideav_dirac::register(&mut reg);
+    oxideav_dirac::register_codecs(&mut reg);
     let params = CodecParameters::video(CodecId::new("dirac"));
     let mut dec = reg.make_decoder(&params).expect("decoder");
     let packet = oxideav_core::Packet::new(0, oxideav_core::TimeBase::new(1, 25), data);
