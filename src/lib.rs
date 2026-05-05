@@ -153,9 +153,16 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
 /// This is the preferred entry point for new code — it matches the
 /// convention every sibling crate now follows. Direct callers that need
 /// only the codec sub-registry can keep using [`register_codecs`].
+///
+/// Also auto-registered into [`oxideav_core::REGISTRARS`] via the
+/// [`oxideav_core::register!`] macro below so consumers calling
+/// [`oxideav_core::RuntimeContext::with_all_features`] pick Dirac up
+/// without any explicit umbrella plumbing.
 pub fn register(ctx: &mut RuntimeContext) {
     register_codecs(&mut ctx.codecs);
 }
+
+oxideav_core::register!("dirac", register);
 
 #[cfg(test)]
 mod register_tests {
