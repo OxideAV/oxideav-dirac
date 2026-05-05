@@ -54,7 +54,7 @@ fn decode_one(stream: Vec<u8>) -> oxideav_core::VideoFrame {
     let mut reg = CodecRegistry::new();
     oxideav_dirac::register_codecs(&mut reg);
     let cp = CodecParameters::video(CodecId::new("dirac"));
-    let mut dec = reg.make_decoder(&cp).expect("make decoder");
+    let mut dec = reg.first_decoder(&cp).expect("make decoder");
     let pkt = Packet::new(0, TimeBase::new(1, 25), stream);
     dec.send_packet(&pkt).expect("send packet");
     match dec.receive_frame().expect("receive frame") {
@@ -232,7 +232,7 @@ fn hq_q0_lossless_three_frame_multi_stream() {
     let mut reg = CodecRegistry::new();
     oxideav_dirac::register_codecs(&mut reg);
     let cp = CodecParameters::video(CodecId::new("dirac"));
-    let mut dec = reg.make_decoder(&cp).expect("decoder");
+    let mut dec = reg.first_decoder(&cp).expect("decoder");
     let pkt = Packet::new(0, TimeBase::new(1, 25), stream);
     dec.send_packet(&pkt).expect("send_packet");
 

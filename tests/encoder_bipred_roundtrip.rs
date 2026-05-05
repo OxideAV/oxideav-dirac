@@ -128,7 +128,7 @@ fn decode_stream(stream: Vec<u8>) -> Vec<oxideav_core::VideoFrame> {
     let mut reg = CodecRegistry::new();
     oxideav_dirac::register_codecs(&mut reg);
     let cp = CodecParameters::video(CodecId::new("dirac"));
-    let mut dec = reg.make_decoder(&cp).expect("decoder");
+    let mut dec = reg.first_decoder(&cp).expect("decoder");
     let packet = Packet::new(0, TimeBase::new(1, 25), stream);
     dec.send_packet(&packet).expect("send_packet");
     let mut out = Vec::new();

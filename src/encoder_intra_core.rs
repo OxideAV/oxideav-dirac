@@ -745,7 +745,7 @@ mod tests {
         let mut reg = CodecRegistry::new();
         crate::register_codecs(&mut reg);
         let cp = CodecParameters::video(CodecId::new("dirac"));
-        let mut dec = reg.make_decoder(&cp).expect("decoder");
+        let mut dec = reg.first_decoder(&cp).expect("decoder");
         let packet = Packet::new(0, TimeBase::new(1, 25), stream);
         dec.send_packet(&packet).expect("send_packet");
         let frame = dec.receive_frame().expect("receive_frame");

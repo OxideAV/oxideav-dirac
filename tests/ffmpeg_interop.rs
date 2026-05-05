@@ -73,7 +73,7 @@ fn decoder_produces_first_frame_from_hq_vc2_intra() {
     let mut reg = CodecRegistry::new();
     oxideav_dirac::register_codecs(&mut reg);
     let params = CodecParameters::video(CodecId::new("dirac"));
-    let mut dec = reg.make_decoder(&params).expect("decoder");
+    let mut dec = reg.first_decoder(&params).expect("decoder");
     let packet = Packet::new(0, TimeBase::new(1, 25), TINY.to_vec());
     dec.send_packet(&packet).expect("send_packet");
     let frame = dec.receive_frame().expect("receive_frame");
@@ -169,7 +169,7 @@ fn ffmpeg_10bit_yuv420_produces_yuv420p10le_frame() {
     let mut reg = CodecRegistry::new();
     oxideav_dirac::register_codecs(&mut reg);
     let params = CodecParameters::video(CodecId::new("dirac"));
-    let mut dec = reg.make_decoder(&params).expect("decoder");
+    let mut dec = reg.first_decoder(&params).expect("decoder");
     let packet = oxideav_core::Packet::new(0, oxideav_core::TimeBase::new(1, 25), data);
     dec.send_packet(&packet).expect("send_packet");
     let frame = dec.receive_frame().expect("receive_frame");
@@ -225,7 +225,7 @@ fn ffmpeg_8bit_yuv422_produces_yuv422p_frame() {
     let mut reg = CodecRegistry::new();
     oxideav_dirac::register_codecs(&mut reg);
     let params = CodecParameters::video(CodecId::new("dirac"));
-    let mut dec = reg.make_decoder(&params).expect("decoder");
+    let mut dec = reg.first_decoder(&params).expect("decoder");
     let packet = oxideav_core::Packet::new(0, oxideav_core::TimeBase::new(1, 25), data);
     dec.send_packet(&packet).expect("send_packet");
     let frame = dec.receive_frame().expect("receive_frame");
