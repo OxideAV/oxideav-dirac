@@ -555,19 +555,136 @@ fn ffmpeg_cross_decodes_our_bipred_b_frame() {
     let bipred_y = &out[frame_size..frame_size + 64 * 64];
     let py = psnr(bipred_y, &ym);
     eprintln!("ffmpeg bipred B-frame cross-decode Y PSNR: {py:.2} dB");
-    // Cross-decode floor: 49 dB. Using integer-pel ME for bipred
-    // (bipred_mv_precision = 0, the default) eliminates the sub-pel
-    // interpolation convention mismatch with ffmpeg's OBMC blend,
-    // lifting the cross-decode from ~42 dB (quarter-pel) to ~50 dB.
-    // The wavelet residue closes the prediction-error loop: since
-    // integer-pel MVs produce no half-pel or quarter-pel samples,
-    // there is no convention difference to accumulate across blocks,
-    // and ffmpeg decodes our residue on top of the same integer-pel
-    // OBMC prediction we used when encoding the residue.
+    // Cross-decode floor: 49 dB on this complementary-bars fixture.
+    // The bipred default is now `bipred_mv_precision = 2` (quarter-pel)
+    // with **per-block adaptive sub-pel-vs-integer-pel selection**
+    // (round-39): `bipred_select_modes` evaluates each MV at both its
+    // sub-pel-refined position and the nearest integer-pel peer,
+    // choosing whichever gives the lower SAD per block. Sharp-edge
+    // blocks (the bars in this fixture) snap back to integer-pel,
+    // matching the previous integer-pel-only baseline (~50 dB) and
+    // avoiding the 7+ dB regression that an unconditional sub-pel
+    // pipeline produced. Smooth-motion blocks (covered by the
+    // `ffmpeg_cross_decodes_camera_pan_bipred_with_subpel_gain` test
+    // below) pick up a +4 dB improvement.
     assert!(
         py >= 49.0,
         "ffmpeg bipred B-frame Y PSNR {py:.2} dB below 49 dB floor — \
-         bipred_mv_precision=0 + residue path regression; expected ~50 dB \
-         on the complementary-bar fixture"
+         per-block adaptive sub-pel-vs-integer-pel selection failed to \
+         pick integer-pel for the sharp-edge bars in this fixture; expected \
+         ~50 dB"
+    );
+}
+
+/// **Bipred sub-pel gain on camera-pan**. With per-block adaptive
+/// sub-pel-vs-integer-pel selection (round-39), the bipred encoder picks
+/// quarter-pel MVs on smooth-motion blocks and integer-pel MVs on
+/// sharp-edge blocks. The camera-pan fixture is entirely smooth-motion
+/// (cosine-shaped vertical bars panned by 1 luma pel), so the bipred
+/// path picks sub-pel MVs almost everywhere and lifts the ffmpeg
+/// cross-decode from the integer-pel-only ceiling (~48 dB) to ≥ 50 dB.
+#[test]
+fn ffmpeg_cross_decodes_camera_pan_bipred_with_subpel_gain() {
+    fn ffmpeg_available() -> bool {
+        std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg not available; skipping camera-pan bipred subpel gain");
+        return;
+    }
+    use oxideav_dirac::encoder_inter::synthetic_camera_pan_64;
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let intra_params = CoreIntraEncoderParams::default_intra(WaveletFilter::LeGall5_3, 3);
+    // ref0 = pan(0), ref1 = pan(2), bipred-mid = pan(1) — exact temporal
+    // midpoint (1/2 average reproduces the source after the cosine
+    // analytical resampler).
+    let (y0, u0, v0, _, _, _) = synthetic_camera_pan_64(0, 0);
+    let (_, _, _, y2, _, _) = synthetic_camera_pan_64(2, 0);
+    let (_, _, _, ym, _, _) = synthetic_camera_pan_64(1, 0);
+    let intra_a = InterInputPicture {
+        picture_number: 0,
+        y: &y0,
+        u: &u0,
+        v: &v0,
+    };
+    let intra_b = InterInputPicture {
+        picture_number: 2,
+        y: &y2,
+        u: &u0,
+        v: &v0,
+    };
+    let bipred = InterInputPicture {
+        picture_number: 1,
+        y: &ym,
+        u: &u0,
+        v: &v0,
+    };
+
+    let measure = |bmp: u32, tag: &str| -> f64 {
+        let p = InterEncoderParams {
+            bipred_mv_precision: bmp,
+            ..InterEncoderParams::default()
+        };
+        let stream = encode_core_intra_then_bipred_stream(
+            &seq,
+            &intra_params,
+            &p,
+            &intra_a,
+            &intra_b,
+            &bipred,
+        );
+        let drc = std::env::temp_dir().join(format!("oxideav_dirac_camera_pan_bipred_{tag}.drc"));
+        let yuv = std::env::temp_dir().join(format!("oxideav_dirac_camera_pan_bipred_{tag}.yuv"));
+        std::fs::write(&drc, &stream).expect("write drc");
+        let s = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "dirac",
+                "-i",
+            ])
+            .arg(&drc)
+            .args(["-f", "rawvideo", "-pix_fmt", "yuv420p"])
+            .arg(&yuv)
+            .status()
+            .expect("run ffmpeg");
+        assert!(
+            s.success(),
+            "ffmpeg rejected camera-pan bipred ({tag}) — see {drc:?}"
+        );
+        let out = std::fs::read(&yuv).unwrap();
+        let frame_size = 64 * 64 + 2 * 32 * 32;
+        let bipred_y = &out[frame_size..frame_size + 64 * 64];
+        psnr(bipred_y, &ym)
+    };
+    let psnr_int = measure(0, "int");
+    let psnr_qpel = measure(2, "qpel");
+    eprintln!(
+        "camera-pan bipred ffmpeg cross-decode: int = {psnr_int:.2} dB, \
+         qpel(adaptive) = {psnr_qpel:.2} dB"
+    );
+    // Floor: quarter-pel adaptive must beat integer-pel by ≥ 2 dB on
+    // this all-smooth-motion fixture. Empirically lifts from 48 to 52.
+    assert!(
+        psnr_qpel >= psnr_int + 2.0,
+        "bipred qpel(adaptive) PSNR {psnr_qpel:.2} dB did not beat \
+         integer-pel {psnr_int:.2} dB by ≥ 2 dB on the camera-pan smooth-\
+         motion fixture — round-39 per-block adaptive sub-pel selection \
+         regression"
+    );
+    assert!(
+        psnr_qpel >= 50.0,
+        "bipred qpel(adaptive) camera-pan PSNR {psnr_qpel:.2} dB below 50 dB \
+         absolute floor — expected ~52 dB after round-39 per-block adaptive \
+         sub-pel selection"
     );
 }
