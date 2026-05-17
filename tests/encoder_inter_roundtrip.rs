@@ -571,3 +571,148 @@ fn residue_none_emits_zero_residual_true() {
     assert_eq!(&with_res_stream[..4], BBCD);
     assert_eq!(no_res_stream[4], with_res_stream[4]);
 }
+
+/// **Round-73 per-block adaptive sub-pel-vs-integer-pel selection
+/// (1-ref path)**. With `inter_adaptive_int_pel = true` (the default)
+/// the encoder evaluates each block's MV at both its sub-pel-refined
+/// position and the nearest integer-pel-rounded peer, picking
+/// whichever gives lower OBMC SSE — a strict superset of the
+/// pre-round-73 sub-pel-only candidate set. The OBMC-aware
+/// refinement (`obmc_refine_passes`) then runs on the chosen MV
+/// grid.
+///
+/// On the integer-pel-translation fixture `synthetic_translating_pair_64(2, -1)`
+/// the bright square's hard edge falls across OBMC overlap regions:
+/// every sub-pel candidate at non-integer offsets introduces 8-tap-filter
+/// smoothing that blurs the edge in the blended reconstruction. The
+/// adaptive selector identifies those blocks and snaps them back to
+/// integer-pel, **without** harming smooth-content blocks (the
+/// per-block min-of-two-SSEs invariant guarantees no per-block
+/// regression — see `inter_select_int_pel_monotonic_per_block_obmc_sse`).
+///
+/// We measure end-to-end self-roundtrip PSNR with residue OFF (so the
+/// gain measures pure ME quality, not residue compensation) and
+/// assert the adaptive path does not regress versus the legacy
+/// always-sub-pel path. A non-regression on integer-pel content is
+/// the load-bearing acceptance — the win cases sit on real video
+/// content with sharp text/occluders that fall outside synthetic
+/// 64×64 fixtures.
+#[test]
+fn intra_then_inter_adaptive_int_pel_does_not_regress_subpel() {
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let intra_params = EncoderParams::default_hq(WaveletFilter::LeGall5_3, 3);
+
+    // Integer-pel translation by (+2, -1) — the same fixture the
+    // OBMC-refinement A/B test uses. Hard-edge content where the
+    // adaptive selector either snaps to int-pel (better) or keeps
+    // sub-pel (tied or better — never worse).
+    let (y0, u0, v0, y1, u1, v1) = synthetic_translating_pair_64(2, -1);
+    let intra = InterInputPicture {
+        picture_number: 0,
+        y: &y0,
+        u: &u0,
+        v: &v0,
+    };
+    let inter = InterInputPicture {
+        picture_number: 1,
+        y: &y1,
+        u: &u1,
+        v: &v1,
+    };
+
+    let decode_psnr = |inter_params: &InterEncoderParams| -> f64 {
+        let stream =
+            encode_intra_then_inter_stream(&seq, &intra_params, inter_params, &intra, &inter);
+        let mut reg = CodecRegistry::new();
+        oxideav_dirac::register_codecs(&mut reg);
+        let cp = CodecParameters::video(CodecId::new("dirac"));
+        let mut dec = reg.first_decoder(&cp).expect("make decoder");
+        let packet = Packet::new(0, TimeBase::new(1, 25), stream);
+        dec.send_packet(&packet).expect("send_packet");
+        let _intra_frame = dec.receive_frame().expect("intra frame");
+        let inter_frame = match dec.receive_frame().expect("inter frame") {
+            Frame::Video(vf) => vf,
+            other => panic!("expected video, got {other:?}"),
+        };
+        psnr(&inter_frame.planes[0].data, &y1)
+    };
+
+    // Baseline: legacy always-sub-pel path. Residue OFF so the PSNR
+    // measures pure ME quality (residue at qindex=0 would close the
+    // loop bit-exactly and hide the adaptive-selector contribution
+    // entirely).
+    let legacy_params = InterEncoderParams {
+        mv_precision: 2,
+        inter_adaptive_int_pel: false,
+        residue: None,
+        ..InterEncoderParams::default()
+    };
+    let psnr_legacy = decode_psnr(&legacy_params);
+
+    // New default: adaptive selector ON. All other knobs match.
+    let adaptive_params = InterEncoderParams {
+        mv_precision: 2,
+        inter_adaptive_int_pel: true,
+        residue: None,
+        ..InterEncoderParams::default()
+    };
+    let psnr_adaptive = decode_psnr(&adaptive_params);
+
+    eprintln!(
+        "translate(+2,-1) self-roundtrip: legacy sub-pel-only PSNR Y = {psnr_legacy:.2} dB, \
+         round-73 adaptive int-pel PSNR Y = {psnr_adaptive:.2} dB"
+    );
+    // Round-73 acceptance: adaptive must NOT regress the legacy path,
+    // on any fixture. This is the strict-superset invariant translated
+    // to picture-level PSNR. A 0.1 dB tolerance allows for floating-
+    // point rounding in the PSNR computation; the per-block SSE
+    // invariant (`inter_select_int_pel_monotonic_per_block_obmc_sse`)
+    // is the bit-precise guarantee.
+    assert!(
+        psnr_adaptive + 0.1 >= psnr_legacy,
+        "adaptive int-pel selector regressed PSNR by > 0.1 dB on the \
+         translate(+2,-1) fixture: legacy = {psnr_legacy:.2} dB, \
+         adaptive = {psnr_adaptive:.2} dB (round-73 strict-superset \
+         invariant broken — selector must never pick a worse MV than \
+         the sub-pel baseline)"
+    );
+}
+
+/// **Round-73 — `inter_adaptive_int_pel = false` is deterministic
+/// and serves as the regression-safety knob**. Encoding the same
+/// fixture twice with the flag explicitly off must produce
+/// byte-identical streams (no hidden state). This lets downstream
+/// callers pin the pre-round-73 behaviour for golden-file tests.
+#[test]
+fn inter_adaptive_int_pel_disabled_is_deterministic() {
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let intra_params = EncoderParams::default_hq(WaveletFilter::LeGall5_3, 3);
+    let legacy_params = InterEncoderParams {
+        mv_precision: 2,
+        inter_adaptive_int_pel: false,
+        obmc_refine_passes: 0,
+        residue: None,
+        ..InterEncoderParams::default()
+    };
+    let (y0, u0, v0, y1, u1, v1) = synthetic_translating_pair_64(2, -1);
+    let intra = InterInputPicture {
+        picture_number: 0,
+        y: &y0,
+        u: &u0,
+        v: &v0,
+    };
+    let inter = InterInputPicture {
+        picture_number: 1,
+        y: &y1,
+        u: &u1,
+        v: &v1,
+    };
+    let legacy_stream_a =
+        encode_intra_then_inter_stream(&seq, &intra_params, &legacy_params, &intra, &inter);
+    let legacy_stream_b =
+        encode_intra_then_inter_stream(&seq, &intra_params, &legacy_params, &intra, &inter);
+    assert_eq!(
+        legacy_stream_a, legacy_stream_b,
+        "encoder must be deterministic with `inter_adaptive_int_pel = false`"
+    );
+}

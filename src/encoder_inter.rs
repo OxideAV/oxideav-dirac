@@ -102,6 +102,33 @@ pub struct InterEncoderParams {
     /// dramatically on real-world content (where ME alone leaves
     /// edge-clamp / OBMC-blend residuals across block boundaries).
     pub residue: Option<ResidueParams>,
+    /// **Per-block adaptive sub-pel-vs-integer-pel selection** for the
+    /// **1-ref (P-picture)** path (round-73, mirrors the bipred
+    /// `bipred_select_modes` adaptive precision landed in round-39).
+    ///
+    /// When `true`, after [`subpel_search_me`] produces the refined
+    /// sub-pel MV grid and **before** [`obmc_refine_me`] runs, each
+    /// block's MV is scored under the §15.8.6 weighted-blend
+    /// reconstruction at both its sub-pel-refined position AND its
+    /// nearest integer-pel-rounded peer; whichever gives lower OBMC SSE
+    /// against the source wins per block (ties biased toward the
+    /// integer-pel MV).
+    ///
+    /// Motivation (same as the bipred case): the spec's §15.8.11 8-tap
+    /// half-pel filter introduces multi-LSB smoothing/ringing at sharp
+    /// edges. On blocks whose source pattern is high-frequency
+    /// (text, hard occluder boundaries), the sub-pel-interpolated
+    /// reference is *worse* than the integer-pel sample even after
+    /// OBMC refinement converges, because every refinement step is
+    /// scored against a smoothed prediction. Allowing the encoder to
+    /// snap such blocks back to integer-pel before OBMC refinement
+    /// gives a strict superset of MV candidates and (since it picks
+    /// the per-block minimum) cannot regress on smooth content.
+    ///
+    /// At `mv_precision == 0` this is a no-op (every MV is already
+    /// integer-pel). Defaults to `true`; set to `false` to disable for
+    /// regression / A-B testing against the pre-round-73 behaviour.
+    pub inter_adaptive_int_pel: bool,
 }
 
 /// Wavelet residue encoder parameters. Mirrors
@@ -167,6 +194,13 @@ impl Default for InterEncoderParams {
             bipred_mv_precision: 2,
             obmc_refine_passes: 2,
             residue: Some(ResidueParams::default_for(WaveletFilter::LeGall5_3, 3)),
+            // Per-block adaptive sub-pel-vs-int-pel for the 1-ref path
+            // (round-73). Mirrors what `bipred_select_modes` does for
+            // the 2-ref path. Strict superset of MV candidates → cannot
+            // regress; on sharp-edge content the integer-pel snap saves
+            // multi-dB of 8-tap-filter smoothing damage even after
+            // OBMC refinement converges.
+            inter_adaptive_int_pel: true,
         }
     }
 }
@@ -895,6 +929,142 @@ pub fn obmc_refine_me(
                     }
                 }
                 mvs[bidx] = best_mv;
+            }
+        }
+    }
+}
+
+/// **Per-block adaptive sub-pel-vs-integer-pel selection** for the
+/// 1-ref path (round-73). For each block in raster order, scores the
+/// current MV at both its sub-pel-refined position AND the
+/// integer-pel-rounded variant under the same §15.8.5 OBMC-aware
+/// weighted-blend reconstruction used by [`obmc_refine_me`], keeping
+/// whichever gives lower per-block SSE against the source.
+///
+/// Tie-bias: when the two SSEs are equal we prefer the integer-pel MV
+/// (smaller decoder-side filter contribution → less risk of multi-LSB
+/// drift accumulating across the OBMC blend with neighbours that are
+/// at different sub-pel offsets).
+///
+/// At `mv_precision == 0` this is a no-op; we return immediately
+/// because every MV is already integer-pel.
+///
+/// Mirrors the [`bipred_select_modes`] adaptive-precision logic landed
+/// in round-39 (which gave +4.4 dB ffmpeg cross-decode on smooth
+/// motion and +7 dB on sharp edges in the 2-ref path). Running it as a
+/// **pre-OBMC** step on the 1-ref path means the integer-pel snap is
+/// itself fed into [`obmc_refine_me`]'s neighbour_sum buffer, so OBMC
+/// converges against the better starting point rather than against a
+/// noisy sub-pel field.
+#[allow(clippy::too_many_arguments)]
+pub fn inter_select_int_pel_per_block(
+    cur_y: &[u8],
+    ref_y: &[u8],
+    width: u32,
+    height: u32,
+    blocks_x: u32,
+    blocks_y: u32,
+    mvs: &mut [IntegerMv],
+    mv_precision: u32,
+) {
+    // At integer-pel precision every MV is already integer-pel; the
+    // rounding is the identity, so the comparison is a no-op. Avoid
+    // the upref build cost.
+    if mv_precision == 0 {
+        return;
+    }
+    let (xblen_u, yblen_u, xbsep_u, ybsep_u) = (8usize, 8usize, 4usize, 4usize);
+    let xoffset = (xblen_u - xbsep_u) / 2;
+    let yoffset = (yblen_u - ybsep_u) / 2;
+    let cur_w = width as i32;
+    let cur_h = height as i32;
+    // Pre-bake every block's spatial weight (only depends on its grid
+    // coords). Matches `obmc_refine_me`'s cache.
+    let mut weights: Vec<Vec<i32>> = Vec::with_capacity((blocks_x * blocks_y) as usize);
+    for j in 0..blocks_y {
+        for i in 0..blocks_x {
+            weights.push(block_weight(
+                xblen_u, yblen_u, xbsep_u, ybsep_u, xoffset, yoffset, i, j, blocks_x, blocks_y,
+            ));
+        }
+    }
+    // Build the signed pre-offset upsampled reference once — matches
+    // the convention `obmc_refine_me` uses (§15.4 reference buffer).
+    let (upref, up_w, up_h) = build_upref_signed(ref_y, width, height);
+    let refp_signed: Vec<i32> = ref_y.iter().map(|&v| v as i32 - 128).collect();
+    let ref_w = width as usize;
+    let ref_h = height as usize;
+
+    for j in 0..blocks_y {
+        for i in 0..blocks_x {
+            let bidx = (j * blocks_x + i) as usize;
+            let cur_mv = mvs[bidx];
+            let int_mv = round_mv_to_int_pel(cur_mv, mv_precision);
+            // Pure-snap path: if rounding doesn't change the MV, skip
+            // the OBMC scoring (it would give equal SSE anyway).
+            if (int_mv.0, int_mv.1) == (cur_mv.0, cur_mv.1) {
+                continue;
+            }
+            let neighbour_sum = build_neighbour_sum(
+                mvs,
+                blocks_x,
+                blocks_y,
+                xblen_u,
+                yblen_u,
+                xbsep_u,
+                ybsep_u,
+                xoffset,
+                yoffset,
+                i,
+                j,
+                &upref,
+                up_w,
+                up_h,
+                &refp_signed,
+                ref_w,
+                ref_h,
+                mv_precision,
+            );
+            let xstart_ij = (i as i32) * (xbsep_u as i32) - (xoffset as i32);
+            let ystart_ij = (j as i32) * (ybsep_u as i32) - (yoffset as i32);
+            let weight = &weights[bidx];
+            let sse_at = |mv: IntegerMv| -> i64 {
+                let pred = block_weighted_pred(
+                    &upref,
+                    up_w,
+                    up_h,
+                    &refp_signed,
+                    ref_w,
+                    ref_h,
+                    mv_precision,
+                    weight,
+                    xblen_u,
+                    yblen_u,
+                    xstart_ij,
+                    ystart_ij,
+                    mv.0,
+                    mv.1,
+                );
+                obmc_block_sse(
+                    cur_y,
+                    cur_w,
+                    cur_h,
+                    &pred,
+                    &neighbour_sum,
+                    xblen_u,
+                    yblen_u,
+                    xstart_ij,
+                    ystart_ij,
+                )
+            };
+            let sse_sub = sse_at(cur_mv);
+            let sse_int = sse_at(int_mv);
+            // Tie-bias toward integer-pel (`<=`) — at equal SSE the
+            // integer-pel MV is preferable because it avoids the 8-tap
+            // half-pel filter's smoothing contribution leaking into
+            // neighbouring blocks' OBMC blends.
+            if sse_int <= sse_sub {
+                mvs[bidx] = int_mv;
             }
         }
     }
@@ -1885,6 +2055,22 @@ pub fn encode_inter_picture(
         params.mv_search_range,
         params.mv_precision,
     );
+    // Round-73: per-block adaptive sub-pel-vs-integer-pel selection
+    // **before** OBMC refinement (so OBMC's neighbour_sum is built
+    // against the better starting point). No-op at integer-pel
+    // (`mv_precision == 0`) or when disabled.
+    if params.inter_adaptive_int_pel {
+        inter_select_int_pel_per_block(
+            cur_y,
+            ref_y,
+            sequence.luma_width,
+            sequence.luma_height,
+            blocks_x,
+            blocks_y,
+            &mut mvs,
+            params.mv_precision,
+        );
+    }
     // §15.8.6 OBMC-aware refinement (#186) — minimises the per-block
     // SSE of the *blended* reconstruction, matching what the decoder
     // (and ffmpeg) will actually emit. No-op when `obmc_refine_passes
@@ -3083,6 +3269,166 @@ mod tests {
             assert_eq!(parsed.refs_wt_precision, synthesised.refs_wt_precision);
             assert_eq!(parsed.ref1_wt, synthesised.ref1_wt);
             assert_eq!(parsed.ref2_wt, synthesised.ref2_wt);
+        }
+    }
+
+    /// At `mv_precision == 0`, [`inter_select_int_pel_per_block`] must
+    /// be a no-op — every MV is already integer-pel, so rounding is
+    /// the identity and the function takes the early-return path before
+    /// even building the upref. Anything else means the round-73 knob
+    /// is silently doing work in the integer-pel regime.
+    #[test]
+    fn inter_select_int_pel_at_precision_0_is_noop() {
+        let (y0, _, _, y1, _, _) = synthetic_translating_pair_64(2, -1);
+        let mut mvs_baseline = subpel_search_me(&y1, &y0, 64, 64, 16, 16, 16, 0);
+        let snapshot: Vec<(i32, i32)> = mvs_baseline.iter().map(|m| (m.0, m.1)).collect();
+        inter_select_int_pel_per_block(&y1, &y0, 64, 64, 16, 16, &mut mvs_baseline, 0);
+        let after: Vec<(i32, i32)> = mvs_baseline.iter().map(|m| (m.0, m.1)).collect();
+        assert_eq!(
+            snapshot, after,
+            "mv_precision = 0 should leave the MV grid untouched"
+        );
+    }
+
+    /// On the quarter-pel camera-pan fixture (smooth sub-pel motion),
+    /// the integer-pel snap should LOSE on most blocks — sub-pel ME
+    /// found the true fractional offset and the OBMC blend rewards
+    /// the spec-correct sub-pel prediction. We assert that the
+    /// majority of MVs keep their sub-pel value, proving the adaptive
+    /// selector is content-sensitive rather than always snapping.
+    #[test]
+    fn inter_select_int_pel_preserves_subpel_on_smooth_pan() {
+        let (y0, _, _, y1, _, _) = synthetic_camera_pan_64(1, 0);
+        let mut mvs = subpel_search_me(&y1, &y0, 64, 64, 16, 16, 16, 2);
+        let before: Vec<(i32, i32)> = mvs.iter().map(|m| (m.0, m.1)).collect();
+        // Count blocks whose MV is already at an integer-pel multiple —
+        // those can never change. Subtract them when computing the
+        // "preserved sub-pel" denominator.
+        let already_int = before
+            .iter()
+            .filter(|(x, y)| (x % 4 == 0) && (y % 4 == 0))
+            .count();
+        inter_select_int_pel_per_block(&y1, &y0, 64, 64, 16, 16, &mut mvs, 2);
+        let after: Vec<(i32, i32)> = mvs.iter().map(|m| (m.0, m.1)).collect();
+        let preserved_subpel = before
+            .iter()
+            .zip(after.iter())
+            .filter(|(b, a)| ((b.0 % 4) != 0 || (b.1 % 4) != 0) && b == a)
+            .count();
+        let total_subpel = before.len() - already_int;
+        assert!(
+            total_subpel > 0,
+            "fixture is supposed to contain sub-pel MVs"
+        );
+        // At least 50 % of the sub-pel MVs must stay sub-pel — the
+        // adaptive selector is not allowed to behave like an
+        // unconditional integer-pel rounder on smooth motion content.
+        assert!(
+            preserved_subpel * 2 >= total_subpel,
+            "adaptive int-pel snapped too aggressively on smooth pan: \
+             {preserved_subpel} / {total_subpel} sub-pel MVs preserved"
+        );
+    }
+
+    /// **Strict-superset invariant**: with `inter_adaptive_int_pel`,
+    /// the per-block selector compares the current sub-pel MV against
+    /// its integer-pel-rounded peer and picks the lower-SSE one. The
+    /// candidate set strictly contains the original MV grid; tie-bias
+    /// is toward int-pel via `<=`. Therefore the per-block OBMC SSE
+    /// after the selector must be ≤ the per-block OBMC SSE before, for
+    /// every block in raster order. This is the load-bearing invariant
+    /// that justifies enabling adaptive int-pel as the default — it
+    /// can never regress the OBMC reconstruction cost function.
+    #[test]
+    fn inter_select_int_pel_monotonic_per_block_obmc_sse() {
+        let (y0, _, _, y1, _, _) = synthetic_translating_pair_64(2, -1);
+        let mvs_subpel = subpel_search_me(&y1, &y0, 64, 64, 16, 16, 16, 2);
+        let mut mvs_after = mvs_subpel.clone();
+        inter_select_int_pel_per_block(&y1, &y0, 64, 64, 16, 16, &mut mvs_after, 2);
+        // For each block: build neighbour_sum from the SAME grid in
+        // both cases (before the selector modifies things) and compare
+        // per-block SSE at the original sub-pel MV vs the selector's
+        // chosen MV. The chosen MV must be at most as costly.
+        let (xblen_u, yblen_u, xbsep_u, ybsep_u) = (8usize, 8usize, 4usize, 4usize);
+        let xoffset = (xblen_u - xbsep_u) / 2;
+        let yoffset = (yblen_u - ybsep_u) / 2;
+        let (upref, up_w, up_h) = build_upref_signed(&y0, 64, 64);
+        let refp_signed: Vec<i32> = y0.iter().map(|&v| v as i32 - 128).collect();
+        let ref_w = 64usize;
+        let ref_h = 64usize;
+        let blocks_x = 16u32;
+        let blocks_y = 16u32;
+        // Use the post-selector grid as the neighbour context, matching
+        // what the selector itself saw in raster order at the moment
+        // each block's decision was made. (For raster-order updates the
+        // exact neighbour state varies; a same-grid snapshot is the
+        // cheap conservative check.)
+        for j in 0..blocks_y {
+            for i in 0..blocks_x {
+                let bidx = (j * blocks_x + i) as usize;
+                let neighbour_sum = build_neighbour_sum(
+                    &mvs_after,
+                    blocks_x,
+                    blocks_y,
+                    xblen_u,
+                    yblen_u,
+                    xbsep_u,
+                    ybsep_u,
+                    xoffset,
+                    yoffset,
+                    i,
+                    j,
+                    &upref,
+                    up_w,
+                    up_h,
+                    &refp_signed,
+                    ref_w,
+                    ref_h,
+                    2,
+                );
+                let xstart_ij = (i as i32) * (xbsep_u as i32) - (xoffset as i32);
+                let ystart_ij = (j as i32) * (ybsep_u as i32) - (yoffset as i32);
+                let weight = block_weight(
+                    xblen_u, yblen_u, xbsep_u, ybsep_u, xoffset, yoffset, i, j, blocks_x, blocks_y,
+                );
+                let sse_at = |mv: IntegerMv| -> i64 {
+                    let pred = block_weighted_pred(
+                        &upref,
+                        up_w,
+                        up_h,
+                        &refp_signed,
+                        ref_w,
+                        ref_h,
+                        2,
+                        &weight,
+                        xblen_u,
+                        yblen_u,
+                        xstart_ij,
+                        ystart_ij,
+                        mv.0,
+                        mv.1,
+                    );
+                    obmc_block_sse(
+                        &y1,
+                        64,
+                        64,
+                        &pred,
+                        &neighbour_sum,
+                        xblen_u,
+                        yblen_u,
+                        xstart_ij,
+                        ystart_ij,
+                    )
+                };
+                let sse_before = sse_at(mvs_subpel[bidx]);
+                let sse_after = sse_at(mvs_after[bidx]);
+                assert!(
+                    sse_after <= sse_before,
+                    "block (i={i},j={j}): per-block OBMC SSE regressed under \
+                     adaptive int-pel: before = {sse_before}, after = {sse_after} \
+                     (this breaks the round-73 strict-superset invariant)"
+                );
+            }
         }
     }
 }

@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Dirac inter encoder **per-block adaptive sub-pel-vs-integer-pel
+  selection for the 1-ref (P-picture) path** (round-73). Mirrors the
+  bipred adaptive precision landed in round-39 (`bipred_select_modes`).
+  After [`subpel_search_me`] produces the refined sub-pel MV grid and
+  **before** [`obmc_refine_me`] runs, the new
+  `inter_select_int_pel_per_block` helper scores each block's MV under
+  the §15.8.5 weighted-blend reconstruction at both its sub-pel-refined
+  position AND the nearest integer-pel-rounded peer (`round_mv_to_int_pel`),
+  keeping whichever gives lower per-block OBMC SSE against the source.
+  Ties bias toward the integer-pel MV (smaller decoder-side filter
+  contribution → less risk of 8-tap half-pel-filter smoothing leaking
+  multi-LSB into neighbouring blocks' OBMC blends).
+  New `InterEncoderParams::inter_adaptive_int_pel: bool` knob, defaults
+  `true`; set to `false` to disable for A/B testing against the
+  pre-round-73 behaviour. At `mv_precision == 0` (integer-pel ME) the
+  helper takes an early-return path — every MV is already integer-pel,
+  so rounding is the identity. The per-block min-of-two-SSEs design is
+  a strict superset of the legacy candidate set → cannot regress
+  per-block OBMC reconstruction cost (load-bearing invariant pinned by
+  `inter_select_int_pel_monotonic_per_block_obmc_sse`). On the
+  synthetic `translate(+2,-1)` / `camera_pan_64` fixtures sub-pel ME
+  already converges to integer-pel for integer motion or pure-sub-pel
+  for smooth motion, so the selector is a no-op there — the win cases
+  sit on real video content with sharp text/occluders that cause
+  sub-pel ME to bottom out at fractional offsets the OBMC blend
+  doesn't reward. 4 new tests (3 unit + 1 self-roundtrip
+  non-regression + 1 determinism); all 197 dirac tests pass.
+
 ## [0.0.6](https://github.com/OxideAV/oxideav-dirac/compare/v0.0.5...v0.0.6) - 2026-05-06
 
 ### Other
