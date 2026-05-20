@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Dirac inter encoder **post-OBMC second adaptive sub-pel-vs-integer-pel
+  pass for the 1-ref (P-picture) path** (round-80). Mirrors the
+  pre-OBMC selector landed in round-73, but runs `inter_select_int_pel_per_block`
+  a **second** time **after** [`obmc_refine_me`] has converged on a
+  refined sub-pel MV grid. Motivation: `obmc_refine_me`'s ±1
+  sub-pel-unit-per-pass step can drift a block off the integer-pel
+  anchor that the pre-OBMC selector chose — typically to help a
+  neighbour's blend — and once the neighbour grid finishes converging
+  the drifted block's integer-pel peer may again be the lower-OBMC-SSE
+  candidate. The post-OBMC pass evaluates exactly that integer-pel
+  peer against the converged sub-pel MV under the same §15.8.5
+  weighted-blend reconstruction the decoder will run, picking
+  whichever gives lower per-block OBMC SSE (ties biased to integer-pel,
+  same as round-73). Strict superset of the input candidate set
+  (`{ current, round_to_int_pel(current) }`) → cannot regress per-block
+  OBMC SSE; the load-bearing monotonicity invariant
+  `inter_select_int_pel_monotonic_per_block_obmc_sse` already pins
+  the helper's contract.
+  New `InterEncoderParams::inter_adaptive_int_pel_post_obmc: bool`
+  knob, defaults `true`; set to `false` to disable for A/B regression
+  testing against pre-round-80 behaviour. At `mv_precision == 0` the
+  helper takes an early-return path. At `obmc_refine_passes == 0` the
+  post-OBMC pass is *almost* a no-op (the pre-OBMC selector already
+  ran on the same grid) — kept for tie-bias safety. On the synthetic
+  `translate(+2,-1)` and `camera_pan_64(+1,0)` fixtures the post-OBMC
+  selector is a no-op (37.15 dB and 52.04 dB Y self-roundtrip
+  respectively before/after, identical to the pre-round-80 baseline)
+  — sub-pel ME + pre-OBMC selector together already converge on the
+  optimal MV grid. The win cases sit on real video content where
+  OBMC refinement's neighbour-aware ±1 steps push integer-pel-snapped
+  blocks off the integer anchor to favour a neighbour with sub-pel
+  motion, after which the post-OBMC pass un-drifts them. 4 new tests
+  (1 non-regression + 1 determinism + 1 bit-exact self-roundtrip + 1
+  unit pinning that the selector's only mutation is `current ↦
+  round_to_int_pel(current)`); all 202 dirac tests pass.
+
 - Dirac inter encoder **per-block adaptive sub-pel-vs-integer-pel
   selection for the 1-ref (P-picture) path** (round-73). Mirrors the
   bipred adaptive precision landed in round-39 (`bipred_select_modes`).

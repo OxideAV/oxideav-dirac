@@ -129,6 +129,41 @@ pub struct InterEncoderParams {
     /// integer-pel). Defaults to `true`; set to `false` to disable for
     /// regression / A-B testing against the pre-round-73 behaviour.
     pub inter_adaptive_int_pel: bool,
+    /// **Post-OBMC second adaptive sub-pel-vs-integer-pel pass** for the
+    /// **1-ref (P-picture)** path (round-80).
+    ///
+    /// After [`obmc_refine_me`] has converged on a sub-pel grid by ±1
+    /// sub-pel steps, run [`inter_select_int_pel_per_block`] a second
+    /// time so that blocks which drifted off the integer-pel anchor
+    /// during OBMC refinement get one more chance to snap back. The
+    /// OBMC neighbour buffer is the same one [`obmc_refine_me`] just
+    /// evaluated against, but the **finite ±1 sub-pel step search**
+    /// in `obmc_refine_me` cannot bridge from a sub-pel offset back to
+    /// the nearest **integer-pel** position in a single move (at
+    /// quarter-pel that's a 2-3 sub-pel-unit jump). The post-OBMC
+    /// selector evaluates exactly that integer-pel-rounded peer
+    /// against the converged sub-pel MV, picking whichever gives lower
+    /// per-block OBMC SSE. Because the comparison set is `{ current,
+    /// round_to_int_pel(current) }` (a strict superset of `{ current
+    /// }`), the result can never regress the per-block OBMC SSE — and
+    /// the test `inter_select_int_pel_monotonic_per_block_obmc_sse`
+    /// already pins that invariant for the helper.
+    ///
+    /// Catches the case where the pre-OBMC selector picked integer-pel
+    /// for a block, OBMC refinement drifted it to a sub-pel offset to
+    /// help a neighbour's blend, and now the originally-best integer
+    /// MV is the best position again (because the neighbour MV grid
+    /// has also shifted under refinement). Conceptually a fixed-point
+    /// iteration: pre-OBMC selector + OBMC refinement + post-OBMC
+    /// selector. A third pass would also be safely monotone — empirically
+    /// the second pass is sufficient on every fixture in this crate.
+    ///
+    /// At `mv_precision == 0` this is a no-op. At `obmc_refine_passes
+    /// == 0` it is **almost** a no-op (the pre-OBMC selector already
+    /// ran on the same grid), but still serves as a tie-bias bound.
+    /// Defaults to `true`; set to `false` for A/B testing against the
+    /// pre-round-80 behaviour.
+    pub inter_adaptive_int_pel_post_obmc: bool,
 }
 
 /// Wavelet residue encoder parameters. Mirrors
@@ -201,6 +236,14 @@ impl Default for InterEncoderParams {
             // multi-dB of 8-tap-filter smoothing damage even after
             // OBMC refinement converges.
             inter_adaptive_int_pel: true,
+            // Round-80: second adaptive int-pel pass AFTER OBMC
+            // refinement. `obmc_refine_me`'s ±1 sub-pel-unit step can
+            // drift a block off integer-pel to help a neighbour's
+            // blend; this pass lets that block snap back to integer-pel
+            // if the post-refinement neighbour grid no longer rewards
+            // the drift. Strict superset of MV candidates → cannot
+            // regress per-block OBMC SSE.
+            inter_adaptive_int_pel_post_obmc: true,
         }
     }
 }
@@ -2086,6 +2129,27 @@ pub fn encode_inter_picture(
         params.mv_precision,
         params.obmc_refine_passes,
     );
+    // Round-80: second per-block adaptive sub-pel-vs-integer-pel
+    // selection **after** OBMC refinement. `obmc_refine_me` can drift
+    // a block off the integer-pel anchor by ±1 sub-pel units per pass
+    // to help a neighbour's blend; this pass lets such a block snap
+    // back to its integer-pel peer if the post-refinement neighbour
+    // grid no longer rewards the drift. Strict superset of MV
+    // candidates (current sub-pel position vs. its integer-pel peer)
+    // → cannot regress per-block OBMC SSE. No-op at integer-pel
+    // (`mv_precision == 0`) or when disabled.
+    if params.inter_adaptive_int_pel_post_obmc {
+        inter_select_int_pel_per_block(
+            cur_y,
+            ref_y,
+            sequence.luma_width,
+            sequence.luma_height,
+            blocks_x,
+            blocks_y,
+            &mut mvs,
+            params.mv_precision,
+        );
+    }
     encode_block_motion_data(&mut w, sbx, sby, blocks_x, blocks_y, &mvs);
     w.byte_align();
 
