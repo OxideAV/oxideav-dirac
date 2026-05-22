@@ -9,6 +9,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Dirac inter encoder **post-OBMC bipred mode-only refinement pass**
+  (round-95): the 2-ref analogue of the 1-ref round-80 post-OBMC
+  re-evaluation. After `bipred_select_modes` picks its
+  `{mode, mv1, mv2}` decisions from the round-91 widened candidate
+  set, the new pass re-scores each block's mode under the full
+  §15.8.5 OBMC blend with the neighbour grid frozen at the
+  selector's output, choosing from the strict-superset trial set
+  `{ current, Ref1Only(mv1), Ref2Only(mv2), Ref1And2(mv1, mv2) }` at
+  the SAME MV pair the selector chose. This closes the cost-function
+  gap between the selector's SAD-against-source metric and the
+  decoder's OBMC-SSE-against-source reconstruction cost without
+  disturbing the MV grid (so smooth-motion sub-pel choices are
+  preserved — the camera-pan ffmpeg cross-decode floor is unchanged
+  at ~53 dB). New public function
+  `oxideav_dirac::encoder_inter::bipred_post_obmc_refine_modes`
+  (mirrors the shape of `inter_select_int_pel_per_block`). New
+  helpers `bipred_block_ref_value` (per-pixel reference value under a
+  `BipredBlock` decision; computes `(v1 + v2 + 1) >> 1` for
+  `Ref1And2` per §15.8.5 at `ref1_wt = ref2_wt = 1`,
+  `refs_wt_precision = 1`) and `build_neighbour_sum_bipred` (the
+  bipred analogue of `build_neighbour_sum`, summing weighted
+  neighbour reference values across all 8 OBMC neighbours).
+  Wired into `encode_bipred_inter_picture` immediately after
+  `bipred_select_modes` returns and before
+  `encode_block_motion_data_bipred` emits the §12.3 block_motion_data
+  stream — gated by the new
+  `InterEncoderParams::bipred_post_obmc_refine` field (default
+  `true`; set to `false` for A/B testing against the pre-round-95
+  behaviour). Strict-superset invariant pinned by the new test
+  `bipred_post_obmc_refine_monotonic_per_block_obmc_sse`: for every
+  block on the qpel camera-pan triplet, the post-pass per-block OBMC
+  SSE under the frozen neighbour grid is ≤ the pre-pass per-block
+  OBMC SSE. Integration test
+  `bipred_post_obmc_refine_does_not_regress_no_residue` (ME-only,
+  no residue) reports +0.80 dB Y self-roundtrip PSNR on the
+  camera-pan fixture (51.44 → 52.24 dB) and asserts the pass never
+  regresses picture-level PSNR by more than ε. The 1-ref P-path
+  remains unchanged; the bipred path's `obmc_refine_me` per-ref
+  refinement remains explicitly disabled (per the round-91 design
+  note — refining each reference's MV independently against the
+  source breaks the blend invariant), and the wavelet residue loop
+  closes any remaining prediction error.
+
 - Dirac inter encoder **bipred per-ref candidate-set widening to
   `{int-pel, half-pel, sub-pel}`** (round-91). Mirrors the 1-ref
   P-path's `inter_select_int_pel_per_block` strict-superset

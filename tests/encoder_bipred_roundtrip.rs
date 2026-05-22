@@ -856,3 +856,84 @@ fn bipred_widened_set_half_pel_favourable_self_roundtrip_no_residue() {
          on the half-pel-favourable fixture — linkage issue"
     );
 }
+
+/// **Round-95 post-OBMC bipred refinement A/B**. Compares the
+/// `bipred_post_obmc_refine` enabled (default) vs disabled paths on a
+/// camera-pan bipred fixture. The post-OBMC pass re-evaluates each
+/// block's mode under the full §15.8.5 OBMC blend with the neighbour
+/// grid frozen at `bipred_select_modes`' output — a strict-superset
+/// trial set that keeps the selector's MV pair but considers all
+/// three modes. The pass must never regress per-block OBMC SSE
+/// (pinned by `bipred_post_obmc_refine_monotonic_per_block_obmc_sse`
+/// in the unit tests), and on smooth-motion content it picks up the
+/// cost-function-gap improvement on edge blocks where the SAD-vs-
+/// source mode pick diverges from the OBMC-blend-vs-source mode pick.
+///
+/// The test uses `residue = None` so we measure the ME-only path's
+/// contribution (residue at qindex=0 closes any remaining gap and
+/// would mask the refinement's signal). Self-roundtrip (no ffmpeg) so
+/// CI is deterministic.
+#[test]
+fn bipred_post_obmc_refine_does_not_regress_no_residue() {
+    use oxideav_dirac::encoder_inter::synthetic_camera_pan_64;
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let intra_params = CoreIntraEncoderParams::default_intra(WaveletFilter::LeGall5_3, 3);
+    // Anchors at pan(0) and pan(2); midpoint at pan(1) — the same
+    // sub-pel-favourable fixture the round-91 monotonicity test uses.
+    let (y0, u0, v0, _, _, _) = synthetic_camera_pan_64(0, 0);
+    let (_, _, _, y2, _, _) = synthetic_camera_pan_64(2, 0);
+    let (_, _, _, ym, _, _) = synthetic_camera_pan_64(1, 0);
+    let intra_a = InterInputPicture {
+        picture_number: 0,
+        y: &y0,
+        u: &u0,
+        v: &v0,
+    };
+    let intra_b = InterInputPicture {
+        picture_number: 2,
+        y: &y2,
+        u: &u0,
+        v: &v0,
+    };
+    let bipred = InterInputPicture {
+        picture_number: 1,
+        y: &ym,
+        u: &u0,
+        v: &v0,
+    };
+    let measure = |post_obmc: bool| -> f64 {
+        let p = InterEncoderParams {
+            bipred_post_obmc_refine: post_obmc,
+            residue: None,
+            ..InterEncoderParams::default()
+        };
+        let stream = encode_core_intra_then_bipred_stream(
+            &seq,
+            &intra_params,
+            &p,
+            &intra_a,
+            &intra_b,
+            &bipred,
+        );
+        let frames = decode_stream(stream);
+        let b = frames.iter().find(|f| f.pts == Some(1)).expect("B frame");
+        psnr(&b.planes[0].data, &ym)
+    };
+    let psnr_off = measure(false);
+    let psnr_on = measure(true);
+    eprintln!(
+        "round-95 post-OBMC bipred refine A/B (camera-pan, no residue): \
+         off = {psnr_off:.2} dB, on = {psnr_on:.2} dB"
+    );
+    // Lower bound: never regress on this fixture. Cost-function-gap
+    // closure can only help when the selector and the OBMC blend
+    // disagree; on indifferent blocks the tie-bias keeps the current
+    // decision, so the pass is a true identity. A small ε allows for
+    // the per-block OBMC SSE → picture-level PSNR conversion noise.
+    assert!(
+        psnr_on >= psnr_off - 0.1,
+        "post-OBMC bipred refinement regressed PSNR: off = {psnr_off:.2} dB, \
+         on = {psnr_on:.2} dB (round-95 strict-superset invariant breached \
+         at the picture-level reconstruction)"
+    );
+}
