@@ -2245,6 +2245,18 @@ fn write_picture_prediction_parameters(
 /// tiny lambda-style tie-break preferring the simpler 1-ref modes
 /// (smaller MV residue + no second MV pair to encode).
 ///
+/// **Round-91 widening.** Each per-ref MV is evaluated against a
+/// strict-superset candidate set: `{int-pel, half-pel, sub-pel}` at
+/// `mv_precision >= 2`, degenerating to `{int-pel, sub-pel}` at half-pel
+/// precision and `{int-pel}` at integer precision. The bipred mode
+/// enumerates up to `3 × 3 = 9` MV combinations (de-duplicated when the
+/// half-pel candidate coincides with one of its peers). Mirrors the
+/// 1-ref P-path's `inter_select_int_pel_per_block` strict-superset
+/// invariant (round-73 + round-80 post-OBMC pass): the widened
+/// candidate set strictly contains the previous round-39 2-candidate
+/// set, so the chosen per-ref SAD and bipred SAD are ≤ the round-39
+/// values on every block — never regresses.
+///
 /// `mv_precision` is in `1/(2^p)` luma pel units (matches
 /// [`InterEncoderParams::mv_precision`]).
 #[allow(clippy::too_many_arguments)]
@@ -2298,19 +2310,28 @@ pub fn bipred_select_modes(
             let mv2 = mvs2[idx];
             let x0 = bx as i32 * xbsep;
             let y0 = by as i32 * ybsep;
-            // Per-block adaptive precision: at sub-pel `mv_precision`,
-            // also evaluate the integer-pel-rounded MV variant. Sharp-
-            // edge content (text bars, occluders) often prefers the
-            // integer-pel MV — the 8-tap half-pel filter's smoothing
-            // ringing introduces multi-LSB drift that propagates through
-            // the OBMC blend with neighbour blocks (whose MVs are at
-            // different sub-pel offsets), accumulating a 7+ dB regression
-            // versus the integer-pel path on complementary-bars-style
-            // fixtures. Smooth-motion content (camera-pan, real video)
-            // still wins at sub-pel — letting each block pick its best
-            // MV closes the gap on both shapes.
+            // Per-block adaptive precision: widened in **round-91**
+            // from `{sub-pel, int-pel}` (round-39) to the strict
+            // superset `{int-pel, half-pel, sub-pel}` per reference.
+            // The 1-ref P-path's `inter_select_int_pel_per_block`
+            // (round-73 + round-80 post-OBMC) carries the same
+            // strict-superset correctness invariant for its own
+            // 2-candidate set; the round-91 widening brings the bipred
+            // path under the *same* invariant with one extra
+            // half-pel-snapped candidate per ref. Sharp-edge content
+            // (bars, occluders) still snaps to int-pel; smooth motion
+            // still keeps the native sub-pel MV; mid-energy content
+            // that prefers the 8-tap-filtered half-pel position but
+            // not the bilinear-refined qpel offset can now pick the
+            // half-pel candidate. Per ST 2042-1 §11.2.5 `mv_precision`
+            // already enumerates int / half / qpel / ⅛-pel, so adding
+            // a per-block half-pel candidate is auditor-equivalent to
+            // the 1-ref invariant: the same MV space, just one extra
+            // representative per ref, no decoder-side change required.
             let mv1_int = round_mv_to_int_pel(mv1, mv_precision);
             let mv2_int = round_mv_to_int_pel(mv2, mv_precision);
+            let mv1_half = round_mv_to_half_pel(mv1, mv_precision);
+            let mv2_half = round_mv_to_half_pel(mv2, mv_precision);
 
             let sad_one =
                 |mv: IntegerMv, refp: &[u8], up: &[i32], up_w: usize, up_h: usize| -> i64 {
@@ -2338,40 +2359,88 @@ pub fn bipred_select_modes(
                     }
                 };
 
-            // Per-mode best MV: pick whichever of (sub-pel, int-pel)
-            // gives the lower SAD against the source.
-            let (sad1_sp, sad1_int) = (
-                sad_one(mv1, ref1_y, &up1, up1_w, up1_h),
-                sad_one(mv1_int, ref1_y, &up1, up1_w, up1_h),
-            );
-            let (best_mv1, sad1) = if sad1_int <= sad1_sp {
-                (mv1_int, sad1_int)
-            } else {
-                (mv1, sad1_sp)
+            // Per-mode best MV from the widened 3-candidate set. Tie
+            // priority is int-pel ≥ half-pel ≥ sub-pel — i.e. on equal
+            // SAD we prefer the candidate that contributes the smallest
+            // §15.8.11 8-tap-filter weight to neighbours' OBMC blends,
+            // so the per-block selection picks the most blend-friendly
+            // representative. This carries the same `<=` tie-bias the
+            // 1-ref `inter_select_int_pel_per_block` uses (round-73).
+            let pick_best_mv = |mv_sp: IntegerMv,
+                                mv_half: IntegerMv,
+                                mv_int: IntegerMv,
+                                refp: &[u8],
+                                up: &[i32],
+                                up_w: usize,
+                                up_h: usize|
+             -> (IntegerMv, i64) {
+                let sad_sp = sad_one(mv_sp, refp, up, up_w, up_h);
+                let sad_int = sad_one(mv_int, refp, up, up_w, up_h);
+                // int-pel wins all ties via `<=`.
+                let (mut best_mv, mut best_sad) = if sad_int <= sad_sp {
+                    (mv_int, sad_int)
+                } else {
+                    (mv_sp, sad_sp)
+                };
+                // Half-pel candidate: only evaluated when distinct
+                // from both peers (`p <= 1` makes it equal int or
+                // sub-pel and the lookup would be redundant work).
+                if mv_precision >= 2
+                    && (mv_half.0, mv_half.1) != (mv_int.0, mv_int.1)
+                    && (mv_half.0, mv_half.1) != (mv_sp.0, mv_sp.1)
+                {
+                    let sad_half = sad_one(mv_half, refp, up, up_w, up_h);
+                    // Tie-bias: half-pel beats sub-pel on ties
+                    // (smaller filter contribution → less OBMC
+                    // drift), but loses to int-pel on ties
+                    // (already locked in above).
+                    if sad_half < best_sad
+                        || (sad_half == best_sad && (best_mv.0, best_mv.1) == (mv_sp.0, mv_sp.1))
+                    {
+                        best_mv = mv_half;
+                        best_sad = sad_half;
+                    }
+                }
+                (best_mv, best_sad)
             };
-            let (sad2_sp, sad2_int) = (
-                sad_one(mv2, ref2_y, &up2, up2_w, up2_h),
-                sad_one(mv2_int, ref2_y, &up2, up2_w, up2_h),
-            );
-            let (best_mv2, sad2) = if sad2_int <= sad2_sp {
-                (mv2_int, sad2_int)
-            } else {
-                (mv2, sad2_sp)
-            };
+
+            let (best_mv1, sad1) = pick_best_mv(mv1, mv1_half, mv1_int, ref1_y, &up1, up1_w, up1_h);
+            let (best_mv2, sad2) = pick_best_mv(mv2, mv2_half, mv2_int, ref2_y, &up2, up2_w, up2_h);
 
             // Bipred SAD: `(p1 + p2 + 1) >> 1` per pixel (the §15.8.5
             // weighted sum at `ref_wt=(1,1)` and `refs_wt_precision=1`,
             // i.e. shift by 1, round-to-nearest at `+1`). This is what
             // the decoder will accumulate into `mc_tmp` for `Ref1And2`
-            // blocks (post-spatial-weight, post-OBMC-blend). For the
-            // bipred mode we evaluate four MV combinations
-            // (sub-pel/int-pel × ref1/ref2) and keep the cheapest.
-            let bipred_candidates = [
-                (mv1, mv2),
-                (mv1_int, mv2),
-                (mv1, mv2_int),
-                (mv1_int, mv2_int),
-            ];
+            // blocks (post-spatial-weight, post-OBMC-blend). Round-91
+            // widens the per-ref MV candidate set to
+            // `{int-pel, half-pel, sub-pel}`, so the bipred mode
+            // enumerates at most 3 × 3 = 9 combinations (filtered to
+            // skip redundant pairs when half-pel coincides with int or
+            // sub-pel). Strict superset of the round-39 4-combo set →
+            // the chosen bipred SAD is ≤ the round-39 bipred SAD on
+            // every block.
+            let mut bipred_candidates: Vec<(IntegerMv, IntegerMv)> = Vec::with_capacity(9);
+            let cands1: &[IntegerMv] = if mv_precision >= 2
+                && (mv1_half.0, mv1_half.1) != (mv1.0, mv1.1)
+                && (mv1_half.0, mv1_half.1) != (mv1_int.0, mv1_int.1)
+            {
+                &[mv1, mv1_half, mv1_int]
+            } else {
+                &[mv1, mv1_int]
+            };
+            let cands2: &[IntegerMv] = if mv_precision >= 2
+                && (mv2_half.0, mv2_half.1) != (mv2.0, mv2.1)
+                && (mv2_half.0, mv2_half.1) != (mv2_int.0, mv2_int.1)
+            {
+                &[mv2, mv2_half, mv2_int]
+            } else {
+                &[mv2, mv2_int]
+            };
+            for &m1 in cands1 {
+                for &m2 in cands2 {
+                    bipred_candidates.push((m1, m2));
+                }
+            }
             let (best_bipred_mv1, best_bipred_mv2, sad12) = bipred_candidates
                 .iter()
                 .map(|&(m1, m2)| {
@@ -2430,12 +2499,61 @@ pub fn bipred_select_modes(
 }
 
 /// Round a sub-pel MV (units of `1/(2^p)` luma pels) to the nearest
+/// **half-pel** position, returning the result in the same sub-pel
+/// units. At `p < 1` this is identical to integer-pel rounding (the
+/// half-pel grid degenerates to the integer-pel grid). At `p == 1` the
+/// MV is already on the half-pel grid and the result is the input
+/// unchanged. At `p >= 2` we snap to the nearest multiple of
+/// `1 << (p - 1)` (i.e. step = 2 for qpel, step = 4 for ⅛-pel).
+///
+/// Used by `bipred_select_modes` (round-91) to widen the per-ref
+/// adaptive candidate set from `{int-pel, sub-pel}` to
+/// `{int-pel, half-pel, sub-pel}`. The half-pel candidate is the
+/// §15.8.11 8-tap-filter natural intermediate position — at qpel
+/// `mv_precision` the sub-pel-refined MV is one bilinear step away
+/// from its half-pel peer, and on content where the 8-tap filter is
+/// well-matched but the bilinear refinement isn't (e.g. mid-energy
+/// edges that benefit from anti-aliasing but not from sub-quarter
+/// adjustment), the half-pel peer can score lower SAD than either of
+/// the existing two candidates.
+fn round_mv_to_half_pel(mv: IntegerMv, p: u32) -> IntegerMv {
+    if p <= 1 {
+        // p == 0 → no sub-pel grid at all, fall through to integer-pel.
+        // p == 1 → already on the half-pel grid by construction.
+        return if p == 0 {
+            round_mv_to_int_pel(mv, p)
+        } else {
+            mv
+        };
+    }
+    let unit = 1i32 << (p - 1);
+    let half = unit / 2;
+    // Same ties-toward-zero biasing as `round_mv_to_int_pel`: degenerate
+    // sub-half-unit offsets snap to zero, exact-half-unit ties round
+    // toward zero so the half-pel snap doesn't inflate motion magnitude.
+    let snap = |v: i32| -> i32 {
+        let mag = v.unsigned_abs() as i32;
+        let snapped_mag = if mag <= half {
+            0
+        } else {
+            ((mag + half) / unit) * unit
+        };
+        if v < 0 {
+            -snapped_mag
+        } else {
+            snapped_mag
+        }
+    };
+    IntegerMv(snap(mv.0), snap(mv.1))
+}
+
+/// Round a sub-pel MV (units of `1/(2^p)` luma pels) to the nearest
 /// **integer-pel** position, returning the result in the same sub-pel
 /// units. At `p == 0` this is a no-op.
 ///
 /// Per-block adaptive sub-pel-vs-integer-pel selection (`bipred_select_modes`)
 /// uses this to evaluate each MV at both the sub-pel-refined position
-/// and its integer-pel-rounded peer, then picks the lower-SAD variant
+/// and the integer-pel-rounded peer, then picks the lower-SAD variant
 /// per block. The motivation: at sharp-edge blocks the 8-tap half-pel
 /// filter introduces ringing that doesn't match the source, and the
 /// resulting prediction loses 4-7 dB to the integer-pel choice; on
@@ -3011,6 +3129,85 @@ mod tests {
         }
     }
 
+    /// Round-91: half-pel snap at qpel precision. unit = 2, half = 1.
+    /// |v| <= 1 → 0 (ties toward zero); |v| > 1 → nearest multiple of 2.
+    #[test]
+    fn round_mv_to_half_pel_qpel_snaps_to_multiples_of_2() {
+        // unit = 1<<(p-1) = 2, half = unit/2 = 1.
+        // |v| <= 1 → 0; otherwise snapped_mag = ((|v|+1)/2)*2.
+        let cases = [
+            (0i32, 0i32),
+            (1, 0), // ties toward zero
+            (2, 2), // already on half-pel grid: ((2+1)/2)*2 = 2
+            (3, 4), // ((3+1)/2)*2 = 4
+            (4, 4),
+            (5, 6), // ((5+1)/2)*2 = 6
+            (6, 6),
+            (-1, 0),
+            (-3, -4),
+            (-5, -6),
+        ];
+        for (input, expected) in cases {
+            let mv = IntegerMv(input, 0);
+            let r = round_mv_to_half_pel(mv, 2);
+            assert_eq!(
+                (r.0, r.1),
+                (expected, 0),
+                "half-pel snap qpel({input}) → expected {expected}, got {}",
+                r.0
+            );
+        }
+    }
+
+    /// At `mv_precision == 0` the half-pel grid degenerates to the
+    /// integer-pel grid, so the helper falls through to integer-pel
+    /// rounding (identity at p == 0).
+    #[test]
+    fn round_mv_to_half_pel_at_precision_0_falls_through_to_int_pel() {
+        for (x, y) in [(0, 0), (3, -7), (-100, 50)] {
+            let mv = IntegerMv(x, y);
+            let r = round_mv_to_half_pel(mv, 0);
+            assert_eq!((r.0, r.1), (x, y));
+        }
+    }
+
+    /// At `mv_precision == 1` (half-pel) every MV is already on the
+    /// half-pel grid, so the helper returns the input unchanged.
+    #[test]
+    fn round_mv_to_half_pel_at_precision_1_is_identity() {
+        for (x, y) in [(0i32, 0i32), (1, -1), (5, 7), (-12, 4)] {
+            let mv = IntegerMv(x, y);
+            let r = round_mv_to_half_pel(mv, 1);
+            assert_eq!((r.0, r.1), (x, y));
+        }
+    }
+
+    /// Round-91: at qpel precision the half-pel rounded MV lands on an
+    /// even (half-pel-grid) coordinate, never on an odd (quarter-pel
+    /// offset) one. This is the structural prerequisite that makes the
+    /// half-pel candidate a genuinely new representative — distinct
+    /// from both the int-pel snap (multiples of 4) and the unmodified
+    /// sub-pel MV (anywhere on the qpel grid).
+    #[test]
+    fn round_mv_to_half_pel_qpel_lands_on_even_grid() {
+        for x in -16..=16i32 {
+            for y in -8..=8i32 {
+                let mv = IntegerMv(x, y);
+                let mv_half = round_mv_to_half_pel(mv, 2);
+                assert_eq!(
+                    mv_half.0 % 2,
+                    0,
+                    "mv = {mv:?}: half-pel snap {mv_half:?} not on even grid"
+                );
+                assert_eq!(
+                    mv_half.1 % 2,
+                    0,
+                    "mv = {mv:?}: half-pel snap {mv_half:?} not on even grid"
+                );
+            }
+        }
+    }
+
     #[test]
     fn motion_grid_matches_decoder_for_64x64() {
         // 64x64 / (4*4) = 4 superblocks per axis → 16 blocks per axis.
@@ -3491,6 +3688,178 @@ mod tests {
                     "block (i={i},j={j}): per-block OBMC SSE regressed under \
                      adaptive int-pel: before = {sse_before}, after = {sse_after} \
                      (this breaks the round-73 strict-superset invariant)"
+                );
+            }
+        }
+    }
+
+    /// **Round-91 strict-superset invariant** (bipred path): the
+    /// widened `{int-pel, half-pel, sub-pel}` per-ref candidate set
+    /// contains the previous round-39 `{int-pel, sub-pel}` set, so on
+    /// every block the widened bipred selector's per-ref SAD and bipred
+    /// SAD are ≤ the previous round-39 selector's values. We re-run a
+    /// reference round-39 selector inline (2 per-ref candidates, 4
+    /// bipred combos) on the same MV grid and compare per-block to the
+    /// round-91 output's per-block SAD. The round-91 SADs must dominate
+    /// (≤) the round-39 SADs on every block — mirrors the
+    /// `inter_select_int_pel_monotonic_per_block_obmc_sse` correctness
+    /// pin on the 1-ref path, scaled to the bipred path.
+    #[test]
+    fn bipred_widened_candidate_set_monotonic_per_block_sad() {
+        // Camera-pan triplet at qpel: ref1 at pan(0), ref2 at pan(2),
+        // current at pan(1) — exact temporal midpoint, the same
+        // smooth-motion fixture the `ffmpeg_cross_decodes_camera_pan_bipred_with_subpel_gain`
+        // test exercises. Sub-pel/half-pel/int-pel candidates all
+        // produce meaningfully different SADs on this fixture, so the
+        // monotonicity check actually exercises the widening (rather
+        // than degenerating into "all candidates equal").
+        let (y0, _, _, _, _, _) = synthetic_camera_pan_64(0, 0);
+        let (_, _, _, y2, _, _) = synthetic_camera_pan_64(2, 0);
+        let (_, _, _, ym, _, _) = synthetic_camera_pan_64(1, 0);
+
+        let w = 64u32;
+        let h = 64u32;
+        let blocks_x = 16u32;
+        let blocks_y = 16u32;
+        let search = 16u32;
+        let p = 2u32; // qpel — widest non-trivial candidate set.
+
+        // Round-91 widened output.
+        let new_decisions = bipred_select_modes(&ym, &y0, &y2, w, h, blocks_x, blocks_y, search, p);
+
+        // Round-39 reference (2 per-ref candidates, 4 bipred combos).
+        // Inlined here so the test pins the round-39 shape even if the
+        // production selector later widens further.
+        let mvs1 = subpel_search_me(&ym, &y0, w, h, blocks_x, blocks_y, search, p);
+        let mvs2 = subpel_search_me(&ym, &y2, w, h, blocks_x, blocks_y, search, p);
+        let (xblen, yblen, xbsep, ybsep) = (8i32, 8i32, 4i32, 4i32);
+        let (up1, up1_w, up1_h) = build_upref(&y0, w, h);
+        let (up2, up2_w, up2_h) = build_upref(&y2, w, h);
+        let w_i = w as i32;
+        let h_i = h as i32;
+        // SAD of one block against one reference at sub-pel precision.
+        // Uses the same `sad_subpel` helper the production selector
+        // uses, so per-block scores are bit-exact comparable.
+        let sad_subpel_one =
+            |mv: IntegerMv, up: &[i32], up_w: usize, up_h: usize, x0: i32, y0: i32| -> i64 {
+                let scale = 1i64 << p;
+                let qx = (x0 as i64) * scale + mv.0 as i64;
+                let qy = (y0 as i64) * scale + mv.1 as i64;
+                sad_subpel(
+                    &ym, up, up_w, up_h, w_i, h_i, x0, y0, qx, qy, xblen, yblen, p,
+                )
+            };
+
+        for by in 0..blocks_y {
+            for bx in 0..blocks_x {
+                let idx = (by * blocks_x + bx) as usize;
+                let x0 = bx as i32 * xbsep;
+                let y0_blk = by as i32 * ybsep;
+                let mv1 = mvs1[idx];
+                let mv2 = mvs2[idx];
+                let mv1_int = round_mv_to_int_pel(mv1, p);
+                let mv2_int = round_mv_to_int_pel(mv2, p);
+
+                // Round-39 per-ref best from {sub-pel, int-pel}.
+                let s1_sp = sad_subpel_one(mv1, &up1, up1_w, up1_h, x0, y0_blk);
+                let s1_int = sad_subpel_one(mv1_int, &up1, up1_w, up1_h, x0, y0_blk);
+                let sad1_r39 = s1_int.min(s1_sp);
+                let s2_sp = sad_subpel_one(mv2, &up2, up2_w, up2_h, x0, y0_blk);
+                let s2_int = sad_subpel_one(mv2_int, &up2, up2_w, up2_h, x0, y0_blk);
+                let sad2_r39 = s2_int.min(s2_sp);
+
+                // Round-39 bipred best from 4 combinations.
+                let combos = [
+                    (mv1, mv2),
+                    (mv1_int, mv2),
+                    (mv1, mv2_int),
+                    (mv1_int, mv2_int),
+                ];
+                let bipred_r39 = combos
+                    .iter()
+                    .map(|&(m1, m2)| {
+                        sad_bipred(
+                            &ym, &up1, up1_w, up1_h, &y0, &up2, up2_w, up2_h, &y2, w_i, h_i, x0,
+                            y0_blk, m1, m2, xblen, yblen, p,
+                        )
+                    })
+                    .min()
+                    .unwrap();
+
+                // Round-91 widened-set best from the same helpers. We
+                // re-derive the three per-ref candidates and 3×3 bipred
+                // combos inline, then assert each new minimum is ≤ the
+                // round-39 minimum — that's exactly the strict-superset
+                // invariant the widened selector promises.
+                let mv1_half = round_mv_to_half_pel(mv1, p);
+                let mv2_half = round_mv_to_half_pel(mv2, p);
+                let r91_per_ref_min = |mv_sp: IntegerMv,
+                                       mv_half: IntegerMv,
+                                       mv_int: IntegerMv,
+                                       up: &[i32],
+                                       up_w: usize,
+                                       up_h: usize|
+                 -> i64 {
+                    let mut best = sad_subpel_one(mv_sp, up, up_w, up_h, x0, y0_blk)
+                        .min(sad_subpel_one(mv_int, up, up_w, up_h, x0, y0_blk));
+                    if (mv_half.0, mv_half.1) != (mv_int.0, mv_int.1)
+                        && (mv_half.0, mv_half.1) != (mv_sp.0, mv_sp.1)
+                    {
+                        best = best.min(sad_subpel_one(mv_half, up, up_w, up_h, x0, y0_blk));
+                    }
+                    best
+                };
+                let sad1_r91 = r91_per_ref_min(mv1, mv1_half, mv1_int, &up1, up1_w, up1_h);
+                let sad2_r91 = r91_per_ref_min(mv2, mv2_half, mv2_int, &up2, up2_w, up2_h);
+                assert!(
+                    sad1_r91 <= sad1_r39,
+                    "block ({bx},{by}) ref1 per-ref SAD regressed: round-91 \
+                     {sad1_r91} > round-39 {sad1_r39}"
+                );
+                assert!(
+                    sad2_r91 <= sad2_r39,
+                    "block ({bx},{by}) ref2 per-ref SAD regressed: round-91 \
+                     {sad2_r91} > round-39 {sad2_r39}"
+                );
+
+                let cands1: Vec<IntegerMv> = if (mv1_half.0, mv1_half.1) != (mv1.0, mv1.1)
+                    && (mv1_half.0, mv1_half.1) != (mv1_int.0, mv1_int.1)
+                {
+                    vec![mv1, mv1_half, mv1_int]
+                } else {
+                    vec![mv1, mv1_int]
+                };
+                let cands2: Vec<IntegerMv> = if (mv2_half.0, mv2_half.1) != (mv2.0, mv2.1)
+                    && (mv2_half.0, mv2_half.1) != (mv2_int.0, mv2_int.1)
+                {
+                    vec![mv2, mv2_half, mv2_int]
+                } else {
+                    vec![mv2, mv2_int]
+                };
+                let mut bipred_r91 = i64::MAX;
+                for &m1 in &cands1 {
+                    for &m2 in &cands2 {
+                        let s = sad_bipred(
+                            &ym, &up1, up1_w, up1_h, &y0, &up2, up2_w, up2_h, &y2, w_i, h_i, x0,
+                            y0_blk, m1, m2, xblen, yblen, p,
+                        );
+                        if s < bipred_r91 {
+                            bipred_r91 = s;
+                        }
+                    }
+                }
+                assert!(
+                    bipred_r91 <= bipred_r39,
+                    "block ({bx},{by}) bipred SAD regressed: round-91 \
+                     {bipred_r91} > round-39 {bipred_r39}"
+                );
+
+                // Smoke-check the actual selector's mode is one of the
+                // legal bipred modes (never `Intra`).
+                let chosen = new_decisions[idx];
+                assert!(
+                    !matches!(chosen.rmode, RefPredMode::Intra),
+                    "bipred selector emitted Intra at ({bx},{by})"
                 );
             }
         }

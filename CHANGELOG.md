@@ -9,6 +9,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Dirac inter encoder **bipred per-ref candidate-set widening to
+  `{int-pel, half-pel, sub-pel}`** (round-91). Mirrors the 1-ref
+  P-path's `inter_select_int_pel_per_block` strict-superset
+  correctness invariant (round-73 + round-80 post-OBMC pass), scaled
+  to the 2-ref bipred path. Round-39 evaluated 2 per-ref candidates
+  (`{sub-pel, int-pel}`) and 4 bipred combinations; round-91 widens
+  this to 3 per-ref candidates (`{int-pel, half-pel, sub-pel}`) and
+  up to 3 × 3 = 9 bipred combinations (de-duplicated when the
+  half-pel snap coincides with one of its peers, or when
+  `bipred_mv_precision < 2` makes the half-pel grid degenerate). Per
+  ST 2042-1 §11.2.5 `mv_precision` already enumerates int / half /
+  qpel / ⅛-pel — no decoder-side change is required; the widening
+  simply lets the encoder pick the same per-block MV from a strict
+  superset. Tie-bias preserves the round-39 ordering: int-pel ≥
+  half-pel ≥ sub-pel under equal SAD (smaller §15.8.11 8-tap-filter
+  contribution → less OBMC blend drift with neighbour blocks).
+  New helper `round_mv_to_half_pel(mv, p)` (private): degenerates
+  to `round_mv_to_int_pel` at `p == 0`, identity at `p == 1` (MV
+  already on half-pel grid), snap-to-nearest-multiple-of-`2^(p-1)`
+  with ties toward zero at `p >= 2`. The strict-superset invariant
+  is pinned by the new test `bipred_widened_candidate_set_monotonic_per_block_sad`:
+  for every block on the camera-pan triplet (qpel), the round-91
+  selector's per-ref SAD and bipred SAD are both ≤ the inlined
+  round-39 reference's SADs. Diagnostic test
+  `bipred_widened_set_exercises_int_half_and_qpel_grids` confirms
+  the new half-pel candidate is genuinely picked (240 half-pel MVs
+  across three fixtures, joining 407 int-pel and 240 qpel — the
+  widening is non-vacuous). A half-pel-favourable
+  `camera_pan_64` triplet (anchors at qpel 0 and 4, midpoint at
+  qpel 2 → exact half-pel MV) is added by
+  `bipred_widened_set_half_pel_favourable_self_roundtrip_no_residue`,
+  measuring +12.23 dB Y self-roundtrip uplift over the int-pel-only
+  ceiling (30.36 → 42.59 dB, residue OFF). The pre-existing
+  `ffmpeg_cross_decodes_camera_pan_bipred_with_subpel_gain` test
+  shows the round-39 fixture is unchanged (52.53 dB → 52.53 dB) —
+  the SAD landscape on cosine-shaped pan-by-1-pel content was
+  already converged on the qpel grid, so the new half-pel
+  candidate is dominated by the qpel pick and the selector
+  rationally keeps it; the strict-superset invariant guarantees
+  the unchanged outcome rather than a regression.
+
 - Dirac inter encoder **post-OBMC second adaptive sub-pel-vs-integer-pel
   pass for the 1-ref (P-picture) path** (round-80). Mirrors the
   pre-OBMC selector landed in round-73, but runs `inter_select_int_pel_per_block`

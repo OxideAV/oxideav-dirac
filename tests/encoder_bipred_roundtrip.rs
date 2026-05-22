@@ -379,6 +379,87 @@ fn bipred_select_modes_emits_ref1and2_on_midpoint_fixture() {
     );
 }
 
+/// **Round-91 grid-coverage diagnostic.** With qpel `bipred_mv_precision`
+/// and the widened `{int-pel, half-pel, sub-pel}` candidate set, the
+/// chosen per-block MVs should cover all three grids across enough
+/// fixtures to confirm the widening is non-vacuous. On any single
+/// fixture some grids may be empty (camera-pan(1,0) is all-smooth →
+/// mostly qpel; complementary-bars is all-sharp → mostly int-pel), so
+/// the diagnostic checks the union across three fixtures including a
+/// camera-pan(2,0) that's specifically half-pel-favourable (current
+/// frame at dx=0.5 pels, ref1 at dx=0 and ref2 at dx=1.0 → exact
+/// half-pel MV to either reference). Without this, an accidental
+/// "half-pel never picked" regression would be silent.
+#[test]
+fn bipred_widened_set_exercises_int_half_and_qpel_grids() {
+    use oxideav_dirac::encoder_inter::synthetic_camera_pan_64;
+    // Fixture A: smooth camera-pan, MV = ±1 qpel from midpoint.
+    let (y0a, _, _, _, _, _) = synthetic_camera_pan_64(0, 0);
+    let (_, _, _, y2a, _, _) = synthetic_camera_pan_64(2, 0);
+    let (_, _, _, yma, _, _) = synthetic_camera_pan_64(1, 0);
+    let decisions_a = bipred_select_modes(&yma, &y0a, &y2a, 64, 64, 16, 16, 16, 2);
+    // Fixture B: complementary-bars midpoint (sharp edges → int-pel).
+    let (y0b, _, _, y1b, _, _, ymb, _, _) = synthetic_bipred_triplet();
+    let decisions_b = bipred_select_modes(&ymb, &y0b, &y1b, 64, 64, 16, 16, 16, 2);
+    // Fixture C: camera-pan with anchors at qpel = 0 and qpel = 4 (one
+    // luma pel apart), current at qpel = 2 → the per-ref motion is
+    // exactly ±0.5 luma pel = ±2 qpel-units, so the half-pel candidate
+    // should be picked on most blocks where the cosine content is smooth.
+    let (y0c, _, _, _, _, _) = synthetic_camera_pan_64(0, 0);
+    let (_, _, _, y4c, _, _) = synthetic_camera_pan_64(4, 0);
+    let (_, _, _, ymc, _, _) = synthetic_camera_pan_64(2, 0);
+    let decisions_c = bipred_select_modes(&ymc, &y0c, &y4c, 64, 64, 16, 16, 16, 2);
+
+    // Classify each chosen MV by the coarsest grid it lies on. Order
+    // matters: a MV on the int-pel grid (multiples of 4 at qpel) is
+    // also on the half-pel grid (multiples of 2), so we check int
+    // first.
+    let mut n_int = 0usize;
+    let mut n_half = 0usize;
+    let mut n_qpel = 0usize;
+    for d in decisions_a
+        .iter()
+        .chain(decisions_b.iter())
+        .chain(decisions_c.iter())
+    {
+        let mvs: &[(i32, i32)] = match d.rmode {
+            RefPredMode::Ref1Only => &[(d.mv1.0, d.mv1.1)][..],
+            RefPredMode::Ref2Only => &[(d.mv2.0, d.mv2.1)][..],
+            RefPredMode::Ref1And2 => &[(d.mv1.0, d.mv1.1), (d.mv2.0, d.mv2.1)][..],
+            RefPredMode::Intra => &[][..],
+        };
+        for &(x, y) in mvs {
+            if x % 4 == 0 && y % 4 == 0 {
+                n_int += 1;
+            } else if x % 2 == 0 && y % 2 == 0 {
+                n_half += 1;
+            } else {
+                n_qpel += 1;
+            }
+        }
+    }
+    eprintln!(
+        "round-91 bipred MV grid coverage (3 fixtures): int-pel = {n_int}, \
+         half-pel = {n_half}, qpel = {n_qpel}"
+    );
+    assert!(
+        n_int > 0,
+        "round-91 bipred: no integer-pel MVs chosen on any block across \
+         the three fixtures — candidate set collapsed to sub-pel only"
+    );
+    assert!(
+        n_half > 0,
+        "round-91 bipred: no half-pel MVs chosen on any block across \
+         the three fixtures (including the camera-pan(2,0) half-pel-\
+         favourable fixture) — the widened candidate set is vacuous"
+    );
+    assert!(
+        n_qpel > 0,
+        "round-91 bipred: no quarter-pel MVs chosen on any block across \
+         the three fixtures — candidate set collapsed to integer-pel only"
+    );
+}
+
 /// **Bipred ME-only A/B vs 1-ref ME-only.** With residue turned OFF,
 /// the bipred encoder's per-block decision search should still beat
 /// the 1-ref baseline on a fixture engineered for averaging — the dark
@@ -686,5 +767,92 @@ fn ffmpeg_cross_decodes_camera_pan_bipred_with_subpel_gain() {
         "bipred qpel(adaptive) camera-pan PSNR {psnr_qpel:.2} dB below 50 dB \
          absolute floor — expected ~52 dB after round-39 per-block adaptive \
          sub-pel selection"
+    );
+}
+
+/// **Round-91 widened-set self-roundtrip on a half-pel-favourable
+/// fixture.** With anchors one luma pel apart and the midpoint at
+/// exactly 0.5 pels, the per-ref MV is exactly half-pel and the round-91
+/// `{int-pel, half-pel, sub-pel}` candidate set's half-pel candidate is
+/// the optimal pick on the smooth-cosine portion of the frame. With
+/// `residue = None` (ME-only A/B), the bipred-mode reconstruction PSNR
+/// should beat the int-pel-only `bipred_mv_precision = 0` baseline — and
+/// the round-91 widening (which includes a half-pel candidate, missing
+/// in the round-39 2-candidate set) should match-or-beat the round-39
+/// 2-candidate behaviour. We exercise this via a self-roundtrip (no
+/// ffmpeg dependency) to keep the test deterministic across CI hosts.
+#[test]
+fn bipred_widened_set_half_pel_favourable_self_roundtrip_no_residue() {
+    use oxideav_dirac::encoder_inter::synthetic_camera_pan_64;
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let intra_params = CoreIntraEncoderParams::default_intra(WaveletFilter::LeGall5_3, 3);
+    // Anchors at pan(0) and pan(4) [= 1.0 luma pel apart];
+    // midpoint at pan(2) [= 0.5 luma pel from each anchor → half-pel MV].
+    let (y0, u0, v0, _, _, _) = synthetic_camera_pan_64(0, 0);
+    let (_, _, _, y4, _, _) = synthetic_camera_pan_64(4, 0);
+    let (_, _, _, ym, _, _) = synthetic_camera_pan_64(2, 0);
+    let intra_a = InterInputPicture {
+        picture_number: 0,
+        y: &y0,
+        u: &u0,
+        v: &v0,
+    };
+    let intra_b = InterInputPicture {
+        picture_number: 2,
+        y: &y4,
+        u: &u0,
+        v: &v0,
+    };
+    let bipred = InterInputPicture {
+        picture_number: 1,
+        y: &ym,
+        u: &u0,
+        v: &v0,
+    };
+
+    let measure = |bmp: u32| -> f64 {
+        let p = InterEncoderParams {
+            bipred_mv_precision: bmp,
+            residue: None,
+            ..InterEncoderParams::default()
+        };
+        let stream = encode_core_intra_then_bipred_stream(
+            &seq,
+            &intra_params,
+            &p,
+            &intra_a,
+            &intra_b,
+            &bipred,
+        );
+        let frames = decode_stream(stream);
+        assert_eq!(frames.len(), 3, "expected 3 frames");
+        // Frames arrive in decode order; bipred B has picture_number=1.
+        let b = frames.iter().find(|f| f.pts == Some(1)).expect("B frame");
+        psnr(&b.planes[0].data, &ym)
+    };
+    let psnr_int = measure(0);
+    let psnr_qpel = measure(2);
+    eprintln!(
+        "round-91 widened-set self-roundtrip (half-pel-favourable, no residue): \
+         int = {psnr_int:.2} dB, qpel(widened) = {psnr_qpel:.2} dB"
+    );
+    // The widened qpel adaptive selector must at least *match* the
+    // int-pel ceiling on this fixture; on the cosine portion the
+    // half-pel candidate is the perfect MV match, so the widened
+    // selector should be strictly better than int-pel only. Lower
+    // bound: ≥ int-pel PSNR (no regression).
+    assert!(
+        psnr_qpel >= psnr_int - 0.5,
+        "round-91 widened qpel PSNR {psnr_qpel:.2} dB regressed below \
+         int-pel-only baseline {psnr_int:.2} dB on the half-pel-favourable \
+         fixture — strict-superset invariant broken"
+    );
+    // Both modes should clear a basic 30 dB floor on this clean
+    // synthetic fixture — failures below this are linkage bugs, not
+    // candidate-set issues.
+    assert!(
+        psnr_qpel >= 30.0,
+        "round-91 widened qpel PSNR {psnr_qpel:.2} dB below 30 dB floor \
+         on the half-pel-favourable fixture — linkage issue"
     );
 }
