@@ -95,7 +95,16 @@
 //!   pictures and ≥48 dB Y/U on a testsrc gradient. Pairs with the
 //!   round-1 inter encoder for a homogeneous-syntax 2-frame stream
 //!   that ffmpeg's `dirac` decoder accepts end-to-end (cross-decoded
-//!   intra Y PSNR ≈ 52 dB).
+//!   intra Y PSNR ≈ 52 dB). A **VLC (non-arithmetic) variant**
+//!   ([`encoder_intra_core::encode_core_intra_picture_vlc`] /
+//!   [`encoder_intra_core::encode_single_core_intra_stream_vlc`],
+//!   parse code `0x4C`) emits the same picture with §13.4.2.2 plain
+//!   exp-Golomb entropy instead of the arithmetic coder — the encoder
+//!   counterpart to the decoder's `decode_subband_vlc`. It shares the
+//!   AC codeblock/skip/quant-offset walk and applies no entropy-coder
+//!   rounding, so at `qindex = 0` it is strictly lossless (bit-exact on
+//!   the testsrc V-plane gradient where the AC path keeps a ~1-LSB
+//!   roughness).
 //!
 //! Still unsupported (planned): v3 extended transform parameters
 //! (horizontal-only transforms); per-codeblock partitioning beyond
