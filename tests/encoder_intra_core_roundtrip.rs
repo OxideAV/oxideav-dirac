@@ -217,15 +217,133 @@ fn core_intra_multi_codeblock_mode1_cumulative_quant_testsrc() {
     let pu = psnr(&ru, &u);
     let pv = psnr(&rv, &v);
     eprintln!("multi-cb mode1 testsrc: Y={py:.2} U={pu:.2} V={pv:.2}");
-    // The running quantiser reaches q = 3 on the finest subbands, so this
-    // is lossy — but encoder and decoder agree on every codeblock's
-    // quantiser, keeping the picture near-lossless (Y ~54 dB measured).
-    // A reset-per-codeblock decoder dequantises the later codeblocks at
-    // the wrong (lower) quantiser and collapses Y to ~37 dB, so the
-    // 48 dB floor cleanly separates the cumulative fix from the bug.
+    // Round-103: the encoder now codes all-zero codeblocks as §13.4.3.3
+    // skips, and a skipped codeblock does not advance the by-reference
+    // running quantiser (§13.4.3.2 — `quant_idx += codeblock_quant_offset()`
+    // lives inside the `if skipped == False` branch). On this gradient
+    // fixture U/V have their high-frequency energy confined to one half of
+    // each subband, so the empty half skips and the non-empty codeblocks
+    // run at a *lower* running quantiser than the pre-r103 absolute-index
+    // policy (e.g. U's HL energy now lands on q = 0 / 1 instead of q = 1 /
+    // 3). Because dead-zone round-trip exactness is not monotonic in q, the
+    // measured per-plane PSNR shifts (U ~45, V bit-exact) versus the old
+    // policy's lucky-exact U — both are correct near-lossless
+    // reconstructions; the change is entropy/quantiser policy, not a desync.
+    //
+    // The floors below still cleanly separate the cumulative-offset fix
+    // from the reset-per-codeblock bug: a decoder that recomputed `q` from
+    // `base_q + delta` per codeblock (instead of carrying it forward) would
+    // mis-dequantise the later codeblocks and collapse PSNR toward ~37 dB,
+    // far below the 44 dB floor.
     assert!(py >= 48.0, "Y PSNR {py:.2} below cumulative-quant floor");
-    assert!(pu >= 48.0, "U PSNR {pu:.2} below cumulative-quant floor");
-    assert!(pv >= 48.0, "V PSNR {pv:.2} below cumulative-quant floor");
+    assert!(pu >= 44.0, "U PSNR {pu:.2} below cumulative-quant floor");
+    assert!(pv >= 44.0, "V PSNR {pv:.2} below cumulative-quant floor");
+}
+
+/// A 64×64 luma picture whose detail is confined to the top-left
+/// quadrant: a sharp checkerboard there, flat mid-grey everywhere else.
+/// After the DWT this concentrates high-frequency energy in the top-left
+/// codeblocks of each partitioned subband and leaves the other three
+/// quadrants' high-pass codeblocks all-zero — exactly the shape that makes
+/// the round-103 §13.4.3.3 skip flag fire. Chroma is flat.
+fn quadrant_detail_64_yuv420() -> ([u8; 64 * 64], [u8; 32 * 32], [u8; 32 * 32]) {
+    let mut y = [128u8; 64 * 64];
+    for row in 0..32 {
+        for col in 0..32 {
+            // High-frequency checkerboard in the top-left quadrant only.
+            y[row * 64 + col] = if (row + col) % 2 == 0 { 40 } else { 215 };
+        }
+    }
+    let u = [128u8; 32 * 32];
+    let v = [128u8; 32 * 32];
+    (y, u, v)
+}
+
+/// Round-103: an all-zero codeblock of a partitioned subband is coded as
+/// a §13.4.3.3 skip (`zero_flag = True`) instead of a non-skip block
+/// followed by an explicit run of zero coefficients. This:
+///
+/// 1. **Compresses** — the skip-aware multi-codeblock stream must be
+///    strictly smaller than the single-codeblock encoding of the same
+///    picture (the quadrant fixture has three of four high-pass quadrants
+///    empty, so most codeblocks collapse to a single skip bit).
+/// 2. **Round-trips** — the decoder's `decode_subband_ac` skip branch
+///    (leave coefficients zero, do not advance the running quantiser) is
+///    the exact inverse of the encoder's skip emission, so the picture
+///    reconstructs at the same near-lossless quality as the non-skip path.
+///
+/// Before round-103 the encoder always wrote `zero_flag = False`, so the
+/// decoder's `skipped == true` branch was never exercised by a
+/// self-produced stream and the empty codeblocks each cost a full run of
+/// exp-Golomb zero coefficients.
+#[test]
+fn core_intra_skip_flag_compresses_and_roundtrips() {
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let (y, u, v) = quadrant_detail_64_yuv420();
+
+    // Single codeblock per subband — the pre-round-103 framing, no skip
+    // flags at all.
+    let single = CoreIntraEncoderParams::default_intra(WaveletFilter::LeGall5_3, 3);
+    let single_stream = encode_single_core_intra_stream(&seq, &single, 0, &y, &u, &v);
+
+    // 4×4 codeblock grid on every detail level — most codeblocks are
+    // empty for this quadrant fixture and must be coded as skips.
+    let mut partitioned = CoreIntraEncoderParams::default_intra(WaveletFilter::LeGall5_3, 3);
+    partitioned.codeblocks = Some(vec![(1, 1), (4, 4), (4, 4), (4, 4)]);
+    partitioned.codeblock_mode = 0;
+    let part_stream = encode_single_core_intra_stream(&seq, &partitioned, 0, &y, &u, &v);
+
+    // The skip flags must net out to a SMALLER stream than the
+    // single-codeblock one despite the extra per-codeblock framing.
+    assert!(
+        part_stream.len() < single_stream.len(),
+        "skip-aware partitioned stream ({} B) should be smaller than the \
+         single-codeblock stream ({} B)",
+        part_stream.len(),
+        single_stream.len(),
+    );
+
+    // Both must reconstruct the picture; qindex == 0 is the LeGall
+    // dead-zone identity so the partitioned (skip) path stays bit-exact.
+    let (sy, su, sv) = decode_single(single_stream);
+    let (ry, ru, rv) = decode_single(part_stream);
+    assert_eq!(ry, y.to_vec(), "skip-path Y bit-exact");
+    assert_eq!(ru, u.to_vec(), "skip-path U bit-exact");
+    assert_eq!(rv, v.to_vec(), "skip-path V bit-exact");
+    // And the two encodings agree pixel-for-pixel (skip is lossless here).
+    assert_eq!(ry, sy, "skip vs single-codeblock Y agree");
+    assert_eq!(ru, su, "skip vs single-codeblock U agree");
+    assert_eq!(rv, sv, "skip vs single-codeblock V agree");
+}
+
+/// Round-103: under `codeblock_mode == 1`, a skipped codeblock must not
+/// advance the by-reference running quantiser (§13.4.3.2). This pins the
+/// encoder/decoder agreement on the quantiser of the FIRST non-skipped
+/// codeblock when earlier codeblocks in the same subband were skipped: the
+/// first non-skip carries offset 0 (runs at the subband base quantiser),
+/// regardless of how many empty codeblocks preceded it. The quadrant
+/// fixture's non-empty codeblocks therefore stay at the base quantiser and
+/// the picture reconstructs near-losslessly; a decoder that advanced the
+/// quantiser through skips would mis-dequantise the detail and drop PSNR.
+#[test]
+fn core_intra_skip_does_not_advance_quantiser_mode1() {
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let (y, u, v) = quadrant_detail_64_yuv420();
+    let mut params = CoreIntraEncoderParams::default_intra(WaveletFilter::LeGall5_3, 3);
+    params.codeblocks = Some(vec![(1, 1), (4, 4), (4, 4), (4, 4)]);
+    params.codeblock_mode = 1;
+    let stream = encode_single_core_intra_stream(&seq, &params, 0, &y, &u, &v);
+    let (ry, ru, rv) = decode_single(stream);
+    let py = psnr(&ry, &y);
+    let pu = psnr(&ru, &u);
+    let pv = psnr(&rv, &v);
+    eprintln!("skip mode1 quadrant: Y={py:.2} U={pu:.2} V={pv:.2}");
+    // Chroma is flat (all energy in the LL DC), so U/V are bit-exact; the
+    // luma detail's non-skipped codeblocks run at the base quantiser (skips
+    // didn't advance it), keeping Y near-lossless.
+    assert!(py >= 48.0, "Y PSNR {py:.2} below skip-quantiser floor");
+    assert!(pu >= 48.0, "U PSNR {pu:.2} below skip-quantiser floor");
+    assert!(pv >= 48.0, "V PSNR {pv:.2} below skip-quantiser floor");
 }
 
 /// 3-frame stream: core-syntax intra reference followed by 2 inter

@@ -353,13 +353,18 @@ fn write_subband_block(
 }
 
 /// The per-codeblock quantiser offset the encoder emits in
-/// `codeblock_mode == 1`. The first codeblock of every subband carries
-/// `0` (so its effective quantiser equals the subband `qindex`); each
-/// later codeblock carries `+1`, giving a strictly increasing running
-/// quantiser in codeblock raster order (§13.4.3.2 — offsets accumulate
-/// by reference). The single-codeblock LL band never reaches this path.
-fn codeblock_offset(cb_index: u32) -> i32 {
-    if cb_index == 0 {
+/// `codeblock_mode == 1`. The first **non-skipped** codeblock of every
+/// subband carries `0` (so its effective quantiser equals the subband
+/// `qindex`); each later non-skipped codeblock carries `+1`, giving a
+/// strictly increasing running quantiser across the non-skipped codeblocks
+/// in raster order (§13.4.3.2 — offsets accumulate by reference, and the
+/// accumulation lives inside the `if skipped == False` branch so skipped
+/// codeblocks neither emit an offset nor advance the running quantiser).
+/// `nonskip_index` is therefore the ordinal among non-skipped codeblocks,
+/// not the absolute codeblock index. The single-codeblock LL band never
+/// reaches this path.
+fn codeblock_offset(nonskip_index: u32) -> i32 {
+    if nonskip_index == 0 {
         0
     } else {
         1
@@ -371,12 +376,26 @@ fn codeblock_offset(cb_index: u32) -> i32 {
 /// [`crate::picture_core`] `decode_subband_ac`. For a single codeblock
 /// (the LL band and any subband when `codeblocks == (1, 1)`) this emits
 /// neither a skip flag nor a quant offset; for a partitioned subband it
-/// emits the ZERO_BLOCK skip flag (always non-skip here) and, under
-/// `codeblock_mode == 1`, the differential quant offset, then quantises
-/// the codeblock's raw coefficients at the running quantiser before
-/// coding them. `qpy` is updated in place so the written-back quantised
-/// values back the neighbourhood/sign context derivation for subsequent
-/// codeblocks (and downstream subbands' parent lookups).
+/// emits the §13.4.3.3 ZERO_BLOCK skip flag per codeblock and, under
+/// `codeblock_mode == 1`, the §13.4.3.4 differential quant offset.
+///
+/// **Round-103**: an all-zero codeblock of a partitioned subband is now
+/// coded as a *skip* (`zero_flag = True`) rather than as a non-skip block
+/// followed by a run of zero coefficients. Per §13.4.3.2 a skipped
+/// codeblock emits no quant offset and does NOT advance the by-reference
+/// running quantiser (`quant_idx += codeblock_quant_offset()` lives inside
+/// the `if skipped == False` branch). The skip decision is taken on the
+/// *quantised* coefficients, so a high running quantiser that zeroes a
+/// codeblock's coefficients turns it into a skip. The level-0 LL band is
+/// always a single codeblock, so it never skips (its DC energy is also
+/// non-zero in practice).
+///
+/// `qpy` is updated in place: each codeblock's coefficients are quantised
+/// at its running quantiser before coding, so the written-back values back
+/// the neighbourhood / sign context derivation for subsequent codeblocks
+/// (and downstream subbands' parent lookups). The merged single walk keeps
+/// the skip decision, the running quantiser and the emitted symbols
+/// self-consistent with the decoder's `decode_subband_ac` read order.
 fn encode_subband_ac(
     pyramid: &mut [[SubbandData; 4]],
     level: u32,
@@ -394,72 +413,101 @@ fn encode_subband_ac(
     let (cbx, cby) = (codeblocks.0.max(1), codeblocks.1.max(1));
     let single_cb = cbx * cby == 1;
 
-    // Phase 1: quantise the raw HL/LH/HH coefficients in place at the
-    // running per-codeblock quantiser. The level-0 LL band is already
-    // quantised + DC-predicted (see `quantise_and_dc_predict_ll`) so it
-    // is left untouched here; its lone codeblock runs at `qindex` (offset
-    // 0, emitted in Phase 2 when mode == 1). After this phase the band
-    // holds the exact quantised values both the encoder contexts and the
-    // decoder operate on.
-    if orient != Orient::LL {
-        let mut q = params.qindex as i32;
-        let mut cb_index = 0u32;
-        for cy in 0..cby {
-            for cx in 0..cbx {
-                if params.codeblock_mode == 1 {
-                    // §13.4.3.2: offsets accumulate by reference.
-                    q = (q + codeblock_offset(cb_index)).max(0);
-                }
-                cb_index += 1;
-                let (left, right, top, bottom) = cb_bounds(cx, cy, cbx, cby, band_w, band_h);
+    // The level-0 LL band is already quantised + DC-predicted (see
+    // `quantise_and_dc_predict_ll`); leave its coefficients untouched and
+    // run its lone codeblock at the base `qindex`.
+    let is_ll = orient == Orient::LL;
+
+    // Single left-to-right codeblock walk. The running quantiser `q`
+    // advances by `codeblock_offset` ONLY for non-skipped codeblocks
+    // (mode 1), and the offset symbol counts non-skipped codeblocks so
+    // encoder and decoder stay in lockstep: §13.4.3.2 modifies `quant_idx`
+    // inside the `if skipped == False` branch. `nonskip_index` is the
+    // ordinal of the current codeblock among the non-skipped ones, used to
+    // pick offset 0 for the first non-skipped codeblock and +1 thereafter.
+    let mut q = params.qindex as i32;
+    let mut nonskip_index = 0u32;
+    for cy in 0..cby {
+        for cx in 0..cbx {
+            let (left, right, top, bottom) = cb_bounds(cx, cy, cbx, cby, band_w, band_h);
+
+            // Tentative quantiser for this codeblock had it not been
+            // skipped: the running `q` plus this non-skip ordinal's offset.
+            let tentative_q = if params.codeblock_mode == 1 {
+                (q + codeblock_offset(nonskip_index)).max(0)
+            } else {
+                q
+            };
+
+            // Quantise the codeblock's raw coefficients at the tentative
+            // quantiser (LL is pre-quantised and left as-is). A codeblock
+            // is a skip candidate when every quantised coefficient is zero.
+            let mut all_zero = true;
+            if !is_ll {
                 let band = &mut pyramid[level_idx][orient_idx];
                 for y in top..bottom {
                     for x in left..right {
                         let raw = band.get(y, x);
-                        band.set(y, x, quantise_coeff(raw, q as u32));
+                        let qc = quantise_coeff(raw, tentative_q as u32);
+                        band.set(y, x, qc);
+                        if qc != 0 {
+                            all_zero = false;
+                        }
+                    }
+                }
+            } else {
+                let band = &pyramid[level_idx][orient_idx];
+                for y in top..bottom {
+                    for x in left..right {
+                        if band.get(y, x) != 0 {
+                            all_zero = false;
+                        }
                     }
                 }
             }
-        }
-    }
 
-    // The decoder consults the parent band when level >= 2 and the
-    // current band on the partial-fill side. We re-walk the codeblock
-    // raster order to match its `parent_zero` / `nhood_zero` /
-    // `sign_pred` calls symbol-for-symbol.
-    let parent: Option<&SubbandData> = if level >= 2 {
-        Some(&pyramid[level_idx - 1][orient_idx])
-    } else {
-        None
-    };
-    let band = &pyramid[level_idx][orient_idx];
-
-    // Phase 2: emit skip flags + quant offsets + coefficients in the
-    // exact codeblock walk the decoder reads. Per §13.4.3.3 the skip flag
-    // is omitted for a single-codeblock subband; per §13.4.3.4 the quant
-    // offset is emitted for EVERY codeblock when mode == 1 (including the
-    // single-codeblock case — the decoder always reads it in that mode).
-    let mut cb_index = 0u32;
-    for cy in 0..cby {
-        for cx in 0..cbx {
+            // §13.4.3.3: the skip flag is only present when the subband
+            // has more than one codeblock; a single-codeblock subband can
+            // never skip. Skip only when the codeblock is genuinely empty.
+            let skipped = !single_cb && all_zero;
             if !single_cb {
-                // §13.4.3.3 zero_flag: never skipped here (we always have
-                // coefficients to send), coded against ZERO_BLOCK.
-                enc.write_bool(&mut bank, ctx::ZERO_BLOCK, false);
+                enc.write_bool(&mut bank, ctx::ZERO_BLOCK, skipped);
             }
+            if skipped {
+                // §13.4.3.2: a skipped codeblock emits no quant offset and
+                // does NOT advance the running quantiser. Its coefficients
+                // are already zero (decoder leaves them zero too).
+                continue;
+            }
+
             if params.codeblock_mode == 1 {
                 // §13.4.3.4 codeblock_quant_offset against the Q_OFFSET_*
-                // contexts (follow / data / sign).
+                // contexts (follow / data / sign). Commit the running
+                // quantiser to the tentative value for this codeblock.
                 enc.write_sint(
                     &mut bank,
                     &[ctx::Q_OFFSET_FOLLOW],
                     ctx::Q_OFFSET_DATA,
                     ctx::Q_OFFSET_SIGN,
-                    codeblock_offset(cb_index),
+                    codeblock_offset(nonskip_index),
                 );
+                q = tentative_q;
             }
-            cb_index += 1;
-            let (left, right, top, bottom) = cb_bounds(cx, cy, cbx, cby, band_w, band_h);
+            nonskip_index += 1;
+
+            // The decoder consults the parent band (level >= 2) and the
+            // current band on the partial-fill side. Re-borrow per
+            // codeblock so the parent borrow doesn't outlive the mutable
+            // quantise pass above.
+            let (parent, band): (Option<&SubbandData>, &SubbandData) = if level >= 2 {
+                let (lower, upper) = pyramid.split_at(level_idx);
+                (
+                    Some(&lower[level_idx - 1][orient_idx]),
+                    &upper[0][orient_idx],
+                )
+            } else {
+                (None, &pyramid[level_idx][orient_idx])
+            };
             encode_codeblock_coeffs(
                 &mut enc, &mut bank, band, parent, orient, left, right, top, bottom,
             );

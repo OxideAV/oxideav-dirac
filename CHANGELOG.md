@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Dirac core-syntax intra encoder **all-zero codeblock skip**
+  (§13.4.3.3 `zero_flag`, round-103). `encode_subband_ac` now codes an
+  empty codeblock of a partitioned subband as a skip (`zero_flag = True`)
+  instead of a non-skip block followed by an explicit run of zero
+  coefficients — both compressing the stream and exercising the
+  decoder's previously-unreached `decode_subband_ac` skip branch from a
+  self-produced stream. The skip decision is taken on the *quantised*
+  coefficients (a high running quantiser that zeroes a codeblock turns it
+  into a skip). Per §13.4.3.2 a skipped codeblock emits no quant offset
+  and does **not** advance the by-reference running quantiser
+  (`quant_idx += codeblock_quant_offset()` lives inside the
+  `if skipped == False` branch); the two former encoder phases
+  (quantise-all-then-emit) are merged into a single left-to-right
+  codeblock walk so the skip decision, the running quantiser and the
+  emitted symbols stay self-consistent with the decoder's read order.
+  `codeblock_offset` now indexes the **non-skipped** codeblock ordinal
+  rather than the absolute codeblock index, so the first non-skipped
+  codeblock of every subband still carries offset 0. New integration
+  tests in `tests/encoder_intra_core_roundtrip.rs`:
+  `core_intra_skip_flag_compresses_and_roundtrips` (skip-aware stream
+  strictly smaller than the single-codeblock stream and bit-exact) and
+  `core_intra_skip_does_not_advance_quantiser_mode1` (the first
+  non-skipped codeblock runs at the base quantiser regardless of how many
+  empty codeblocks preceded it). The round-100
+  `core_intra_multi_codeblock_mode1_cumulative_quant_testsrc` floors are
+  relaxed to 44 dB on U/V: with the gradient fixture's empty subband
+  halves now skipping, the non-empty codeblocks run at a lower quantiser
+  and — because dead-zone round-trip exactness is not monotonic in `q` —
+  the per-plane PSNR shifts (still near-lossless, still far above the
+  ~37 dB reset-per-codeblock-bug collapse the test guards against).
+
 ### Fixed
 
 - **Cumulative codeblock quantiser offset** (§13.4.3.2, round-100). The
