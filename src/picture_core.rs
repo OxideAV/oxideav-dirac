@@ -236,6 +236,12 @@ fn decode_subband_vlc(
     let base_q = quant_index.saturating_sub(q_matrix_entry);
     let (cbx, cby) = cb_counts(params, level);
 
+    // §13.4.3.2: `quant_idx` is passed by reference and modified
+    // cumulatively by each codeblock's `codeblock_quant_offset()`. The
+    // offsets are differential, so a non-skipped codeblock's effective
+    // quantiser is the running value carried forward from every earlier
+    // codeblock in raster order — NOT a fresh `base_q + delta`.
+    let mut q = base_q;
     for cy in 0..cby {
         for cx in 0..cbx {
             let skipped = if cbx * cby == 1 {
@@ -246,7 +252,6 @@ fn decode_subband_vlc(
             if skipped {
                 continue;
             }
-            let mut q = base_q;
             if params.codeblock_mode == 1 {
                 let delta = r.read_sintb();
                 let next = q as i32 + delta;
@@ -291,6 +296,11 @@ fn decode_subband_ac(
     let (cbx, cby) = cb_counts(params, level);
     let single_cb = cbx * cby == 1;
 
+    // §13.4.3.2: the codeblock quant offset is differential and modifies
+    // `quant_idx` by reference, so the effective quantiser accumulates
+    // across codeblocks in raster order. Hold the running value outside
+    // the loop instead of resetting it to `base_q` per codeblock.
+    let mut q = base_q;
     for cy in 0..cby {
         for cx in 0..cbx {
             let skipped = if single_cb {
@@ -301,7 +311,6 @@ fn decode_subband_ac(
             if skipped {
                 continue;
             }
-            let mut q = base_q;
             if params.codeblock_mode == 1 {
                 // §13.4.3.4: signed quant offset coded against the
                 // Q_OFFSET_* contexts (follow / data / sign).
@@ -603,5 +612,75 @@ mod tests {
         assert_eq!(ll.get(0, 1), 0);
         assert_eq!(ll.get(1, 0), -1);
         assert_eq!(ll.get(1, 1), 3);
+    }
+
+    /// §13.4.3.2 cumulative codeblock quant offset (round-100 fix).
+    ///
+    /// A 2x1 HL band split into two 1x1 codeblocks at `codeblock_mode = 1`
+    /// with subband `quant_index = 0`. Each codeblock carries the offset
+    /// `+4` and the coefficient `+1`. The running quantiser must
+    /// accumulate by reference across codeblocks:
+    ///
+    /// * codeblock (0,0): q = 0 + 4 = 4   → `inverse_quant(1, 4) = 3`
+    /// * codeblock (1,0): q = 4 + 4 = 8   → `inverse_quant(1, 8) = 6`
+    ///
+    /// A decoder that reset `q` to `base_q + delta` per codeblock would
+    /// dequantise the second codeblock at q = 4 and recover `3` instead of
+    /// `6`. The asserted `6` therefore pins the cumulative behaviour.
+    #[test]
+    fn vlc_codeblock_quant_offset_accumulates_across_codeblocks() {
+        // Build the VLC block with the symmetric `BitWriter`: for each of
+        // the two codeblocks emit the skip flag (false), the differential
+        // quant offset (+4) and one coefficient (+1).
+        let mut w = crate::bitwriter::BitWriter::new();
+        for _ in 0..2 {
+            w.write_bool(false); // §13.4.3.3 zero_flag: not skipped
+            w.write_sint(4); // §13.4.3.4 codeblock_quant_offset = +4
+            w.write_sint(1); // the codeblock's single coefficient = +1
+        }
+        let byte_buf = w.finish();
+
+        // dwt_depth 1; codeblocks[1] = (2, 1) → two horizontal codeblocks
+        // on the level-1 HL band. codeblock_mode = 1 enables the offset.
+        let params = CoreTransformParameters {
+            wavelet: WaveletFilter::LeGall5_3,
+            dwt_depth: 1,
+            codeblocks: vec![(1, 1), (2, 1)],
+            codeblock_mode: 1,
+            quant_matrix: None,
+        };
+        // Pyramid: level 0 LL (unused here), level 1 HL is the 2x1 band.
+        let mut py = vec![
+            [
+                SubbandData::new(2, 1),
+                SubbandData::new(0, 0),
+                SubbandData::new(0, 0),
+                SubbandData::new(0, 0),
+            ],
+            [
+                SubbandData::new(0, 0),
+                SubbandData::new(2, 1),
+                SubbandData::new(0, 0),
+                SubbandData::new(0, 0),
+            ],
+        ];
+        let total_bits = (byte_buf.len() as u64) * 8;
+        decode_subband_vlc(
+            &byte_buf,
+            total_bits,
+            &mut py,
+            1,
+            Orient::HL,
+            2,
+            1,
+            &params,
+            0,
+        )
+        .unwrap();
+        let hl = &py[1][1];
+        // First codeblock dequantised at q = 4.
+        assert_eq!(hl.get(0, 0), 3, "codeblock (0,0) at q=4");
+        // Second codeblock dequantised at the CUMULATIVE q = 8, not q = 4.
+        assert_eq!(hl.get(0, 1), 6, "codeblock (1,0) at cumulative q=8");
     }
 }

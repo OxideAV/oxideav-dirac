@@ -55,9 +55,15 @@ use crate::sequence::SequenceHeader;
 use crate::subband::{padded_component_dims, Orient, SubbandData};
 use crate::wavelet::{dwt, WaveletFilter};
 
-/// Encoder-side core-syntax intra parameters. Surface stays small for
-/// r2 — single-codeblock per subband, no per-codeblock quant offset,
-/// no custom quant matrix.
+/// Encoder-side core-syntax intra parameters.
+///
+/// The default surface stays small — single-codeblock per subband, no
+/// per-codeblock quant offset, no custom quant matrix. Round-100 adds an
+/// optional **spatial partition** (§11.3.3 `codeblock_parameters`) that
+/// splits each HL/LH/HH subband into a grid of codeblocks and, when
+/// `codeblock_mode == 1`, codes a per-codeblock differential quantiser
+/// offset (§13.4.3.4). The level-0 LL band stays a single codeblock so
+/// the §13.3 DC-prediction pass it carries is unaffected.
 #[derive(Debug, Clone)]
 pub struct CoreIntraEncoderParams {
     pub wavelet: WaveletFilter,
@@ -66,17 +72,51 @@ pub struct CoreIntraEncoderParams {
     /// for small coefficients (the dead-zone quantiser's `qf=4`
     /// rounding gives `4*|x|/4 = |x|`).
     pub qindex: u32,
+    /// Optional spatial partition. `None` ⇒ `spatial_partition_flag = 0`
+    /// (one codeblock per subband, the pre-round-100 behaviour). `Some`
+    /// holds the per-level `(codeblocks_x, codeblocks_y)` counts for
+    /// levels `0..=dwt_depth`; the level-0 entry is forced to `(1, 1)`
+    /// regardless of what the caller supplies so DC prediction keeps a
+    /// single LL codeblock.
+    pub codeblocks: Option<Vec<(u32, u32)>>,
+    /// `CODEBLOCK_MODE` (§11.3.3): `0` = single quantiser for the whole
+    /// subband; `1` = per-codeblock differential quantiser offset. Only
+    /// meaningful when `codeblocks` is `Some`.
+    pub codeblock_mode: u32,
 }
 
 impl CoreIntraEncoderParams {
     /// Default core-syntax intra parameters: LeGall 5/3 at depth 3,
-    /// `qindex=0` (near-lossless). Matches the `encoder::EncoderParams`
-    /// defaults for the HQ path.
+    /// `qindex=0` (near-lossless), single codeblock per subband. Matches
+    /// the `encoder::EncoderParams` defaults for the HQ path.
     pub fn default_intra(wavelet: WaveletFilter, dwt_depth: u32) -> Self {
         Self {
             wavelet,
             dwt_depth,
             qindex: 0,
+            codeblocks: None,
+            codeblock_mode: 0,
+        }
+    }
+
+    /// The effective per-level codeblock grid. `(1, 1)` for every level
+    /// when `codeblocks` is `None`; otherwise the caller's grid with the
+    /// level-0 LL band forced to `(1, 1)`.
+    fn codeblock_grid(&self) -> Vec<(u32, u32)> {
+        match &self.codeblocks {
+            None => vec![(1, 1); self.dwt_depth as usize + 1],
+            Some(grid) => {
+                let mut g: Vec<(u32, u32)> = (0..=self.dwt_depth as usize)
+                    .map(|lvl| {
+                        grid.get(lvl)
+                            .copied()
+                            .map(|(x, y)| (x.max(1), y.max(1)))
+                            .unwrap_or((1, 1))
+                    })
+                    .collect();
+                g[0] = (1, 1);
+                g
+            }
         }
     }
 }
@@ -126,17 +166,22 @@ pub fn encode_core_intra_picture(
     let mut u_qpy = forward_and_quantise(u, chroma_w, chroma_h, sequence.chroma_depth, params);
     let mut v_qpy = forward_and_quantise(v, chroma_w, chroma_h, sequence.chroma_depth, params);
 
-    // Forward DC prediction on each component's level-0 LL band — the
-    // decoder unconditionally inverts this for intra pictures (§13.4.2).
-    forward_dc_prediction_on_ll(&mut y_qpy);
-    forward_dc_prediction_on_ll(&mut u_qpy);
-    forward_dc_prediction_on_ll(&mut v_qpy);
+    // Quantise + forward-DC-predict each component's level-0 LL band.
+    // The decoder inverts the DC prediction unconditionally for intra
+    // pictures (§13.4.2). The LL band is always a single codeblock at the
+    // base quantiser (`codeblock_grid` forces level 0 to (1, 1) and the
+    // running offset for its lone codeblock is 0), so it stays quantised
+    // at `qindex`. `forward_and_quantise` now returns the *raw* DWT
+    // pyramid; LL is quantised here and HL/LH/HH per-codeblock below.
+    quantise_and_dc_predict_ll(&mut y_qpy, params.qindex);
+    quantise_and_dc_predict_ll(&mut u_qpy, params.qindex);
+    quantise_and_dc_predict_ll(&mut v_qpy, params.qindex);
 
     // §13.4.1 core_transform_data — for each component: LL @ level 0,
     // then HL/LH/HH @ levels 1..=dwt_depth.
-    write_component_subbands(&mut w, params, &y_qpy);
-    write_component_subbands(&mut w, params, &u_qpy);
-    write_component_subbands(&mut w, params, &v_qpy);
+    write_component_subbands(&mut w, params, &mut y_qpy);
+    write_component_subbands(&mut w, params, &mut u_qpy);
+    write_component_subbands(&mut w, params, &mut v_qpy);
 
     w.byte_align();
     w.finish()
@@ -147,9 +192,21 @@ fn write_core_transform_parameters(w: &mut BitWriter, params: &CoreIntraEncoderP
     // dwt_depth, codeblock_parameters.
     w.write_uint(wavelet_index(params.wavelet));
     w.write_uint(params.dwt_depth);
-    // §11.3.3 codeblock_parameters: spatial_partition_flag = 0 means
-    // every level gets a single codeblock (1, 1).
-    w.write_bool(false);
+    // §11.3.3 codeblock_parameters. With no partition every level gets a
+    // single codeblock (1, 1); with one we emit per-level counts then the
+    // codeblock_mode. Mirrors `picture_core::parse_codeblock_parameters`.
+    match &params.codeblocks {
+        None => w.write_bool(false),
+        Some(_) => {
+            w.write_bool(true);
+            let grid = params.codeblock_grid();
+            for (x, y) in &grid {
+                w.write_uint(*x);
+                w.write_uint(*y);
+            }
+            w.write_uint(params.codeblock_mode);
+        }
+    }
 }
 
 fn wavelet_index(filter: WaveletFilter) -> u32 {
@@ -166,8 +223,15 @@ fn wavelet_index(filter: WaveletFilter) -> u32 {
 
 /// Forward-DWT one component then dead-zone quantise every coefficient.
 /// Mirrors [`crate::encoder::forward_component`] +
-/// [`crate::encoder::quantise_pyramid`] but specialised to the
-/// single-quantiser core-syntax path (one `qindex` for all subbands).
+/// [`crate::encoder::quantise_pyramid`].
+///
+/// The LL band is quantised here at the base `qindex` (it is always a
+/// single codeblock and carries DC prediction). HL/LH/HH coefficients
+/// are also quantised at the base `qindex`; when `codeblock_mode == 1`
+/// the per-codeblock encoder re-quantises them from the recoverable raw
+/// value at each codeblock's running quantiser (see
+/// [`encode_subband_ac`]). With `qindex == 0` and mode 0, qf = 4 →
+/// `4*|x|/4 = |x|` (identity, bit-exact roundtrip).
 fn forward_and_quantise(
     plane: &[u8],
     comp_w: u32,
@@ -186,34 +250,7 @@ fn forward_and_quantise(
             pic.set(y, x, v);
         }
     }
-    let py = dwt(&pic, params.wavelet, params.dwt_depth);
-
-    // Quantise in-place — same dead-zone forward formula as the HQ
-    // encoder. With `qindex=0`, qf=4 → `4*|x|/4 = |x|` (identity).
-    let mut out: Vec<[SubbandData; 4]> = Vec::with_capacity(py.len());
-    for bands in py.iter() {
-        let mut level_out: [SubbandData; 4] = [
-            SubbandData::new(bands[0].width, bands[0].height),
-            SubbandData::new(bands[1].width, bands[1].height),
-            SubbandData::new(bands[2].width, bands[2].height),
-            SubbandData::new(bands[3].width, bands[3].height),
-        ];
-        for orient_idx in 0..4 {
-            let src = &bands[orient_idx];
-            if src.width == 0 || src.height == 0 {
-                continue;
-            }
-            let dst = &mut level_out[orient_idx];
-            for y in 0..src.height {
-                for x in 0..src.width {
-                    let v = src.get(y, x);
-                    dst.set(y, x, quantise_coeff(v, params.qindex));
-                }
-            }
-        }
-        out.push(level_out);
-    }
-    out
+    dwt(&pic, params.wavelet, params.dwt_depth)
 }
 
 /// Dead-zone forward quantisation — same formula as
@@ -232,13 +269,20 @@ fn quantise_coeff(x: i32, q: u32) -> i32 {
     }
 }
 
-/// Subtract the §13.4 prediction from each LL coefficient. The decoder
-/// adds the same prediction back in raster order, so this exactly
-/// inverts the decoder pass on the LL band — equivalent to
-/// [`crate::encoder::forward_dc_prediction`] but operating on the
-/// level-0 LL of an already-quantised pyramid.
-fn forward_dc_prediction_on_ll(pyramid: &mut [[SubbandData; 4]]) {
+/// Quantise the level-0 LL band at `qindex`, then subtract the §13.4
+/// DC prediction from each (quantised) LL coefficient. The decoder
+/// inverse-quantises with the same `qindex` and adds the prediction back
+/// in raster order, so this exactly inverts the decoder pass on the LL
+/// band. The LL band is always a single codeblock, so no per-codeblock
+/// requantisation applies here.
+fn quantise_and_dc_predict_ll(pyramid: &mut [[SubbandData; 4]], qindex: u32) {
     let band = &mut pyramid[0][0];
+    for y in 0..band.height {
+        for x in 0..band.width {
+            let raw = band.get(y, x);
+            band.set(y, x, quantise_coeff(raw, qindex));
+        }
+    }
     crate::encoder::forward_dc_prediction(band);
 }
 
@@ -249,12 +293,13 @@ fn forward_dc_prediction_on_ll(pyramid: &mut [[SubbandData; 4]]) {
 fn write_component_subbands(
     w: &mut BitWriter,
     params: &CoreIntraEncoderParams,
-    qpy: &[[SubbandData; 4]],
+    qpy: &mut [[SubbandData; 4]],
 ) {
-    write_subband_block(w, params, qpy, 0, Orient::LL);
+    let grid = params.codeblock_grid();
+    write_subband_block(w, params, qpy, 0, Orient::LL, grid[0]);
     for level in 1..=params.dwt_depth {
         for orient in [Orient::HL, Orient::LH, Orient::HH] {
-            write_subband_block(w, params, qpy, level, orient);
+            write_subband_block(w, params, qpy, level, orient, grid[level as usize]);
         }
     }
 }
@@ -262,12 +307,20 @@ fn write_component_subbands(
 /// Encode a single subband's coefficients into a self-contained
 /// AC block, then emit `length || quant_index || bytes` framed for
 /// [`crate::picture_core::core_transform_component`].
+///
+/// For HL/LH/HH subbands under `codeblock_mode == 1` this also
+/// re-quantises the raw DWT coefficients per codeblock at the running
+/// quantiser, writing the quantised values back into `qpy` so the
+/// neighbourhood/sign contexts are computed against the same values the
+/// decoder reconstructs. The level-0 LL band is already quantised + DC
+/// predicted (see [`quantise_and_dc_predict_ll`]).
 fn write_subband_block(
     w: &mut BitWriter,
     params: &CoreIntraEncoderParams,
-    qpy: &[[SubbandData; 4]],
+    qpy: &mut [[SubbandData; 4]],
     level: u32,
     orient: Orient,
+    codeblocks: (u32, u32),
 ) {
     w.byte_align();
     let band = &qpy[level as usize][orient.as_index()];
@@ -280,7 +333,7 @@ fn write_subband_block(
     }
 
     // Encode the coefficients under the §13.4.4 contexts.
-    let bytes = encode_subband_ac(qpy, level, orient);
+    let bytes = encode_subband_ac(qpy, level, orient, codeblocks, params);
     if bytes.is_empty() {
         // Defensive — `ArithEncoder::finish` always emits at least one
         // padded byte, but if the future allows zero-size blocks we
@@ -299,30 +352,156 @@ fn write_subband_block(
     w.write_bytes(&bytes);
 }
 
-/// Encode one subband's quantised coefficients with the §13.4.4 AC
-/// contexts. Single codeblock — no skip flag, no quant offset.
-fn encode_subband_ac(pyramid: &[[SubbandData; 4]], level: u32, orient: Orient) -> Vec<u8> {
+/// The per-codeblock quantiser offset the encoder emits in
+/// `codeblock_mode == 1`. The first codeblock of every subband carries
+/// `0` (so its effective quantiser equals the subband `qindex`); each
+/// later codeblock carries `+1`, giving a strictly increasing running
+/// quantiser in codeblock raster order (§13.4.3.2 — offsets accumulate
+/// by reference). The single-codeblock LL band never reaches this path.
+fn codeblock_offset(cb_index: u32) -> i32 {
+    if cb_index == 0 {
+        0
+    } else {
+        1
+    }
+}
+
+/// Encode one subband's coefficients with the §13.4.4 AC contexts,
+/// walking codeblock-by-codeblock to mirror the decoder's
+/// [`crate::picture_core`] `decode_subband_ac`. For a single codeblock
+/// (the LL band and any subband when `codeblocks == (1, 1)`) this emits
+/// neither a skip flag nor a quant offset; for a partitioned subband it
+/// emits the ZERO_BLOCK skip flag (always non-skip here) and, under
+/// `codeblock_mode == 1`, the differential quant offset, then quantises
+/// the codeblock's raw coefficients at the running quantiser before
+/// coding them. `qpy` is updated in place so the written-back quantised
+/// values back the neighbourhood/sign context derivation for subsequent
+/// codeblocks (and downstream subbands' parent lookups).
+fn encode_subband_ac(
+    pyramid: &mut [[SubbandData; 4]],
+    level: u32,
+    orient: Orient,
+    codeblocks: (u32, u32),
+    params: &CoreIntraEncoderParams,
+) -> Vec<u8> {
     let mut bank = ContextBank::new(ctx::NUM_CONTEXTS);
     let mut enc = ArithEncoder::new();
 
     let level_idx = level as usize;
     let orient_idx = orient.as_index();
-
-    // The decoder consults the parent band when level >= 2 and the
-    // current band on the partial-fill side. We re-walk the same
-    // raster order to match its `parent_zero` / `nhood_zero` /
-    // `sign_pred` calls symbol-for-symbol.
     let band_w = pyramid[level_idx][orient_idx].width;
     let band_h = pyramid[level_idx][orient_idx].height;
-    let band = &pyramid[level_idx][orient_idx];
+    let (cbx, cby) = (codeblocks.0.max(1), codeblocks.1.max(1));
+    let single_cb = cbx * cby == 1;
+
+    // Phase 1: quantise the raw HL/LH/HH coefficients in place at the
+    // running per-codeblock quantiser. The level-0 LL band is already
+    // quantised + DC-predicted (see `quantise_and_dc_predict_ll`) so it
+    // is left untouched here; its lone codeblock runs at `qindex` (offset
+    // 0, emitted in Phase 2 when mode == 1). After this phase the band
+    // holds the exact quantised values both the encoder contexts and the
+    // decoder operate on.
+    if orient != Orient::LL {
+        let mut q = params.qindex as i32;
+        let mut cb_index = 0u32;
+        for cy in 0..cby {
+            for cx in 0..cbx {
+                if params.codeblock_mode == 1 {
+                    // §13.4.3.2: offsets accumulate by reference.
+                    q = (q + codeblock_offset(cb_index)).max(0);
+                }
+                cb_index += 1;
+                let (left, right, top, bottom) = cb_bounds(cx, cy, cbx, cby, band_w, band_h);
+                let band = &mut pyramid[level_idx][orient_idx];
+                for y in top..bottom {
+                    for x in left..right {
+                        let raw = band.get(y, x);
+                        band.set(y, x, quantise_coeff(raw, q as u32));
+                    }
+                }
+            }
+        }
+    }
+
+    // The decoder consults the parent band when level >= 2 and the
+    // current band on the partial-fill side. We re-walk the codeblock
+    // raster order to match its `parent_zero` / `nhood_zero` /
+    // `sign_pred` calls symbol-for-symbol.
     let parent: Option<&SubbandData> = if level >= 2 {
         Some(&pyramid[level_idx - 1][orient_idx])
     } else {
         None
     };
+    let band = &pyramid[level_idx][orient_idx];
 
-    for y in 0..band_h {
-        for x in 0..band_w {
+    // Phase 2: emit skip flags + quant offsets + coefficients in the
+    // exact codeblock walk the decoder reads. Per §13.4.3.3 the skip flag
+    // is omitted for a single-codeblock subband; per §13.4.3.4 the quant
+    // offset is emitted for EVERY codeblock when mode == 1 (including the
+    // single-codeblock case — the decoder always reads it in that mode).
+    let mut cb_index = 0u32;
+    for cy in 0..cby {
+        for cx in 0..cbx {
+            if !single_cb {
+                // §13.4.3.3 zero_flag: never skipped here (we always have
+                // coefficients to send), coded against ZERO_BLOCK.
+                enc.write_bool(&mut bank, ctx::ZERO_BLOCK, false);
+            }
+            if params.codeblock_mode == 1 {
+                // §13.4.3.4 codeblock_quant_offset against the Q_OFFSET_*
+                // contexts (follow / data / sign).
+                enc.write_sint(
+                    &mut bank,
+                    &[ctx::Q_OFFSET_FOLLOW],
+                    ctx::Q_OFFSET_DATA,
+                    ctx::Q_OFFSET_SIGN,
+                    codeblock_offset(cb_index),
+                );
+            }
+            cb_index += 1;
+            let (left, right, top, bottom) = cb_bounds(cx, cy, cbx, cby, band_w, band_h);
+            encode_codeblock_coeffs(
+                &mut enc, &mut bank, band, parent, orient, left, right, top, bottom,
+            );
+        }
+    }
+
+    enc.finish()
+}
+
+/// Codeblock boundaries within a subband — identical to the decoder's
+/// `picture_core::codeblock_bounds`.
+fn cb_bounds(
+    cx: u32,
+    cy: u32,
+    cbx: u32,
+    cby: u32,
+    band_w: usize,
+    band_h: usize,
+) -> (usize, usize, usize, usize) {
+    let left = (band_w * cx as usize) / cbx as usize;
+    let right = (band_w * (cx as usize + 1)) / cbx as usize;
+    let top = (band_h * cy as usize) / cby as usize;
+    let bottom = (band_h * (cy as usize + 1)) / cby as usize;
+    (left, right, top, bottom)
+}
+
+/// Encode the quantised coefficients of one codeblock in raster order
+/// under the §13.4.4 contexts.
+#[allow(clippy::too_many_arguments)]
+fn encode_codeblock_coeffs(
+    enc: &mut ArithEncoder,
+    bank: &mut ContextBank,
+    band: &SubbandData,
+    parent: Option<&SubbandData>,
+    orient: Orient,
+    left: usize,
+    right: usize,
+    top: usize,
+    bottom: usize,
+) {
+    for y in top..bottom {
+        for x in left..right {
             let parent_zero = match parent {
                 Some(p) => p.get(y / 2, x / 2) == 0,
                 None => true,
@@ -332,11 +511,9 @@ fn encode_subband_ac(pyramid: &[[SubbandData; 4]], level: u32, orient: Orient) -
             let (follow, data_ctx, sign_ctx) =
                 select_coeff_ctxs(parent_zero, nhood_zero, sign_pred);
             let qc = band.get(y, x);
-            enc.write_sint(&mut bank, follow, data_ctx, sign_ctx, qc);
+            enc.write_sint(bank, follow, data_ctx, sign_ctx, qc);
         }
     }
-
-    enc.finish()
 }
 
 // The next three helpers are byte-for-byte mirrors of the decoder-side
@@ -666,13 +843,14 @@ mod tests {
         for (i, &v) in pattern.iter().enumerate() {
             band_ll.set(i / 4, i % 4, v);
         }
-        let pyramid = vec![[
+        let mut pyramid = vec![[
             band_ll,
             SubbandData::new(0, 0),
             SubbandData::new(0, 0),
             SubbandData::new(0, 0),
         ]];
-        let bytes = encode_subband_ac(&pyramid, 0, Orient::LL);
+        let params_enc = CoreIntraEncoderParams::default_intra(WaveletFilter::LeGall5_3, 1);
+        let bytes = encode_subband_ac(&mut pyramid, 0, Orient::LL, (1, 1), &params_enc);
         assert!(
             !bytes.is_empty(),
             "AC encoder should emit at least one byte"

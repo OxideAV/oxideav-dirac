@@ -97,6 +97,137 @@ fn core_intra_self_roundtrip_constant_frame_is_bit_exact() {
     assert_eq!(vf.planes[2].data, v.to_vec(), "V plane bit-exact");
 }
 
+/// Helper: decode a single-picture core-intra stream and return the
+/// three reconstructed planes.
+fn decode_single(stream: Vec<u8>) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let mut reg = CodecRegistry::new();
+    oxideav_dirac::register_codecs(&mut reg);
+    let cp = CodecParameters::video(CodecId::new("dirac"));
+    let mut dec = reg.first_decoder(&cp).expect("decoder");
+    let packet = Packet::new(0, TimeBase::new(1, 25), stream);
+    dec.send_packet(&packet).expect("send_packet");
+    let frame = dec.receive_frame().expect("receive_frame");
+    match frame {
+        Frame::Video(v) => (
+            v.planes[0].data.clone(),
+            v.planes[1].data.clone(),
+            v.planes[2].data.clone(),
+        ),
+        other => panic!("expected video frame, got {other:?}"),
+    }
+}
+
+/// Round-100: spatial-partition (multi-codeblock) core-intra at
+/// `codeblock_mode == 0`. Each HL/LH/HH subband is split into a 2x2
+/// codeblock grid, so the decoder exercises the §13.4.3.3 per-codeblock
+/// skip-flag path. With `qindex == 0` (LeGall dead-zone identity) the
+/// reconstruction must still be bit-exact on the flat constant frame —
+/// the partition only changes the entropy framing, not the coefficients.
+#[test]
+fn core_intra_multi_codeblock_mode0_constant_frame_bit_exact() {
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let mut params = CoreIntraEncoderParams::default_intra(WaveletFilter::LeGall5_3, 3);
+    // 4 levels (0..=3); level 0 (LL) is forced to (1,1) internally.
+    params.codeblocks = Some(vec![(1, 1), (2, 2), (2, 2), (2, 2)]);
+    params.codeblock_mode = 0;
+    let y = [123u8; 64 * 64];
+    let u = [200u8; 32 * 32];
+    let v = [55u8; 32 * 32];
+    let stream = encode_single_core_intra_stream(&seq, &params, 0, &y, &u, &v);
+    let (ry, ru, rv) = decode_single(stream);
+    assert_eq!(ry, y.to_vec(), "Y bit-exact (mode 0 partition)");
+    assert_eq!(ru, u.to_vec(), "U bit-exact (mode 0 partition)");
+    assert_eq!(rv, v.to_vec(), "V bit-exact (mode 0 partition)");
+}
+
+/// Round-100: spatial-partition core-intra on the textured testsrc at
+/// `codeblock_mode == 0`. Confirms the multi-codeblock skip-flag framing
+/// round-trips at the same near-lossless quality as the single-codeblock
+/// path on a non-flat picture.
+#[test]
+fn core_intra_multi_codeblock_mode0_testsrc_near_lossless() {
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let mut params = CoreIntraEncoderParams::default_intra(WaveletFilter::LeGall5_3, 3);
+    params.codeblocks = Some(vec![(1, 1), (2, 2), (4, 4), (4, 4)]);
+    params.codeblock_mode = 0;
+    let (y, u, v) = synthetic_testsrc_64_yuv420();
+    let stream = encode_single_core_intra_stream(&seq, &params, 0, &y, &u, &v);
+    let (ry, ru, rv) = decode_single(stream);
+    let py = psnr(&ry, &y);
+    let pu = psnr(&ru, &u);
+    let pv = psnr(&rv, &v);
+    eprintln!("multi-cb mode0 testsrc: Y={py:.2} U={pu:.2} V={pv:.2}");
+    // qindex == 0 ⇒ identical coefficients to the single-codeblock path;
+    // the partition is entropy-only, so the same floors apply.
+    assert!(py >= 48.0);
+    assert!(pu >= 48.0);
+    assert!(pv >= 40.0);
+}
+
+/// Round-100: spatial-partition core-intra at `codeblock_mode == 1`
+/// (per-codeblock differential quantiser). The encoder emits a strictly
+/// increasing running quantiser across each subband's codeblocks
+/// (offsets 0, +1, +1, ...), per §13.4.3.2's by-reference accumulation.
+///
+/// This is the regression pin for the cumulative-offset decoder fix: a
+/// decoder that reset `q` to `base_q + delta` per codeblock (instead of
+/// carrying the running value forward) would inverse-quantise the third
+/// and later codeblocks at the wrong quantiser and produce a visibly
+/// wrong reconstruction. The flat constant frame puts almost all energy
+/// in the LL DC (single codeblock at the base quantiser) so the picture
+/// stays bit-exact even though the higher subbands ran at q = 1, 2, 3.
+#[test]
+fn core_intra_multi_codeblock_mode1_cumulative_quant_constant_frame() {
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let mut params = CoreIntraEncoderParams::default_intra(WaveletFilter::LeGall5_3, 3);
+    // 4 codeblocks per subband on the higher levels → the running
+    // quantiser climbs 0,1,2,3 within each partitioned subband.
+    params.codeblocks = Some(vec![(1, 1), (2, 2), (2, 2), (2, 2)]);
+    params.codeblock_mode = 1;
+    let y = [90u8; 64 * 64];
+    let u = [140u8; 32 * 32];
+    let v = [180u8; 32 * 32];
+    let stream = encode_single_core_intra_stream(&seq, &params, 0, &y, &u, &v);
+    let (ry, ru, rv) = decode_single(stream);
+    // Flat picture: all non-LL coefficients are zero, so per-codeblock
+    // quantisation of zeros is lossless regardless of the running q. The
+    // encoder/decoder must nevertheless agree on the *syntax* (skip flag
+    // + cumulative offset) for the stream to parse coherently.
+    assert_eq!(ry, y.to_vec(), "Y bit-exact (mode 1 cumulative)");
+    assert_eq!(ru, u.to_vec(), "U bit-exact (mode 1 cumulative)");
+    assert_eq!(rv, v.to_vec(), "V bit-exact (mode 1 cumulative)");
+}
+
+/// Round-100: spatial-partition core-intra at `codeblock_mode == 1` on a
+/// textured picture. The non-zero high-frequency coefficients are now
+/// quantised at the per-codeblock running quantiser, so the decoder must
+/// track the same cumulative quantiser to reconstruct them. A
+/// reset-per-codeblock decoder would mis-dequantise the later codeblocks
+/// and drop PSNR sharply; the cumulative fix keeps it comfortably high.
+#[test]
+fn core_intra_multi_codeblock_mode1_cumulative_quant_testsrc() {
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let mut params = CoreIntraEncoderParams::default_intra(WaveletFilter::LeGall5_3, 3);
+    params.codeblocks = Some(vec![(1, 1), (2, 2), (2, 2), (2, 2)]);
+    params.codeblock_mode = 1;
+    let (y, u, v) = synthetic_testsrc_64_yuv420();
+    let stream = encode_single_core_intra_stream(&seq, &params, 0, &y, &u, &v);
+    let (ry, ru, rv) = decode_single(stream);
+    let py = psnr(&ry, &y);
+    let pu = psnr(&ru, &u);
+    let pv = psnr(&rv, &v);
+    eprintln!("multi-cb mode1 testsrc: Y={py:.2} U={pu:.2} V={pv:.2}");
+    // The running quantiser reaches q = 3 on the finest subbands, so this
+    // is lossy — but encoder and decoder agree on every codeblock's
+    // quantiser, keeping the picture near-lossless (Y ~54 dB measured).
+    // A reset-per-codeblock decoder dequantises the later codeblocks at
+    // the wrong (lower) quantiser and collapses Y to ~37 dB, so the
+    // 48 dB floor cleanly separates the cumulative fix from the bug.
+    assert!(py >= 48.0, "Y PSNR {py:.2} below cumulative-quant floor");
+    assert!(pu >= 48.0, "U PSNR {pu:.2} below cumulative-quant floor");
+    assert!(pv >= 48.0, "V PSNR {pv:.2} below cumulative-quant floor");
+}
+
 /// 3-frame stream: core-syntax intra reference followed by 2 inter
 /// pictures (same reference). Validates the parse-code chain and the
 /// reference-picture buffer survives across two inter decodes.

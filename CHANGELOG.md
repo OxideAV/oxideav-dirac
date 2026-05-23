@@ -7,7 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Cumulative codeblock quantiser offset** (§13.4.3.2, round-100). The
+  core-syntax coefficient decoder reset the effective quantiser to
+  `base_q + delta` at the *start of each codeblock*, contradicting the
+  spec's `quant_idx += codeblock_quant_offset()` — the offset is
+  differential and accumulates **by reference** across the codeblocks of
+  a subband in raster order. Both the AC path (`decode_subband_ac`) and
+  the VLC path (`decode_subband_vlc`) in `picture_core` now carry the
+  running quantiser forward instead of recomputing it from the subband
+  base each codeblock. The bug was previously dormant (the only encoder
+  that emitted core-syntax intra used a single codeblock per subband, so
+  `codeblock_quant_offset()` was never read); it surfaces with the
+  round-100 spatial-partition encoder below. Pinned by the new unit test
+  `picture_core::tests::vlc_codeblock_quant_offset_accumulates_across_codeblocks`
+  (two 1×1 codeblocks, offsets `+4, +4`, asserting the second codeblock
+  dequantises at the cumulative `q = 8`, recovering `6`, rather than the
+  reset `q = 4` recovering `3`).
+
 ### Added
+
+- Dirac core-syntax **intra spatial partition** (§11.3.3
+  `codeblock_parameters`) on the encoder. `CoreIntraEncoderParams` gains
+  `codeblocks: Option<Vec<(u32, u32)>>` (per-level `(cbx, cby)` grid;
+  level-0 LL is always forced to a single codeblock so its §13.3 DC
+  prediction is preserved) and `codeblock_mode: u32` (0 = single
+  per-subband quantiser; 1 = per-codeblock differential quantiser
+  offset). `write_core_transform_parameters` now emits
+  `spatial_partition_flag = 1` + the per-level counts + the codeblock
+  mode when a grid is supplied; `encode_subband_ac` walks the subband
+  codeblock-by-codeblock (matching the decoder's
+  `decode_subband_ac`/`decode_subband_vlc`), emitting the §13.4.3.3
+  ZERO_BLOCK skip flag (never skipped — coefficients are always present)
+  for partitioned subbands and, under `codeblock_mode == 1`, the
+  §13.4.3.4 differential quant offset (`0` for the first codeblock of
+  every subband, `+1` thereafter → a strictly increasing running
+  quantiser) for **every** codeblock including the single-codeblock LL
+  band, then quantises the codeblock's coefficients at the running
+  quantiser before AC-coding them. The default surface
+  (`CoreIntraEncoderParams::default_intra`) is unchanged
+  (`codeblocks = None`, single codeblock per subband). New integration
+  tests in `tests/encoder_intra_core_roundtrip.rs`: multi-codeblock
+  mode-0 bit-exact (constant frame) + near-lossless (testsrc), and
+  multi-codeblock mode-1 cumulative-quantiser roundtrips that exercise
+  the decoder fix end-to-end (mode-1 testsrc reconstructs at ~54 dB Y
+  with the fix; a reset-per-codeblock decoder collapses it to ~37 dB,
+  below the 48 dB assertion floor).
 
 - Dirac inter encoder **post-OBMC bipred mode-only refinement pass**
   (round-95): the 2-ref analogue of the 1-ref round-80 post-OBMC
