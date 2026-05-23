@@ -136,6 +136,48 @@ pub fn encode_core_intra_picture(
     u: &[u8],
     v: &[u8],
 ) -> Vec<u8> {
+    encode_core_intra_picture_inner(sequence, params, picture_number, y, u, v, true)
+}
+
+/// Encode one core-syntax intra reference picture with the
+/// variable-length-coding (non-arithmetic) entropy path. The returned
+/// bytes follow the parse-info header; the caller pairs this with parse
+/// code `0x4C` (core-syntax, intra reference, **no** arithmetic coding —
+/// Table 9.1).
+///
+/// The whole-picture framing is identical to [`encode_core_intra_picture`]
+/// (§12.2 picture header → §9.6.1 RETD → §11.3 transform parameters →
+/// §13.4.1 transform data). Only the per-codeblock entropy coding differs:
+/// §13.4.3.3 `zero_flag` becomes `read_boolb()` (one raw bit), §13.4.3.4
+/// `codeblock_quant_offset()` becomes `read_sintb()` (plain signed
+/// exp-Golomb) and §13.4.4 `coeff_unpack` becomes `read_sintb()` per
+/// coefficient with no neighbourhood / sign contexts (those condition only
+/// the arithmetic coder). Decoded by [`crate::picture_core`]'s
+/// `decode_subband_vlc` when `using_ac() == False`.
+pub fn encode_core_intra_picture_vlc(
+    sequence: &SequenceHeader,
+    params: &CoreIntraEncoderParams,
+    picture_number: u32,
+    y: &[u8],
+    u: &[u8],
+    v: &[u8],
+) -> Vec<u8> {
+    encode_core_intra_picture_inner(sequence, params, picture_number, y, u, v, false)
+}
+
+/// Shared body for the AC (`0x0C`) and VLC (`0x4C`) core-intra encoders.
+/// `using_ac` selects the per-codeblock entropy path; the §12.2 picture
+/// header, §9.6.1 RETD, §11.3 transform parameters and §13.4.1 transform
+/// data framing are bit-identical between the two.
+fn encode_core_intra_picture_inner(
+    sequence: &SequenceHeader,
+    params: &CoreIntraEncoderParams,
+    picture_number: u32,
+    y: &[u8],
+    u: &[u8],
+    v: &[u8],
+    using_ac: bool,
+) -> Vec<u8> {
     let mut w = BitWriter::new();
 
     // §12.2 picture_header: byte-align then 4-byte picture_number.
@@ -179,9 +221,9 @@ pub fn encode_core_intra_picture(
 
     // §13.4.1 core_transform_data — for each component: LL @ level 0,
     // then HL/LH/HH @ levels 1..=dwt_depth.
-    write_component_subbands(&mut w, params, &mut y_qpy);
-    write_component_subbands(&mut w, params, &mut u_qpy);
-    write_component_subbands(&mut w, params, &mut v_qpy);
+    write_component_subbands(&mut w, params, &mut y_qpy, using_ac);
+    write_component_subbands(&mut w, params, &mut u_qpy, using_ac);
+    write_component_subbands(&mut w, params, &mut v_qpy, using_ac);
 
     w.byte_align();
     w.finish()
@@ -294,12 +336,21 @@ fn write_component_subbands(
     w: &mut BitWriter,
     params: &CoreIntraEncoderParams,
     qpy: &mut [[SubbandData; 4]],
+    using_ac: bool,
 ) {
     let grid = params.codeblock_grid();
-    write_subband_block(w, params, qpy, 0, Orient::LL, grid[0]);
+    write_subband_block(w, params, qpy, 0, Orient::LL, grid[0], using_ac);
     for level in 1..=params.dwt_depth {
         for orient in [Orient::HL, Orient::LH, Orient::HH] {
-            write_subband_block(w, params, qpy, level, orient, grid[level as usize]);
+            write_subband_block(
+                w,
+                params,
+                qpy,
+                level,
+                orient,
+                grid[level as usize],
+                using_ac,
+            );
         }
     }
 }
@@ -321,6 +372,7 @@ fn write_subband_block(
     level: u32,
     orient: Orient,
     codeblocks: (u32, u32),
+    using_ac: bool,
 ) {
     w.byte_align();
     let band = &qpy[level as usize][orient.as_index()];
@@ -332,8 +384,14 @@ fn write_subband_block(
         return;
     }
 
-    // Encode the coefficients under the §13.4.4 contexts.
-    let bytes = encode_subband_ac(qpy, level, orient, codeblocks, params);
+    // Encode the coefficients under the §13.4 entropy path selected by
+    // `using_ac`: arithmetic (§13.4.4 contexts) or VLC (plain
+    // exp-Golomb, §13.4.2.2 / §13.4.4 `read_sintb` branch).
+    let bytes = if using_ac {
+        encode_subband_ac(qpy, level, orient, codeblocks, params)
+    } else {
+        encode_subband_vlc(qpy, level, orient, codeblocks, params)
+    };
     if bytes.is_empty() {
         // Defensive — `ArithEncoder::finish` always emits at least one
         // padded byte, but if the future allows zero-size blocks we
@@ -517,6 +575,122 @@ fn encode_subband_ac(
     enc.finish()
 }
 
+/// Encode one subband's coefficients with the §13.4.2.2 VLC (non-AC)
+/// path, walking codeblock-by-codeblock to mirror the decoder's
+/// [`crate::picture_core`] `decode_subband_vlc`. The codeblock structure
+/// — the §13.4.3.3 `zero_flag` skip, the §13.4.3.2 by-reference running
+/// quantiser and the §13.4.3.4 differential offset — is identical to the
+/// AC path in [`encode_subband_ac`]; only the entropy primitives change:
+///
+/// * `zero_flag(level)` → `write_bool(skipped)` (one raw bit, the
+///   encoder counterpart of `read_boolb()`). As in AC, the flag is only
+///   present for a partitioned subband (`num_blocks > 1`).
+/// * `codeblock_quant_offset()` → `write_sint(offset)` (plain signed
+///   exp-Golomb, the counterpart of `read_sintb()`), emitted only under
+///   `codeblock_mode == 1` inside the non-skip branch.
+/// * each coefficient → `write_sint(qc)`; the VLC path has no
+///   neighbourhood / parent / sign conditioning (those condition only the
+///   arithmetic coder per §13.4.4), so the coefficients are emitted in
+///   raster order with no context state.
+///
+/// `qpy` is updated in place exactly like the AC path: each codeblock's
+/// raw coefficients are quantised at its running quantiser before coding
+/// (LL is pre-quantised + DC-predicted and left untouched) and the skip
+/// decision is taken on the quantised values, so a high running quantiser
+/// that zeroes a codeblock turns it into a skip and the written-back
+/// values stay consistent with what the decoder reconstructs.
+fn encode_subband_vlc(
+    pyramid: &mut [[SubbandData; 4]],
+    level: u32,
+    orient: Orient,
+    codeblocks: (u32, u32),
+    params: &CoreIntraEncoderParams,
+) -> Vec<u8> {
+    let mut w = BitWriter::new();
+
+    let level_idx = level as usize;
+    let orient_idx = orient.as_index();
+    let band_w = pyramid[level_idx][orient_idx].width;
+    let band_h = pyramid[level_idx][orient_idx].height;
+    let (cbx, cby) = (codeblocks.0.max(1), codeblocks.1.max(1));
+    let single_cb = cbx * cby == 1;
+    let is_ll = orient == Orient::LL;
+
+    // §13.4.3.2: the running quantiser advances by `codeblock_offset`
+    // ONLY for non-skipped codeblocks under mode 1, and the offset symbol
+    // counts non-skipped codeblocks so encoder and decoder stay in
+    // lockstep — identical bookkeeping to `encode_subband_ac`.
+    let mut q = params.qindex as i32;
+    let mut nonskip_index = 0u32;
+    for cy in 0..cby {
+        for cx in 0..cbx {
+            let (left, right, top, bottom) = cb_bounds(cx, cy, cbx, cby, band_w, band_h);
+
+            let tentative_q = if params.codeblock_mode == 1 {
+                (q + codeblock_offset(nonskip_index)).max(0)
+            } else {
+                q
+            };
+
+            // Quantise the codeblock's raw coefficients at the tentative
+            // quantiser (LL is pre-quantised and left as-is). A codeblock
+            // is a skip candidate when every quantised coefficient is zero.
+            let mut all_zero = true;
+            if !is_ll {
+                let band = &mut pyramid[level_idx][orient_idx];
+                for y in top..bottom {
+                    for x in left..right {
+                        let raw = band.get(y, x);
+                        let qc = quantise_coeff(raw, tentative_q as u32);
+                        band.set(y, x, qc);
+                        if qc != 0 {
+                            all_zero = false;
+                        }
+                    }
+                }
+            } else {
+                let band = &pyramid[level_idx][orient_idx];
+                for y in top..bottom {
+                    for x in left..right {
+                        if band.get(y, x) != 0 {
+                            all_zero = false;
+                        }
+                    }
+                }
+            }
+
+            // §13.4.3.3 zero_flag — present only for a partitioned subband.
+            let skipped = !single_cb && all_zero;
+            if !single_cb {
+                w.write_bool(skipped);
+            }
+            if skipped {
+                // §13.4.3.2: a skipped codeblock emits no quant offset and
+                // does NOT advance the running quantiser.
+                continue;
+            }
+
+            if params.codeblock_mode == 1 {
+                // §13.4.3.4 codeblock_quant_offset, plain signed exp-Golomb.
+                w.write_sint(codeblock_offset(nonskip_index));
+                q = tentative_q;
+            }
+            nonskip_index += 1;
+
+            // §13.4.4 coeff_unpack VLC branch: plain `read_sintb()` per
+            // coefficient in raster order, no contexts.
+            let band = &pyramid[level_idx][orient_idx];
+            for y in top..bottom {
+                for x in left..right {
+                    w.write_sint(band.get(y, x));
+                }
+            }
+        }
+    }
+
+    w.finish()
+}
+
 /// Codeblock boundaries within a subband — identical to the decoder's
 /// `picture_core::codeblock_bounds`.
 fn cb_bounds(
@@ -676,6 +850,36 @@ pub fn encode_single_core_intra_stream(
     out.extend_from_slice(&sh_payload);
     // `0x0C`: core-syntax, AC, intra reference, num_refs = 0.
     write_parse_info(&mut out, 0x0C, pic_unit_len as u32, sh_unit_len as u32);
+    out.extend_from_slice(&pic_payload);
+    write_parse_info(&mut out, 0x10, 0, pic_unit_len as u32);
+    out
+}
+
+/// Encode a single-frame stream consisting of [seq_hdr | core-intra
+/// reference (`0x4C`, **no arithmetic coding**) | EOS]. The VLC analogue
+/// of [`encode_single_core_intra_stream`], exercising the decoder's
+/// `decode_subband_vlc` path end-to-end from a self-produced stream.
+pub fn encode_single_core_intra_stream_vlc(
+    sequence: &SequenceHeader,
+    params: &CoreIntraEncoderParams,
+    picture_number: u32,
+    y: &[u8],
+    u: &[u8],
+    v: &[u8],
+) -> Vec<u8> {
+    let sh_payload = crate::encoder::encode_sequence_header(sequence);
+    let pic_payload = encode_core_intra_picture_vlc(sequence, params, picture_number, y, u, v);
+
+    let pi_size = 13usize;
+    let sh_unit_len = pi_size + sh_payload.len();
+    let pic_unit_len = pi_size + pic_payload.len();
+
+    let mut out = Vec::with_capacity(sh_unit_len + pic_unit_len + pi_size);
+    write_parse_info(&mut out, 0x00, sh_unit_len as u32, 0);
+    out.extend_from_slice(&sh_payload);
+    // `0x4C`: core-syntax, intra reference, num_refs = 0, NO arithmetic
+    // coding (Table 9.1). `using_ac()` = `(0x4C & 0x48) == 0x08` → false.
+    write_parse_info(&mut out, 0x4C, pic_unit_len as u32, sh_unit_len as u32);
     out.extend_from_slice(&pic_payload);
     write_parse_info(&mut out, 0x10, 0, pic_unit_len as u32);
     out

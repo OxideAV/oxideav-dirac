@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Dirac core-syntax **VLC (non-arithmetic) intra reference encoder**
+  (parse code `0x4C`, round-108). `encode_core_intra_picture_vlc` /
+  `encode_single_core_intra_stream_vlc` emit a core-syntax intra reference
+  whose per-codeblock entropy uses plain interleaved exp-Golomb instead of
+  the binary arithmetic coder — the encoder counterpart to the decoder's
+  long-present-but-previously-encoder-unreachable `decode_subband_vlc`
+  (only hand-built unit-test blocks reached it before). The whole-picture
+  framing (§12.2 picture header → §9.6.1 RETD → §11.3 transform parameters
+  → §13.4.1 transform data) is bit-identical to the AC `0x0C` path; only
+  the §13.4.2.2 entropy primitives change: §13.4.3.3 `zero_flag` becomes a
+  single raw bit (`read_boolb()`), §13.4.3.4 `codeblock_quant_offset()`
+  becomes `read_sintb()`, and §13.4.4 `coeff_unpack` becomes `read_sintb()`
+  per coefficient with **no** neighbourhood / parent / sign conditioning
+  (those condition only the arithmetic coder). The shared codeblock walk —
+  the §13.4.3.3 all-zero skip, the §13.4.3.2 by-reference running quantiser
+  and the §13.4.3.4 differential offset — is reused verbatim from the AC
+  path, so the partition/skip/mode-1 behaviour matches. `using_ac()` =
+  `(0x4C & 0x48) == 0x08` → false routes the decoder to the VLC subband
+  reader. Because the VLC path applies no entropy-coder rounding, at
+  `qindex = 0` (LeGall 5/3 dead-zone identity) it is **strictly lossless**
+  and bit-exact on the synthetic testsrc fixture — including the V-plane
+  steep gradient where the AC path carries a long-tolerated ~1-LSB
+  roughness. Seven integration tests in
+  `tests/encoder_intra_core_roundtrip.rs`:
+  `core_intra_vlc_stream_uses_parse_code_0x4c` (parse-info walk asserts the
+  `0x4C` picture code), `core_intra_vlc_self_roundtrip_yuv420_synth_testsrc`
+  + `core_intra_vlc_self_roundtrip_constant_frame_is_bit_exact` (bit-exact
+  Y/U/V at q=0), `core_intra_vlc_beats_ac_on_v_gradient` (VLC V matches the
+  source while AC V does not; VLC PSNR ≥ AC PSNR per plane),
+  `core_intra_vlc_multi_codeblock_skip_roundtrips` (4×4 partition, empty
+  codeblocks coded as VLC skips → strictly smaller than the single-codeblock
+  VLC stream, still bit-exact) and
+  `core_intra_vlc_mode1_skip_does_not_advance_quantiser` (mode-1 VLC
+  differential offset; a skipped codeblock leaves the running quantiser
+  unchanged).
 - Dirac core-syntax intra encoder **all-zero codeblock skip**
   (§13.4.3.3 `zero_flag`, round-103). `encode_subband_ac` now codes an
   empty codeblock of a partitioned subband as a skip (`zero_flag = True`)

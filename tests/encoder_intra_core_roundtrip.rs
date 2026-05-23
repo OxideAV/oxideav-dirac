@@ -20,7 +20,8 @@ use oxideav_dirac::encoder_inter::{
     synthetic_translating_pair_64, InterEncoderParams, InterInputPicture,
 };
 use oxideav_dirac::encoder_intra_core::{
-    encode_core_intra_then_inter_stream, encode_single_core_intra_stream, CoreIntraEncoderParams,
+    encode_core_intra_then_inter_stream, encode_single_core_intra_stream,
+    encode_single_core_intra_stream_vlc, CoreIntraEncoderParams,
 };
 use oxideav_dirac::video_format::ChromaFormat;
 use oxideav_dirac::wavelet::WaveletFilter;
@@ -344,6 +345,199 @@ fn core_intra_skip_does_not_advance_quantiser_mode1() {
     assert!(py >= 48.0, "Y PSNR {py:.2} below skip-quantiser floor");
     assert!(pu >= 48.0, "U PSNR {pu:.2} below skip-quantiser floor");
     assert!(pv >= 48.0, "V PSNR {pv:.2} below skip-quantiser floor");
+}
+
+// ---------------------------------------------------------------------
+// Round-108: VLC (non-arithmetic) core-syntax intra encoder (`0x4C`).
+//
+// The `encode_*_vlc` family produces a core-syntax intra reference whose
+// per-codeblock entropy uses plain exp-Golomb (§13.4.2.2 / §13.4.4
+// `read_sintb` branch) instead of the arithmetic coder. `using_ac()` =
+// `(0x4C & 0x48) == 0x08` → false routes the decoder to
+// `picture_core::decode_subband_vlc`, which had no encoder counterpart
+// before this round (only hand-built unit-test blocks reached it).
+// ---------------------------------------------------------------------
+
+/// The VLC stream's picture data unit must carry parse code `0x4C`
+/// (core-syntax intra reference, no arithmetic coding). Walk the
+/// parse-info chain (seq-header `0x00` → picture → EOS `0x10`) by its
+/// next-parse-offset and assert the picture's parse code.
+#[test]
+fn core_intra_vlc_stream_uses_parse_code_0x4c() {
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let params = CoreIntraEncoderParams::default_intra(WaveletFilter::LeGall5_3, 3);
+    let y = [123u8; 64 * 64];
+    let u = [200u8; 32 * 32];
+    let v = [55u8; 32 * 32];
+    let stream = encode_single_core_intra_stream_vlc(&seq, &params, 0, &y, &u, &v);
+
+    // Parse-info header: "BBCD" magic + 1-byte parse code + 4-byte next
+    // offset + 4-byte previous offset (13 bytes total). The first unit is
+    // the sequence header (0x00); follow its next-parse-offset to the
+    // picture unit.
+    assert_eq!(&stream[..4], b"BBCD", "stream starts with BBCD");
+    assert_eq!(stream[4], 0x00, "first unit is sequence header");
+    let sh_next = u32::from_be_bytes([stream[5], stream[6], stream[7], stream[8]]) as usize;
+    assert_eq!(
+        &stream[sh_next..sh_next + 4],
+        b"BBCD",
+        "BBCD at picture unit"
+    );
+    assert_eq!(
+        stream[sh_next + 4],
+        0x4C,
+        "picture parse code is 0x4C (VLC core-syntax intra reference)"
+    );
+}
+
+/// VLC core-intra self-roundtrip on the textured testsrc. With qindex = 0
+/// (LeGall 5/3 dead-zone identity) the VLC path is *lossless*: it codes the
+/// quantised coefficients with plain exp-Golomb (`read_sintb`), so there is
+/// no entropy-coder rounding at all and the reconstruction is bit-exact on
+/// all three planes. (The AC path on this same fixture loses ~1 LSB on the
+/// V plane's steep gradient — see `core_intra_vlc_beats_ac_on_v_gradient`.)
+#[test]
+fn core_intra_vlc_self_roundtrip_yuv420_synth_testsrc() {
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let params = CoreIntraEncoderParams::default_intra(WaveletFilter::LeGall5_3, 3);
+    let (y, u, v) = synthetic_testsrc_64_yuv420();
+    let stream = encode_single_core_intra_stream_vlc(&seq, &params, 0, &y, &u, &v);
+    let (ry, ru, rv) = decode_single(stream);
+    let py = psnr(&ry, &y);
+    let pu = psnr(&ru, &u);
+    let pv = psnr(&rv, &v);
+    eprintln!("VLC core-intra self-roundtrip: Y={py:.2} U={pu:.2} V={pv:.2}");
+    assert_eq!(ry, y.to_vec(), "VLC Y bit-exact (q=0 lossless)");
+    assert_eq!(ru, u.to_vec(), "VLC U bit-exact (q=0 lossless)");
+    assert_eq!(rv, v.to_vec(), "VLC V bit-exact (q=0 lossless)");
+}
+
+/// VLC core-intra on a flat constant frame — all energy collapses to the
+/// LL DC, so the round-trip is bit-exact across all three planes.
+#[test]
+fn core_intra_vlc_self_roundtrip_constant_frame_is_bit_exact() {
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let params = CoreIntraEncoderParams::default_intra(WaveletFilter::LeGall5_3, 3);
+    let y = [123u8; 64 * 64];
+    let u = [200u8; 32 * 32];
+    let v = [55u8; 32 * 32];
+    let stream = encode_single_core_intra_stream_vlc(&seq, &params, 0, &y, &u, &v);
+    let (ry, ru, rv) = decode_single(stream);
+    assert_eq!(ry, y.to_vec(), "VLC Y plane bit-exact");
+    assert_eq!(ru, u.to_vec(), "VLC U plane bit-exact");
+    assert_eq!(rv, v.to_vec(), "VLC V plane bit-exact");
+}
+
+/// VLC and AC code the *same* quantised coefficients, so on the flat planes
+/// (Y / U on the testsrc fixture both round-trip exactly through either
+/// entropy coder) the two reconstructions agree. The interesting plane is
+/// V: its steep vertical gradient pushes coefficient magnitudes into a range
+/// where the AC path loses ~1 LSB on a handful of edge coefficients (the
+/// long-tolerated "1-LSB roughness" of `core_intra_self_roundtrip`), whereas
+/// the VLC path — plain exp-Golomb with no context modelling — reproduces
+/// every quantised coefficient exactly and is therefore bit-exact against
+/// the source.
+///
+/// This pins the VLC encoder as a faithful, *strictly lossless-at-q0*
+/// counterpart to the decoder's `decode_subband_vlc`: the VLC V plane equals
+/// the source, the AC V plane does not, and the VLC PSNR is at least the AC
+/// PSNR on every plane.
+#[test]
+fn core_intra_vlc_beats_ac_on_v_gradient() {
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let params = CoreIntraEncoderParams::default_intra(WaveletFilter::LeGall5_3, 3);
+    let (y, u, v) = synthetic_testsrc_64_yuv420();
+    let ac_stream = encode_single_core_intra_stream(&seq, &params, 0, &y, &u, &v);
+    let vlc_stream = encode_single_core_intra_stream_vlc(&seq, &params, 0, &y, &u, &v);
+    let (ay, au, av) = decode_single(ac_stream);
+    let (vy, vu, vv) = decode_single(vlc_stream);
+
+    // Flat-ish planes agree between the two entropy coders.
+    assert_eq!(vy, ay, "VLC vs AC Y reconstruction agree");
+    assert_eq!(vu, au, "VLC vs AC U reconstruction agree");
+
+    // VLC is bit-exact on the V gradient; AC is not (1-LSB roughness).
+    assert_eq!(vv, v.to_vec(), "VLC V bit-exact against source");
+    assert_ne!(
+        av,
+        v.to_vec(),
+        "AC V carries its known 1-LSB gradient roughness (guards the contrast)"
+    );
+
+    // VLC PSNR is at least the AC PSNR on every plane.
+    for (plane, vlc_p, ac_p, src) in [
+        ("Y", &vy, &ay, &y[..]),
+        ("U", &vu, &au, &u[..]),
+        ("V", &vv, &av, &v[..]),
+    ] {
+        let pv = psnr(vlc_p, src);
+        let pa = psnr(ac_p, src);
+        eprintln!("{plane}: VLC={pv:.2} AC={pa:.2}");
+        assert!(
+            pv >= pa - 1e-9,
+            "{plane}: VLC PSNR {pv:.2} should be >= AC PSNR {pa:.2}"
+        );
+    }
+}
+
+/// VLC core-intra with a 4×4 spatial partition at `codeblock_mode == 0`.
+/// The quadrant fixture leaves three of four high-pass quadrants empty, so
+/// most codeblocks are coded as §13.4.3.3 `zero_flag` skips on the VLC path
+/// (one raw bit, `read_boolb()` on decode). Confirms the VLC skip framing
+/// round-trips bit-exactly (qindex = 0 dead-zone identity).
+#[test]
+fn core_intra_vlc_multi_codeblock_skip_roundtrips() {
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let (y, u, v) = quadrant_detail_64_yuv420();
+
+    let single = CoreIntraEncoderParams::default_intra(WaveletFilter::LeGall5_3, 3);
+    let single_stream = encode_single_core_intra_stream_vlc(&seq, &single, 0, &y, &u, &v);
+
+    let mut partitioned = CoreIntraEncoderParams::default_intra(WaveletFilter::LeGall5_3, 3);
+    partitioned.codeblocks = Some(vec![(1, 1), (4, 4), (4, 4), (4, 4)]);
+    partitioned.codeblock_mode = 0;
+    let part_stream = encode_single_core_intra_stream_vlc(&seq, &partitioned, 0, &y, &u, &v);
+
+    // Skip flags net out to a smaller stream than the single-codeblock VLC
+    // encoding (empty codeblocks collapse to a single skip bit instead of a
+    // run of exp-Golomb zeros).
+    assert!(
+        part_stream.len() < single_stream.len(),
+        "VLC skip-aware partitioned stream ({} B) should be smaller than the \
+         single-codeblock VLC stream ({} B)",
+        part_stream.len(),
+        single_stream.len(),
+    );
+
+    let (ry, ru, rv) = decode_single(part_stream);
+    assert_eq!(ry, y.to_vec(), "VLC skip-path Y bit-exact");
+    assert_eq!(ru, u.to_vec(), "VLC skip-path U bit-exact");
+    assert_eq!(rv, v.to_vec(), "VLC skip-path V bit-exact");
+}
+
+/// VLC core-intra at `codeblock_mode == 1` — the per-codeblock
+/// differential quantiser offset on the VLC path is a plain `read_sintb()`
+/// (§13.4.3.4) rather than the AC `Q_OFFSET_*` contexts. A skipped
+/// codeblock must not advance the by-reference running quantiser
+/// (§13.4.3.2). The quadrant fixture's non-empty codeblocks therefore run
+/// at the base quantiser, keeping the reconstruction near-lossless; a
+/// decoder that advanced `q` through skips would mis-dequantise the detail.
+#[test]
+fn core_intra_vlc_mode1_skip_does_not_advance_quantiser() {
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let (y, u, v) = quadrant_detail_64_yuv420();
+    let mut params = CoreIntraEncoderParams::default_intra(WaveletFilter::LeGall5_3, 3);
+    params.codeblocks = Some(vec![(1, 1), (4, 4), (4, 4), (4, 4)]);
+    params.codeblock_mode = 1;
+    let stream = encode_single_core_intra_stream_vlc(&seq, &params, 0, &y, &u, &v);
+    let (ry, ru, rv) = decode_single(stream);
+    let py = psnr(&ry, &y);
+    let pu = psnr(&ru, &u);
+    let pv = psnr(&rv, &v);
+    eprintln!("VLC skip mode1 quadrant: Y={py:.2} U={pu:.2} V={pv:.2}");
+    assert!(py >= 48.0, "VLC Y PSNR {py:.2} below skip-quantiser floor");
+    assert!(pu >= 48.0, "VLC U PSNR {pu:.2} below skip-quantiser floor");
+    assert!(pv >= 48.0, "VLC V PSNR {pv:.2} below skip-quantiser floor");
 }
 
 /// 3-frame stream: core-syntax intra reference followed by 2 inter
