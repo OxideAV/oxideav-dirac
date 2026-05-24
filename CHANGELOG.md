@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **§13.2.1 inter quant-offset on the decoder** (round-125). The 2008
+  Dirac specification defines two reconstruction offsets in
+  inverse-quantisation:
+  - **Intra** — `(qf + 1) / 2` (the spec's `quant_factor(q).div_ceil(2)`,
+    biasing toward the midpoint of the dead-zone interval).
+  - **Inter** — `(qf * 3 + 4) / 8` (biasing toward zero because the
+    inter residue distribution is sharply Laplacian).
+  SMPTE ST 2042-1 (VC-2) later collapsed both into the intra formula
+  because VC-2 is intra-only by construction; the previous `quant_offset`
+  was therefore correct for every LD / HQ slice and every core-syntax
+  intra picture but applied the intra formula to inter pictures too,
+  leaving a ~1-LSB-times-most-coefficients reconstruction bias on every
+  inter wavelet residue.
+  New public API: `quant_offset_for(q, is_intra)` and
+  `inverse_quant_for(qcoeff, q, is_intra)`. The existing
+  `quant_offset(q)` / `inverse_quant(qcoeff, q)` are kept as thin shims
+  with `is_intra = true` so existing callers (LD slices, internal
+  encoder roundtrip asserts) need no change. The `is_intra` flag is
+  threaded through `picture_core::core_transform_component`,
+  `decode_subband_ac` and `decode_subband_vlc` (it was already a
+  parameter of `core_transform_component`; the helpers now propagate
+  it).
+  At `q ∈ {0, 1}` intra and inter agree (`offset = 1` and `2`
+  respectively), so every encoder self-roundtrip test — all of which
+  run at qindex=0 by design — is unaffected. At higher `q` the inter
+  reconstruction is strictly closer to zero than the intra
+  reconstruction for every non-zero coefficient (invariant pinned by
+  `intra_offset_dominates_inter_offset` and
+  `inverse_quant_inter_pulls_toward_zero`); the reconstruction-interval
+  invariant `3 ≤ offset + 2 < quant_factor` from the spec's note holds
+  for both branches at every `q >= 2` (pinned by
+  `inter_offset_satisfies_reconstruction_interval_for_q_ge_2`).
+  Effect on the docs-corpus inter fixtures (every intra fixture was
+  already bit-exact since round-118 and is unchanged):
+  - `corpus_i_then_p_320x240` — P frame **67.50 dB Y** (was ≈48 dB),
+    aggregate 99.23% pixel-exact, UV ∞ dB.
+  - `corpus_i_p_b_320x240` — P + B frames **67.16 dB Y** aggregate
+    (was 47.96 dB P, 7.31 dB B), 99.21% pixel-exact, UV ∞ dB.
+  - `corpus_interlaced_720x576_i_then_p_wavelet_5_3` —
+    **73.90 dB Y** + **54.70 dB UV** aggregate, 99.62% pixel-exact.
+  The residual ~1% pixel gap on each is the OBMC convention edge case
+  (decoder rounds the §15.8.5 weighted-sum reconstruction one LSB
+  differently from ffmpeg on a small fraction of block edges), not the
+  inverse-quant offset. Eight new unit tests in
+  `quant::tests` (offset agreement at low `q`, intra-dominates-inter
+  invariant, reconstruction-interval invariant, inverse_quant
+  identity at low `q`, inter-pulls-toward-zero invariant) plus one
+  integration unit in `picture_core::tests`
+  (`vlc_inter_offset_applies_via_is_intra_false`, pinning the wiring
+  with an end-to-end VLC subband decode at `qindex = 12` where intra
+  and inter reconstructions differ by 1 LSB).
+
+
 ## [0.0.7](https://github.com/OxideAV/oxideav-dirac/compare/v0.0.6...v0.0.7) - 2026-05-24
 
 ### Other

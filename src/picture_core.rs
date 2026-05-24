@@ -25,7 +25,7 @@
 use crate::arith::{ArithDecoder, ContextBank};
 use crate::bits::BitReader;
 use crate::picture::PictureError;
-use crate::quant::{inverse_quant, QuantMatrix};
+use crate::quant::{inverse_quant_for, QuantMatrix};
 use crate::subband::{init_pyramid, subband_dims, Orient, SubbandData};
 use crate::wavelet::WaveletFilter;
 
@@ -121,6 +121,7 @@ pub fn core_transform_component(
         comp_height,
         params,
         using_ac,
+        is_intra,
     )?;
     for level in 1..=params.dwt_depth {
         for orient in [Orient::HL, Orient::LH, Orient::HH] {
@@ -133,6 +134,7 @@ pub fn core_transform_component(
                 comp_height,
                 params,
                 using_ac,
+                is_intra,
             )?;
         }
     }
@@ -146,6 +148,10 @@ pub fn core_transform_component(
 }
 
 /// One subband's-worth of coefficient unpacking (§13.4.2).
+///
+/// `is_intra` selects the §13.2.1 reconstruction offset (intra ≈ `qf/2`,
+/// inter ≈ `3*qf/8`). The §13.4 codeblock walk is identical in both
+/// cases — only the per-coefficient inverse-quant step differs.
 #[allow(clippy::too_many_arguments)]
 fn decode_subband(
     r: &mut BitReader<'_>,
@@ -156,6 +162,7 @@ fn decode_subband(
     comp_height: u32,
     params: &CoreTransformParameters,
     using_ac: bool,
+    is_intra: bool,
 ) -> Result<(), PictureError> {
     r.byte_align();
     let length = r.read_uint();
@@ -191,6 +198,7 @@ fn decode_subband(
             band_h,
             params,
             quant_index,
+            is_intra,
         )?;
     } else {
         decode_subband_vlc(
@@ -203,6 +211,7 @@ fn decode_subband(
             band_h,
             params,
             quant_index,
+            is_intra,
         )?;
     }
 
@@ -215,6 +224,8 @@ fn decode_subband(
 }
 
 /// §13.4.2.2 VLC path — plain bounded exp-Golomb.
+///
+/// `is_intra` selects the §13.2.1 reconstruction offset.
 #[allow(clippy::too_many_arguments)]
 fn decode_subband_vlc(
     block: &[u8],
@@ -226,6 +237,7 @@ fn decode_subband_vlc(
     band_h: usize,
     params: &CoreTransformParameters,
     quant_index: u32,
+    is_intra: bool,
 ) -> Result<(), PictureError> {
     let mut r = crate::bits::BoundedBitReader::new(block, total_bits);
     let q_matrix_entry = params
@@ -262,7 +274,7 @@ fn decode_subband_vlc(
             for y in top..bottom {
                 for x in left..right {
                     let qc = r.read_sintb();
-                    band.set(y, x, inverse_quant(qc, q));
+                    band.set(y, x, inverse_quant_for(qc, q, is_intra));
                 }
             }
         }
@@ -273,6 +285,8 @@ fn decode_subband_vlc(
 }
 
 /// §13.4.2.2 AC path — arithmetic-coded codeblocks.
+///
+/// `is_intra` selects the §13.2.1 reconstruction offset.
 #[allow(clippy::too_many_arguments)]
 fn decode_subband_ac(
     block: &[u8],
@@ -283,6 +297,7 @@ fn decode_subband_ac(
     band_h: usize,
     params: &CoreTransformParameters,
     quant_index: u32,
+    is_intra: bool,
 ) -> Result<(), PictureError> {
     let mut bank = ContextBank::new(ctx::NUM_CONTEXTS);
     let mut dec = ArithDecoder::new(block, block.len());
@@ -347,7 +362,7 @@ fn decode_subband_ac(
                     let (follow, data_ctx, sign_ctx) =
                         select_coeff_ctxs(parent_zero, nhood_zero, sign_pred);
                     let qc = dec.read_sint(&mut bank, follow, data_ctx, sign_ctx);
-                    band.set(y, x, inverse_quant(qc, q));
+                    band.set(y, x, inverse_quant_for(qc, q, is_intra));
                 }
             }
         }
@@ -605,6 +620,7 @@ mod tests {
             2,
             &params,
             0,
+            /* is_intra */ true,
         )
         .unwrap();
         let ll = &py[0][0];
@@ -675,6 +691,7 @@ mod tests {
             1,
             &params,
             0,
+            /* is_intra */ true,
         )
         .unwrap();
         let hl = &py[1][1];
@@ -682,5 +699,88 @@ mod tests {
         assert_eq!(hl.get(0, 0), 3, "codeblock (0,0) at q=4");
         // Second codeblock dequantised at the CUMULATIVE q = 8, not q = 4.
         assert_eq!(hl.get(0, 1), 6, "codeblock (1,0) at cumulative q=8");
+    }
+
+    /// §13.2.1 inter quant-offset wiring. The same `+1` quantised
+    /// coefficient at `q = 4` dequantises to `3` under the intra
+    /// offset (the `vlc_decodes_a_handful_of_known_values_at_qindex_0`
+    /// pin above) but to `2` under the inter offset
+    /// (`(qf*3+4)/8 = (8*3+4)/8 = 28/8 = 3`; `(1*8 + 3 + 2)/4 = 13/4 = 3`,
+    /// vs the intra `(1*8 + 4 + 2)/4 = 14/4 = 3` — at this small q both
+    /// round to the same magnitude). Pick a slightly larger q where the
+    /// magnitudes do split: at `q = 8`, intra offset = 8, inter offset = 6;
+    /// `+1` dequantises to `(16 + 8 + 2)/4 = 26/4 = 6` intra and
+    /// `(16 + 6 + 2)/4 = 24/4 = 6` inter — still equal because the
+    /// magnitude is small enough that the `+2` and `//4` mask the
+    /// offset delta. Pick `+5` at `q = 8`: intra
+    /// `(40 + 8 + 2)/4 = 50/4 = 12`; inter `(40 + 6 + 2)/4 = 48/4 = 12`.
+    /// Try `+3` at `q = 12` where qf=32: intra offset=16, inter offset=12;
+    /// magnitude `3` → intra `(96+16+2)/4 = 114/4 = 28`,
+    /// inter `(96+12+2)/4 = 110/4 = 27`. THAT pins the wiring.
+    #[test]
+    fn vlc_inter_offset_applies_via_is_intra_false() {
+        // One codeblock holding one coefficient `+3`. We want to
+        // exercise `decode_subband_vlc` at quant_index = 12 where the
+        // intra/inter offsets produce different reconstructions.
+        let mut w = crate::bitwriter::BitWriter::new();
+        w.write_sint(3); // single coefficient = +3 (no skip — 1x1 band)
+        let byte_buf = w.finish();
+        let params = CoreTransformParameters {
+            wavelet: WaveletFilter::LeGall5_3,
+            dwt_depth: 0,
+            codeblocks: vec![(1, 1)],
+            codeblock_mode: 0,
+            quant_matrix: None,
+        };
+        let mut py = vec![[
+            SubbandData::new(1, 1),
+            SubbandData::new(0, 0),
+            SubbandData::new(0, 0),
+            SubbandData::new(0, 0),
+        ]];
+        let total_bits = (byte_buf.len() as u64) * 8;
+
+        // First decode under the intra offset → magnitude 28.
+        decode_subband_vlc(
+            &byte_buf,
+            total_bits,
+            &mut py,
+            0,
+            Orient::LL,
+            1,
+            1,
+            &params,
+            12,
+            /* is_intra */ true,
+        )
+        .unwrap();
+        assert_eq!(
+            py[0][0].get(0, 0),
+            28,
+            "intra: (3*32 + quant_offset(12)=16 + 2)/4 = 114/4 = 28"
+        );
+
+        // Reset the band and re-decode under the inter offset →
+        // magnitude 27 (one LSB lower because the inter offset biases
+        // the reconstruction toward zero).
+        py[0][0] = SubbandData::new(1, 1);
+        decode_subband_vlc(
+            &byte_buf,
+            total_bits,
+            &mut py,
+            0,
+            Orient::LL,
+            1,
+            1,
+            &params,
+            12,
+            /* is_intra */ false,
+        )
+        .unwrap();
+        assert_eq!(
+            py[0][0].get(0, 0),
+            27,
+            "inter: (3*32 + quant_offset_for(12,false)=12 + 2)/4 = 110/4 = 27"
+        );
     }
 }
