@@ -22,6 +22,7 @@ use oxideav_dirac::encoder::{
     encode_hq_intra_multi_stream, encode_single_hq_intra_stream, encode_single_ld_intra_stream,
     make_minimal_sequence, make_minimal_sequence_ld, EncoderParams, InputPicture, LdEncoderParams,
 };
+use oxideav_dirac::quant::QuantMatrix;
 use oxideav_dirac::video_format::ChromaFormat;
 use oxideav_dirac::wavelet::WaveletFilter;
 
@@ -411,4 +412,169 @@ fn hq_q12_psnr_above_30db_across_six_wavelets() {
             "{filter:?}: Y PSNR {p_y:.2} dB < 30 dB at qindex=12 on a smooth gradient"
         );
     }
+}
+
+/// A non-default, all-zero custom quantisation matrix (§12.4.5.3) that
+/// the encoder emits in-band (`custom_quant_matrix = True`). At qindex=0
+/// every effective subband quantiser is 0 (LeGall dead-zone identity) so
+/// the round-trip is bit-exact — proving (a) the extra `read_uint`
+/// entries the decoder pulls for the custom matrix stay in lockstep with
+/// the encoder's writes (no bitstream desync) and (b) the picture is
+/// fully decodable end-to-end through the public decoder.
+///
+/// The matrix is deliberately distinct from `QuantMatrix::default_for`
+/// for LeGall depth 3 (which is `[4,0,0,0], [0,2,2,0], [0,4,4,2],
+/// [0,5,5,3]`), so a regression that silently dropped the custom matrix
+/// and fell back to `custom_quant_matrix = False` would still parse but
+/// would not be exercising the custom path here.
+#[test]
+fn hq_custom_quant_matrix_framing_roundtrips_q0() {
+    let w: u32 = 64;
+    let h: u32 = 64;
+    let cw = w / 2;
+    let ch = h / 2;
+    let y = synth_plane(w as usize, h as usize, 3);
+    let u = synth_plane(cw as usize, ch as usize, 17);
+    let v = synth_plane(cw as usize, ch as usize, 29);
+
+    let seq = make_minimal_sequence(w, h, ChromaFormat::Yuv420);
+    // All-zero matrix: every entry differs from the LeGall default, and
+    // at qindex=0 the effective quantiser is 0 everywhere → lossless.
+    let zero_matrix = QuantMatrix {
+        dwt_depth: 3,
+        levels: vec![[0; 4]; 4],
+    };
+    let params = EncoderParams::default_hq(WaveletFilter::LeGall5_3, 3)
+        .with_custom_quant_matrix(zero_matrix);
+    assert!(params.custom_quant_matrix, "builder must set the flag");
+
+    let stream = encode_single_hq_intra_stream(&seq, &params, 0, &y, &u, &v);
+    let frame = decode_one(stream);
+    assert_eq!(
+        frame.planes[0].data, y,
+        "Y not bit-exact with custom matrix"
+    );
+    assert_eq!(
+        frame.planes[1].data, u,
+        "U not bit-exact with custom matrix"
+    );
+    assert_eq!(
+        frame.planes[2].data, v,
+        "V not bit-exact with custom matrix"
+    );
+}
+
+/// Sharp quantiser-agreement test for the §12.4.5.3 custom matrix: a
+/// high qindex with an **all-zero** custom matrix forces every subband's
+/// effective quantiser to the full `qindex`. The encoder quantises with
+/// that all-zero matrix; the decoder must read the same matrix back to
+/// dequantise at the identical per-subband quantisers.
+///
+/// To prove the matrix actually travels and is used, the same picture is
+/// also encoded at the same qindex with the **default** matrix (flag
+/// `False`). The two reconstructions must differ: the default matrix
+/// subtracts its non-zero entries from qindex, so its effective
+/// quantisers are strictly lower for the LF subbands → a different
+/// dead-zone reconstruction. If the encoder had silently dropped the
+/// custom matrix, both streams would decode identically and this test
+/// would fail.
+#[test]
+fn hq_custom_all_zero_matrix_differs_from_default_at_q8() {
+    let w: u32 = 64;
+    let h: u32 = 64;
+    let cw = w / 2;
+    let ch = h / 2;
+    // A smooth gradient so the LF subbands carry real energy that the
+    // matrix subtraction actually moves.
+    let mut y = vec![0u8; (w * h) as usize];
+    for row in 0..h as usize {
+        for col in 0..w as usize {
+            y[row * w as usize + col] = ((row + col) * 2) as u8;
+        }
+    }
+    let u = vec![128u8; (cw * ch) as usize];
+    let v = vec![128u8; (cw * ch) as usize];
+    let seq = make_minimal_sequence(w, h, ChromaFormat::Yuv420);
+
+    let zero_matrix = QuantMatrix {
+        dwt_depth: 3,
+        levels: vec![[0; 4]; 4],
+    };
+    let mut custom = EncoderParams::default_hq(WaveletFilter::LeGall5_3, 3)
+        .with_custom_quant_matrix(zero_matrix);
+    custom.qindex = 8;
+    let mut default = EncoderParams::default_hq(WaveletFilter::LeGall5_3, 3);
+    default.qindex = 8;
+    assert!(!default.custom_quant_matrix);
+
+    let custom_stream = encode_single_hq_intra_stream(&seq, &custom, 0, &y, &u, &v);
+    let default_stream = encode_single_hq_intra_stream(&seq, &default, 0, &y, &u, &v);
+
+    // The default-matrix stream omits the per-subband uints, so the two
+    // bitstreams must differ in length / content.
+    assert_ne!(
+        custom_stream, default_stream,
+        "custom-matrix stream should differ from the default-matrix stream"
+    );
+
+    let custom_frame = decode_one(custom_stream);
+    let default_frame = decode_one(default_stream);
+    // Both decode cleanly to the right shape.
+    assert_eq!(custom_frame.planes[0].stride, w as usize);
+    assert_eq!(default_frame.planes[0].stride, w as usize);
+    // The reconstructions must differ: the matrices drive different
+    // effective per-subband quantisers at qindex=8.
+    assert_ne!(
+        custom_frame.planes[0].data, default_frame.planes[0].data,
+        "all-zero custom matrix should reconstruct Y differently from the default matrix at q=8"
+    );
+
+    // Self-consistency: the custom path's reconstruction is a faithful
+    // (lossy) round-trip of the source — encoder and decoder agreed on
+    // the per-subband quantisers.
+    let p_y = psnr(&custom_frame.planes[0].data, &y);
+    eprintln!("HQ q=8 custom all-zero matrix: Y PSNR = {p_y:.2} dB");
+    assert!(
+        p_y > 30.0,
+        "custom-matrix Y PSNR {p_y:.2} dB < 30 dB — encoder/decoder quantisers may disagree"
+    );
+}
+
+/// LD-profile custom quant matrix (§12.4.5.3): the LD transform-
+/// parameters path also gains the in-band custom matrix. An all-zero
+/// matrix at qindex=0 with a generous slice budget reproduces a smooth
+/// gradient at high PSNR, confirming the LD slice-parameters →
+/// quant-matrix read order stays aligned with the encoder.
+#[test]
+fn ld_custom_quant_matrix_roundtrips_q0() {
+    let w: u32 = 64;
+    let h: u32 = 64;
+    let cw = w / 2;
+    let ch = h / 2;
+    let mut y = vec![0u8; (w * h) as usize];
+    for row in 0..h as usize {
+        for col in 0..w as usize {
+            y[row * w as usize + col] = ((row + col) * 2) as u8;
+        }
+    }
+    let u = vec![128u8; (cw * ch) as usize];
+    let v = vec![128u8; (cw * ch) as usize];
+    let seq = make_minimal_sequence_ld(w, h, ChromaFormat::Yuv420);
+
+    let zero_matrix = QuantMatrix {
+        dwt_depth: 3,
+        levels: vec![[0; 4]; 4],
+    };
+    let params = LdEncoderParams::default_ld(WaveletFilter::LeGall5_3, 3, 4, 4, 256)
+        .with_custom_quant_matrix(zero_matrix);
+    assert!(params.custom_quant_matrix);
+
+    let stream = encode_single_ld_intra_stream(&seq, &params, 0, &y, &u, &v);
+    let frame = decode_one(stream);
+    let p_y = psnr(&frame.planes[0].data, &y);
+    eprintln!("LD q=0 custom all-zero matrix: Y PSNR = {p_y:.2} dB");
+    assert!(
+        p_y > 35.0,
+        "LD custom-matrix Y PSNR {p_y:.2} dB < 35 dB on a smooth gradient"
+    );
 }

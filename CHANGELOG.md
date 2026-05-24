@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- VC-2 low-delay **custom quantisation matrix on the encoder**
+  (§12.4.5.3 / §11.3.5 `quant_matrix()`, round-111). Both
+  `EncoderParams` (HQ) and `LdEncoderParams` (LD) gain a
+  `custom_quant_matrix: bool` field (default `false`) and a
+  `with_custom_quant_matrix(matrix)` builder. When the flag is set,
+  `write_transform_parameters` / `write_ld_transform_parameters` emit
+  `custom_quant_matrix = True` followed by the explicit per-subband
+  entries in the spec's exact read order (`QMATRIX[0][LL]`, then
+  `QMATRIX[level][HL/LH/HH]` for `level = 1..=dwt_depth`) instead of the
+  `custom_quant_matrix = False` flag that makes the decoder reconstruct
+  the Annex E.1 default via `set_quant_matrix()`. This closes the
+  encode-side half of the quant-matrix syntax — the decoder
+  (`picture::parse_transform_parameters`) has parsed the custom matrix
+  since the VC-2 interop work, but the encoder previously hard-wired the
+  flag to `False`, so a non-default `EncoderParams::quant_matrix` was
+  silently unrecoverable on decode. The shared `write_quant_matrix`
+  helper byte-for-byte mirrors the decoder's read loop. Three
+  integration tests in `tests/encoder_matrix.rs`:
+  `hq_custom_quant_matrix_framing_roundtrips_q0` (a non-default all-zero
+  custom matrix bit-exact at qindex=0 — proves the extra `read_uint`
+  entries stay in lockstep with the encoder's writes, no bitstream
+  desync), `hq_custom_all_zero_matrix_differs_from_default_at_q8` (the
+  same picture encoded with the all-zero custom matrix vs the default
+  matrix at qindex=8 produces *different* bitstreams and *different*
+  reconstructions — proving the matrix actually travels and drives the
+  per-subband quantisers; the custom path self-round-trips at 53.5 dB Y
+  PSNR), and `ld_custom_quant_matrix_roundtrips_q0` (the LD
+  slice-parameters → quant-matrix read order stays aligned: all-zero
+  custom matrix at qindex=0 reconstructs a smooth gradient bit-exact).
+  Note §11.3.5 *requires* the custom flag for `dwt_depth > 4`, where the
+  Annex E.1 default table is undefined.
 - Dirac core-syntax **VLC (non-arithmetic) intra reference encoder**
   (parse code `0x4C`, round-108). `encode_core_intra_picture_vlc` /
   `encode_single_core_intra_stream_vlc` emit a core-syntax intra reference

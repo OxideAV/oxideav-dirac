@@ -49,6 +49,18 @@ pub struct EncoderParams {
     pub slice_prefix_bytes: u32,
     pub slice_size_scaler: u32,
     pub quant_matrix: QuantMatrix,
+    /// When `true`, emit `quant_matrix.levels` explicitly into the
+    /// stream as a §12.4.5.3 / §11.3.5 *custom* quantisation matrix
+    /// (`custom_quant_matrix = True`) instead of the
+    /// `custom_quant_matrix = False` flag that makes the decoder look up
+    /// the Annex E.1 default. The encoder already quantises against
+    /// `quant_matrix` regardless; this flag only controls whether the
+    /// matrix travels in-band, so a non-default `quant_matrix` is
+    /// recoverable on the decode side. Defaults to `false`. Note that
+    /// §11.3.5 *requires* `True` whenever `dwt_depth > 4` (the default
+    /// table is undefined there); the [`Self::with_custom_quant_matrix`]
+    /// helper sets the flag for that case.
+    pub custom_quant_matrix: bool,
     /// Per-slice quantisation index (0..=127). 0 means lossless-ish —
     /// qf=4, offset=1, resulting in near-identity inverse quant for
     /// coefficients small compared to 4.
@@ -70,8 +82,19 @@ impl EncoderParams {
             slice_prefix_bytes: 0,
             slice_size_scaler: 1,
             quant_matrix,
+            custom_quant_matrix: false,
             qindex: 0,
         }
+    }
+
+    /// Replace the quantisation matrix with `matrix` and set
+    /// `custom_quant_matrix = true` so the decoder reads it back in-band
+    /// (§12.4.5.3) rather than recomputing the Annex E.1 default. The
+    /// caller is responsible for `matrix.dwt_depth == self.dwt_depth`.
+    pub fn with_custom_quant_matrix(mut self, matrix: QuantMatrix) -> Self {
+        self.quant_matrix = matrix;
+        self.custom_quant_matrix = true;
+        self
     }
 }
 
@@ -149,11 +172,47 @@ fn write_transform_parameters(w: &mut BitWriter, params: &EncoderParams) {
     w.write_uint(params.slices_y);
     w.write_uint(params.slice_prefix_bytes);
     w.write_uint(params.slice_size_scaler);
-    // Default quant matrix — emit flag=0 so the decoder looks up
-    // the per-filter table. If callers pass a custom matrix we could
-    // emit flag=1 + the explicit values; for now the encoder always
-    // uses defaults.
-    w.write_bool(false);
+    // §12.4.5.3 quant_matrix: emit flag=0 (default Annex E.1 table) or,
+    // when `custom_quant_matrix` is set, flag=1 plus the explicit
+    // per-subband entries.
+    write_quant_matrix(w, params.custom_quant_matrix, &params.quant_matrix);
+}
+
+/// Emit the §12.4.5.3 (low-delay) / §11.3.5 `quant_matrix()` syntax.
+///
+/// When `custom == false` we write `custom_quant_matrix = False`; the
+/// decoder then reconstructs the Annex E.1 default for the picture's
+/// wavelet / depth via `set_quant_matrix()`. When `custom == true` we
+/// write `custom_quant_matrix = True` followed by the explicit values in
+/// the spec's exact read order:
+///
+/// ```text
+///   state[QMATRIX][0][LL] = read_uint()
+///   for level = 1 to state[DWT_DEPTH]:
+///     state[QMATRIX][level][HL] = read_uint()
+///     state[QMATRIX][level][LH] = read_uint()
+///     state[QMATRIX][level][HH] = read_uint()
+/// ```
+///
+/// `matrix.levels[level]` is `[LL, HL, LH, HH]` ([`Orient::as_index`]
+/// ordering), so level 0 contributes its `[0]` entry and each higher
+/// level contributes `[1], [2], [3]` — bit-exactly the order the decoder
+/// reads in `picture::parse_transform_parameters`.
+fn write_quant_matrix(w: &mut BitWriter, custom: bool, matrix: &QuantMatrix) {
+    if !custom {
+        w.write_bool(false);
+        return;
+    }
+    w.write_bool(true);
+    // Level 0: LL only.
+    w.write_uint(matrix.levels[0][0]);
+    // Levels 1..=dwt_depth: HL, LH, HH in that order.
+    for level in 1..=matrix.dwt_depth as usize {
+        let triplet = matrix.levels[level];
+        w.write_uint(triplet[1]); // HL
+        w.write_uint(triplet[2]); // LH
+        w.write_uint(triplet[3]); // HH
+    }
 }
 
 fn wavelet_index(filter: WaveletFilter) -> u32 {
@@ -713,6 +772,11 @@ pub struct LdEncoderParams {
     pub slice_bytes_numer: u32,
     pub slice_bytes_denom: u32,
     pub quant_matrix: QuantMatrix,
+    /// When `true`, emit `quant_matrix.levels` as a §12.4.5.3 *custom*
+    /// quantisation matrix (`custom_quant_matrix = True`) instead of the
+    /// `False` flag that makes the decoder use the Annex E.1 default. See
+    /// [`EncoderParams::custom_quant_matrix`] for the full rationale.
+    pub custom_quant_matrix: bool,
     /// Per-slice qindex (0..=127). 0 is near-lossless for coefficients
     /// in the range where the dead-zone quantiser's forward rounding is
     /// exact.
@@ -742,8 +806,17 @@ impl LdEncoderParams {
             slice_bytes_numer: total,
             slice_bytes_denom: slices_x * slices_y,
             quant_matrix,
+            custom_quant_matrix: false,
             qindex: 0,
         }
+    }
+
+    /// Replace the quantisation matrix with `matrix` and set
+    /// `custom_quant_matrix = true` so it travels in-band (§12.4.5.3).
+    pub fn with_custom_quant_matrix(mut self, matrix: QuantMatrix) -> Self {
+        self.quant_matrix = matrix;
+        self.custom_quant_matrix = true;
+        self
     }
 }
 
@@ -894,9 +967,8 @@ fn write_ld_transform_parameters(w: &mut BitWriter, params: &LdEncoderParams) {
     w.write_uint(params.slices_y);
     w.write_uint(params.slice_bytes_numer);
     w.write_uint(params.slice_bytes_denom);
-    // Default quant matrix — emit flag=0 so the decoder uses the
-    // per-filter table.
-    w.write_bool(false);
+    // §12.4.5.3 quant_matrix: default (flag=0) or explicit (flag=1).
+    write_quant_matrix(w, params.custom_quant_matrix, &params.quant_matrix);
 }
 
 fn forward_component_ld(
