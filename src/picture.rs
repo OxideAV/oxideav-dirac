@@ -1046,10 +1046,13 @@ pub fn intra_dc_prediction(band: &mut SubbandData) {
 }
 
 fn mean3(a: i32, b: i32, c: i32) -> i32 {
-    // §1.3 defines `a // b` as floor division — rounds toward -infinity,
-    // unlike Rust's `/` which truncates toward zero. For a negative
-    // sum, this matters: `-7 // 3 = -3` but `-7 / 3 = -2` in Rust.
-    let s = a as i64 + b as i64 + c as i64;
+    // §5.4 `mean(S)` for n values is `(s0 + .. + s_{n-1} + (n//2)) // n`,
+    // the *unbiased* integer mean — note the `+ (n//2)` rounding term.
+    // For n = 3 that is `(a + b + c + 1) // 3`. §1.3 defines `//` as
+    // floor division (rounds toward -infinity), unlike Rust's `/`
+    // which truncates toward zero; for a negative sum this matters:
+    // `-7 // 3 = -3` but `-7 / 3 = -2` in Rust, so we use `div_euclid`.
+    let s = a as i64 + b as i64 + c as i64 + 1;
     s.div_euclid(3) as i32
 }
 
@@ -1091,7 +1094,33 @@ mod tests {
         assert_eq!(b.get(0, 1), 2);
         assert_eq!(b.get(0, 2), 3);
         assert_eq!(b.get(1, 0), 2);
-        assert_eq!(b.get(1, 1), 1 + (2 + 1 + 2) / 3);
+        // §5.4 unbiased mean of the already-reconstructed neighbours
+        // (left=2, top-left=1, top=2): (2 + 1 + 2 + 1) // 3 = 2, so the
+        // reconstructed coefficient is 1 + 2 = 3. The `+ 1` is the
+        // `(n // 2)` rounding term the spec's `mean()` carries.
+        assert_eq!(b.get(1, 1), 1 + (2 + 1 + 2 + 1) / 3);
+        assert_eq!(b.get(1, 1), 3);
+    }
+
+    /// `mean3` is the spec's `mean(a, b, c)` = `(a + b + c + 1) // 3`
+    /// with floor division. Spot-check the rounding bias and the
+    /// negative-sum floor behaviour that distinguishes it from Rust's
+    /// truncating `/`.
+    #[test]
+    fn mean3_unbiased_floor() {
+        // Exact multiple of 3: the +1 bias does not change the result.
+        assert_eq!(mean3(1, 1, 1), 1);
+        assert_eq!(mean3(2, 2, 2), 2);
+        // sum = 5 -> (5 + 1) // 3 = 2 (round-to-nearest behaviour from
+        // the +1 bias; truncating 5/3 would give 1).
+        assert_eq!(mean3(2, 1, 2), 2);
+        // sum = 4 -> (4 + 1) // 3 = 1.
+        assert_eq!(mean3(2, 1, 1), 1);
+        // Negative sum: (-7 + 1) // 3 = -6 // 3 = -2 (floor); a
+        // truncating divide of -6/3 also gives -2 here, but -8 shows
+        // the floor: (-8 + 1) // 3 = -7 // 3 = -3.
+        assert_eq!(mean3(-3, -2, -2), -2);
+        assert_eq!(mean3(-3, -3, -2), -3);
     }
 
     #[test]

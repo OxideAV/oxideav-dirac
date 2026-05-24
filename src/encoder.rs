@@ -1009,11 +1009,9 @@ pub fn forward_dc_prediction(band: &mut SubbandData) {
                 let a = orig[y * w + (x - 1)];
                 let b = orig[(y - 1) * w + (x - 1)];
                 let c = orig[(y - 1) * w + x];
-                let s = a as i64 + b as i64 + c as i64;
-                // §1.3 floor division — rounds toward -infinity.
-                // Rust's `/` truncates toward zero, which disagrees on
-                // negative sums. Self-roundtrip survives because both
-                // sides use the same formula; ffmpeg follows the spec.
+                // §5.4 unbiased mean `(a + b + c + 1) // 3` (floor div),
+                // mirroring the decoder's `mean3` exactly.
+                let s = a as i64 + b as i64 + c as i64 + 1;
                 s.div_euclid(3) as i32
             } else if x > 0 {
                 orig[y * w + (x - 1)]

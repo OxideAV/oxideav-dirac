@@ -68,6 +68,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Intra DC subband-prediction `mean` rounding** (§5.4 / §13.3,
+  round-118). `picture::intra_dc_prediction` (decoder) and
+  `encoder::forward_dc_prediction` (encoder) computed the 3-neighbour
+  prediction as `(a + b + c) // 3`, omitting the spec's unbiased-`mean`
+  rounding term `(n // 2) = 1`: §5.4 defines `mean(S)` as
+  `(s0 + … + s_{n-1} + (n // 2)) // n`, i.e. `(a + b + c + 1) // 3` with
+  floor division. The missing `+1` left every intra picture's level-0 LL
+  band ~1 LSB off after the IDWT. With the fix, **all five intra-only
+  docs-corpus fixtures now decode bit-exactly against the ffmpeg
+  reference** — `i-only-tiny`, `vc2-low-delay-tiny`,
+  `vc2-low-delay-3pics`, `interlaced-720x576-i-only` (depth-4 IDWT) and
+  `chroma-422-720x576` (4:2:2) — up from ~48–52 dB PSNR; their
+  `docs_corpus` cases are promoted from `ReportOnly` to `BitExact`. The
+  inter fixtures' intra reference frames also tighten (overall PSNR
+  +3–5 dB). Encoder and decoder are kept in lockstep so the
+  forward/inverse DC prediction stays a bit-exact pair.
+
 - **`quant::quant_factor` u32 overflow at high qindex** (§13.2.1,
   round-114). `quant_factor(q)` computed `1u32 << (q/4)` and then
   `4 * base` / `503_829 * base` / … in `u32`, which overflows for

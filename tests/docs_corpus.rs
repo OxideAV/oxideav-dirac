@@ -419,10 +419,13 @@ fn evaluate(case: &CorpusCase) {
 // Per-fixture tests
 // ---------------------------------------------------------------------------
 //
-// All fixtures start as `Tier::ReportOnly`. As the in-tree Dirac
-// decoder closes the relevant gap (LD-profile slice decode, OBMC inter,
-// per-picture wavelet selection, 4:2:2 chroma, interlaced TFF picture
-// reconstruction), individual cases should be promoted to `BitExact`.
+// As of round-118 every intra-only fixture decodes bit-exactly against
+// the ffmpeg reference and is pinned at `Tier::BitExact`:
+// `i-only-tiny`, `vc2-low-delay-tiny`, `vc2-low-delay-3pics`,
+// `interlaced-720x576-i-only` (depth-4 IDWT) and `chroma-422-720x576`
+// (4:2:2). The remaining `Tier::ReportOnly` cases all carry inter
+// pictures (P / B), whose §13.2.1 inverse-quant offset and OBMC
+// reconstruction still diverge; promote each as that gap closes.
 //
 // Trace files (referenced in `evaluate()` via the `eprintln!` header)
 // live alongside each fixture and capture the per-step `PARSE_UNIT` /
@@ -441,7 +444,9 @@ fn corpus_i_only_tiny_320x240() {
         height: 240,
         n_frames: 1,
         sub: Subsampling::Yuv420,
-        tier: Tier::ReportOnly,
+        // Bit-exact since round-118: the §5.4 unbiased-mean (`+1`)
+        // rounding in intra DC subband prediction was corrected.
+        tier: Tier::BitExact,
     });
 }
 
@@ -498,7 +503,8 @@ fn corpus_vc2_low_delay_tiny_320x240() {
         height: 240,
         n_frames: 1,
         sub: Subsampling::Yuv420,
-        tier: Tier::ReportOnly,
+        // Bit-exact since round-118 (intra DC prediction `mean` fix).
+        tier: Tier::BitExact,
     });
 }
 
@@ -515,7 +521,8 @@ fn corpus_vc2_low_delay_3pics_320x240() {
         height: 240,
         n_frames: 3,
         sub: Subsampling::Yuv420,
-        tier: Tier::ReportOnly,
+        // Bit-exact since round-118 (intra DC prediction `mean` fix).
+        tier: Tier::BitExact,
     });
 }
 
@@ -531,7 +538,9 @@ fn corpus_interlaced_720x576_i_only() {
         height: 576,
         n_frames: 1,
         sub: Subsampling::Yuv420,
-        tier: Tier::ReportOnly,
+        // Bit-exact since round-118 (intra DC prediction `mean` fix);
+        // also confirms the depth-4 IDWT recursion is correct.
+        tier: Tier::BitExact,
     });
 }
 
@@ -565,6 +574,8 @@ fn corpus_chroma_422_720x576_i_only() {
         height: 576,
         n_frames: 1,
         sub: Subsampling::Yuv422,
-        tier: Tier::ReportOnly,
+        // Bit-exact since round-118 (intra DC prediction `mean` fix);
+        // also confirms 4:2:2 chroma-plane decode is correct.
+        tier: Tier::BitExact,
     });
 }
