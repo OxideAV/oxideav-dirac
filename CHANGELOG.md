@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/OxideAV/oxideav-dirac/compare/v0.0.6...v0.0.7) - 2026-05-24
+
+### Other
+
+- §13.5.4 per-slice adaptive qindex (HQ profile)
+- emit §12.4.5.3 custom quantisation matrix (HQ + LD)
+- document the VLC core-intra encoder in the crate-level rustdoc
+- VLC (non-arithmetic) core-syntax intra encoder (0x4C)
+- core-intra encoder all-zero codeblock skip (§13.4.3.3)
+- cumulative codeblock quant offset fix + core-intra spatial partition encoder
+- inter encoder: post-OBMC bipred mode-only refinement pass (round-95)
+- inter encoder: bipred per-ref candidate-set widening to {int-pel, half-pel, sub-pel}
+- inter encoder: post-OBMC second adaptive sub-pel-vs-int-pel pass for 1-ref path
+- inter encoder: per-block adaptive sub-pel-vs-int-pel selection for 1-ref path
+
 ### Added
 
 - VC-2 HQ **per-slice adaptive quantisation index** (§13.5.2 / §13.5.4,
