@@ -64,7 +64,30 @@ pub struct EncoderParams {
     /// Per-slice quantisation index (0..=127). 0 means lossless-ish —
     /// qf=4, offset=1, resulting in near-identity inverse quant for
     /// coefficients small compared to 4.
+    ///
+    /// When [`Self::slice_size_target`] is `None` this exact value is
+    /// written into every slice header and used to quantise the whole
+    /// picture (the constant-qindex behaviour). When it is `Some(_)` it
+    /// becomes the *floor* of the per-slice adaptive search (§13.5.4):
+    /// each slice never uses a qindex below this value.
     pub qindex: u32,
+    /// Per-slice byte-budget target for the §13.5.4 adaptive-qindex
+    /// search. `None` (default) keeps the constant-`qindex` behaviour —
+    /// every slice writes `qindex` verbatim. `Some(target)` makes each
+    /// slice independently pick the *smallest* qindex in
+    /// `qindex..=127` for which **every** component's HQ length byte is
+    /// `<= target` (i.e. each component's coefficient payload fits in
+    /// `target * slice_size_scaler` bytes). This is the spec's intended
+    /// HQ rate-control knob — a slice with little energy keeps the low
+    /// floor qindex (lossless-ish), while a busy slice raises its own
+    /// qindex just enough to fit, instead of relying on a generous
+    /// `slice_size_scaler` and silently truncating. The HQ profile
+    /// applies no §13.5.1 DC prediction, so each slice's coefficients
+    /// are independent and may be quantised at its own qindex without
+    /// any cross-slice coupling. If even qindex 127 overflows the
+    /// target the search keeps 127 (the length byte is still bounded by
+    /// the 255 cap the `debug_assert!` in [`encode_hq_slice`] guards).
+    pub slice_size_target: Option<u32>,
 }
 
 impl EncoderParams {
@@ -84,6 +107,7 @@ impl EncoderParams {
             quant_matrix,
             custom_quant_matrix: false,
             qindex: 0,
+            slice_size_target: None,
         }
     }
 
@@ -94,6 +118,16 @@ impl EncoderParams {
     pub fn with_custom_quant_matrix(mut self, matrix: QuantMatrix) -> Self {
         self.quant_matrix = matrix;
         self.custom_quant_matrix = true;
+        self
+    }
+
+    /// Enable the §13.5.4 per-slice adaptive-qindex search with a
+    /// per-component byte budget of `target` length-byte units (i.e.
+    /// `target * slice_size_scaler` bytes per component). See
+    /// [`Self::slice_size_target`] for the full semantics. The current
+    /// [`Self::qindex`] becomes the search floor.
+    pub fn with_slice_size_target(mut self, target: u32) -> Self {
+        self.slice_size_target = Some(target);
         self
     }
 }
@@ -126,15 +160,11 @@ pub fn encode_hq_intra_picture(
     let chroma_w = sequence.chroma_width;
     let chroma_h = sequence.chroma_height;
 
+    // Keep the *unquantised* coefficient pyramids — each slice may pick
+    // its own qindex (§13.5.4) and quantise its own region on the fly.
     let y_py = forward_component(y, luma_w, luma_h, sequence.luma_depth, params);
     let u_py = forward_component(u, chroma_w, chroma_h, sequence.chroma_depth, params);
     let v_py = forward_component(v, chroma_w, chroma_h, sequence.chroma_depth, params);
-
-    // Quantise in place.
-    let q_per_level = slice_quantisers(params.qindex, &params.quant_matrix);
-    let y_qpy = quantise_pyramid(&y_py, &q_per_level);
-    let u_qpy = quantise_pyramid(&u_py, &q_per_level);
-    let v_qpy = quantise_pyramid(&v_py, &q_per_level);
 
     // Precompute per-level subband sizes for each component.
     let mut luma_dims: Vec<(usize, usize)> = Vec::with_capacity(params.dwt_depth as usize + 1);
@@ -146,14 +176,33 @@ pub fn encode_hq_intra_picture(
 
     for sy in 0..params.slices_y {
         for sx in 0..params.slices_x {
+            // §13.5.4: choose this slice's qindex. With no byte target
+            // the floor `params.qindex` is used verbatim (the legacy
+            // constant-qindex path). With a target, search upward for
+            // the smallest qindex whose component lengths all fit.
+            let qindex = match params.slice_size_target {
+                None => params.qindex,
+                Some(target) => choose_hq_slice_qindex(
+                    params,
+                    sx,
+                    sy,
+                    &y_py,
+                    &u_py,
+                    &v_py,
+                    &luma_dims,
+                    &chroma_dims,
+                    target,
+                ),
+            };
             encode_hq_slice(
                 &mut w,
                 params,
+                qindex,
                 sx,
                 sy,
-                &y_qpy,
-                &u_qpy,
-                &v_qpy,
+                &y_py,
+                &u_py,
+                &v_py,
                 &luma_dims,
                 &chroma_dims,
             );
@@ -161,6 +210,116 @@ pub fn encode_hq_intra_picture(
     }
 
     w.finish()
+}
+
+/// Length byte (in `slice_size_scaler` units) one HQ component would
+/// occupy if this slice's coefficients were quantised at `qindex`.
+/// Mirrors the padding arithmetic in [`encode_hq_slice`].
+fn hq_component_length_byte(
+    params: &EncoderParams,
+    qindex: u32,
+    comp_py: &[[SubbandData; 4]],
+    dims: &[(usize, usize)],
+    sx: u32,
+    sy: u32,
+) -> usize {
+    let q_per_level = slice_quantisers(qindex, &params.quant_matrix);
+    let comp_bytes = encode_hq_component(params, &q_per_level, comp_py, dims, sx, sy);
+    let scaler = params.slice_size_scaler.max(1) as usize;
+    comp_bytes.len().div_ceil(scaler)
+}
+
+/// §13.5.4 adaptive per-slice quantiser search (HQ profile). Returns the
+/// smallest `qindex` in `params.qindex..=127` for which **every**
+/// component's HQ length byte is `<= target`. If even qindex 127 cannot
+/// fit, returns 127 (the most aggressive quantiser available); the HQ
+/// length-byte 255 cap is still enforced downstream by the
+/// `debug_assert!` in [`encode_hq_slice`]. The HQ profile applies no
+/// §13.5.1 DC prediction so each slice is independent — quantising one
+/// slice at a higher qindex never affects another.
+#[allow(clippy::too_many_arguments)]
+fn choose_hq_slice_qindex(
+    params: &EncoderParams,
+    sx: u32,
+    sy: u32,
+    y_py: &[[SubbandData; 4]],
+    u_py: &[[SubbandData; 4]],
+    v_py: &[[SubbandData; 4]],
+    luma_dims: &[(usize, usize)],
+    chroma_dims: &[(usize, usize)],
+    target: u32,
+) -> u32 {
+    let target = target as usize;
+    let floor = params.qindex.min(127);
+    for qindex in floor..=127 {
+        let ly = hq_component_length_byte(params, qindex, y_py, luma_dims, sx, sy);
+        let lu = hq_component_length_byte(params, qindex, u_py, chroma_dims, sx, sy);
+        let lv = hq_component_length_byte(params, qindex, v_py, chroma_dims, sx, sy);
+        if ly <= target && lu <= target && lv <= target {
+            return qindex;
+        }
+    }
+    127
+}
+
+/// Per-slice diagnostic for the §13.5.4 adaptive-qindex search. Returns
+/// one `(qindex, max_component_length_byte)` pair per slice, in
+/// raster slice order (`sy` outer, `sx` inner) — exactly the order
+/// [`encode_hq_intra_picture`] emits slices. `qindex` is the value the
+/// encoder would write into that slice's header; `max_component_length_byte`
+/// is the largest of the three components' length bytes at that qindex
+/// (i.e. the value the [`EncoderParams::slice_size_target`] budget is
+/// compared against). With [`EncoderParams::slice_size_target`] = `None`
+/// every pair carries `params.qindex` and the resulting length. This is
+/// drift-proof against the emit path because both call the same
+/// [`choose_hq_slice_qindex`] / [`hq_component_length_byte`] helpers.
+pub fn hq_slice_qindexes(
+    sequence: &SequenceHeader,
+    params: &EncoderParams,
+    y: &[u8],
+    u: &[u8],
+    v: &[u8],
+) -> Vec<(u32, usize)> {
+    let luma_w = sequence.luma_width;
+    let luma_h = sequence.luma_height;
+    let chroma_w = sequence.chroma_width;
+    let chroma_h = sequence.chroma_height;
+
+    let y_py = forward_component(y, luma_w, luma_h, sequence.luma_depth, params);
+    let u_py = forward_component(u, chroma_w, chroma_h, sequence.chroma_depth, params);
+    let v_py = forward_component(v, chroma_w, chroma_h, sequence.chroma_depth, params);
+
+    let mut luma_dims: Vec<(usize, usize)> = Vec::with_capacity(params.dwt_depth as usize + 1);
+    let mut chroma_dims: Vec<(usize, usize)> = Vec::with_capacity(params.dwt_depth as usize + 1);
+    for level in 0..=params.dwt_depth {
+        luma_dims.push(subband_dims(luma_w, luma_h, params.dwt_depth, level));
+        chroma_dims.push(subband_dims(chroma_w, chroma_h, params.dwt_depth, level));
+    }
+
+    let mut out = Vec::with_capacity((params.slices_x * params.slices_y) as usize);
+    for sy in 0..params.slices_y {
+        for sx in 0..params.slices_x {
+            let qindex = match params.slice_size_target {
+                None => params.qindex,
+                Some(target) => choose_hq_slice_qindex(
+                    params,
+                    sx,
+                    sy,
+                    &y_py,
+                    &u_py,
+                    &v_py,
+                    &luma_dims,
+                    &chroma_dims,
+                    target,
+                ),
+            };
+            let ly = hq_component_length_byte(params, qindex, &y_py, &luma_dims, sx, sy);
+            let lu = hq_component_length_byte(params, qindex, &u_py, &chroma_dims, sx, sy);
+            let lv = hq_component_length_byte(params, qindex, &v_py, &chroma_dims, sx, sy);
+            out.push((qindex, ly.max(lu).max(lv)));
+        }
+    }
+    out
 }
 
 fn write_transform_parameters(w: &mut BitWriter, params: &EncoderParams) {
@@ -250,39 +409,6 @@ fn forward_component(
     dwt(&pic, params.wavelet, params.dwt_depth)
 }
 
-/// Quantise every coefficient `x` to `sign(x) * (|x| / qf)`. Level 0
-/// uses only the LL entry; higher levels use HL/LH/HH.
-fn quantise_pyramid(
-    pyramid: &[[SubbandData; 4]],
-    q_per_level: &[[u32; 4]],
-) -> Vec<[SubbandData; 4]> {
-    let mut out: Vec<[SubbandData; 4]> = Vec::with_capacity(pyramid.len());
-    for (level, bands) in pyramid.iter().enumerate() {
-        let mut level_out: [SubbandData; 4] = [
-            SubbandData::new(bands[0].width, bands[0].height),
-            SubbandData::new(bands[1].width, bands[1].height),
-            SubbandData::new(bands[2].width, bands[2].height),
-            SubbandData::new(bands[3].width, bands[3].height),
-        ];
-        for orient_idx in 0..4 {
-            let src = &bands[orient_idx];
-            if src.width == 0 || src.height == 0 {
-                continue;
-            }
-            let q = q_per_level[level][orient_idx];
-            let dst = &mut level_out[orient_idx];
-            for y in 0..src.height {
-                for x in 0..src.width {
-                    let v = src.get(y, x);
-                    dst.set(y, x, quantise_coeff(v, q));
-                }
-            }
-        }
-        out.push(level_out);
-    }
-    out
-}
-
 /// Forward quantisation (§13.3.1 inverse). The spec's inverse quant
 /// formula is `x = sign(q) * (|q| * qf + offset + 2) / 4`. A matching
 /// forward map that's exactly recovered when the qindex keeps qf small
@@ -324,15 +450,21 @@ fn slice_bounds(
 
 /// Encode one HQ slice (§13.5.4):
 /// `slice_prefix_bytes | qindex | (len_y, Y-coeffs) | (len_u, U-coeffs) | (len_v, V-coeffs)`.
+///
+/// `qindex` is the quantiser this slice writes into its 1-byte header
+/// and uses to quantise its own coefficient region. The three component
+/// pyramids are the *unquantised* forward-DWT coefficients; this slice
+/// quantises only its `(sx, sy)` region per [`slice_quantisers`].
 #[allow(clippy::too_many_arguments)]
 fn encode_hq_slice(
     w: &mut BitWriter,
     params: &EncoderParams,
+    qindex: u32,
     sx: u32,
     sy: u32,
-    y_qpy: &[[SubbandData; 4]],
-    u_qpy: &[[SubbandData; 4]],
-    v_qpy: &[[SubbandData; 4]],
+    y_py: &[[SubbandData; 4]],
+    u_py: &[[SubbandData; 4]],
+    v_py: &[[SubbandData; 4]],
     luma_dims: &[(usize, usize)],
     chroma_dims: &[(usize, usize)],
 ) {
@@ -341,19 +473,22 @@ fn encode_hq_slice(
     for _ in 0..params.slice_prefix_bytes {
         w.write_uint_lit(1, 0);
     }
-    // qindex is 1 byte.
-    w.write_uint_lit(1, params.qindex);
+    // qindex is 1 byte (§13.5.2).
+    w.write_uint_lit(1, qindex);
+
+    // Per-subband effective quantisers for this slice's qindex.
+    let q_per_level = slice_quantisers(qindex, &params.quant_matrix);
 
     // Per-component: emit a 1-byte length and the coefficient stream,
     // padded out to `length * slice_size_scaler` bytes.
     for comp in 0..3 {
         let dims: &[(usize, usize)] = if comp == 0 { luma_dims } else { chroma_dims };
-        let qpy: &[[SubbandData; 4]] = match comp {
-            0 => y_qpy,
-            1 => u_qpy,
-            _ => v_qpy,
+        let py: &[[SubbandData; 4]] = match comp {
+            0 => y_py,
+            1 => u_py,
+            _ => v_py,
         };
-        let comp_bytes = encode_hq_component(params, qpy, dims, sx, sy);
+        let comp_bytes = encode_hq_component(params, &q_per_level, py, dims, sx, sy);
         let scaler = params.slice_size_scaler.max(1) as usize;
         // Round length up to a multiple of scaler; emit the byte
         // length divided by scaler as the length prefix.
@@ -376,20 +511,23 @@ fn encode_hq_slice(
 
 /// Serialise one component's coefficients for a single slice to a
 /// fresh byte buffer, using bounded interleaved exp-Golomb + byte
-/// alignment at the end.
+/// alignment at the end. `q_per_level` holds the per-subband effective
+/// quantisers for this slice (from [`slice_quantisers`]); the pyramid
+/// `py` is *unquantised* and each coefficient is quantised on the fly.
 fn encode_hq_component(
     params: &EncoderParams,
-    qpy: &[[SubbandData; 4]],
+    q_per_level: &[[u32; 4]],
+    py: &[[SubbandData; 4]],
     dims: &[(usize, usize)],
     sx: u32,
     sy: u32,
 ) -> Vec<u8> {
     let mut w = BitWriter::new();
     // Level 0 — LL only.
-    write_slice_band(&mut w, 0, Orient::LL, sx, sy, params, qpy, dims);
+    write_slice_band(&mut w, 0, Orient::LL, sx, sy, params, q_per_level, py, dims);
     for level in 1..=params.dwt_depth {
         for orient in [Orient::HL, Orient::LH, Orient::HH] {
-            write_slice_band(&mut w, level, orient, sx, sy, params, qpy, dims);
+            write_slice_band(&mut w, level, orient, sx, sy, params, q_per_level, py, dims);
         }
     }
     w.byte_align();
@@ -404,19 +542,21 @@ fn write_slice_band(
     sx: u32,
     sy: u32,
     params: &EncoderParams,
-    qpy: &[[SubbandData; 4]],
+    q_per_level: &[[u32; 4]],
+    py: &[[SubbandData; 4]],
     dims: &[(usize, usize)],
 ) {
     let (sub_w, sub_h) = dims[level as usize];
     let (left, right, top, bottom) =
         slice_bounds(sx, sy, params.slices_x, params.slices_y, sub_w, sub_h);
-    let band = &qpy[level as usize][orient.as_index()];
+    let band = &py[level as usize][orient.as_index()];
     if band.width == 0 || band.height == 0 {
         return;
     }
+    let q = q_per_level[level as usize][orient.as_index()];
     for y in top..bottom {
         for x in left..right {
-            let v = band.get(y, x);
+            let v = quantise_coeff(band.get(y, x), q);
             w.write_sint(v);
         }
     }

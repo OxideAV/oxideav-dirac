@@ -9,6 +9,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- VC-2 HQ **per-slice adaptive quantisation index** (§13.5.2 / §13.5.4,
+  round-114). `EncoderParams` gains `slice_size_target: Option<u32>`
+  (default `None`) plus a `with_slice_size_target(target)` builder. With
+  `None` the encoder keeps the legacy constant-qindex behaviour — every
+  slice writes `params.qindex` verbatim and the whole picture is
+  quantised once. With `Some(target)` each slice independently picks the
+  **smallest** qindex in `params.qindex..=127` for which **every**
+  component's HQ length byte is `<= target` (i.e. each component's
+  coefficient payload fits in `target * slice_size_scaler` bytes). This
+  is the spec's intended HQ rate-control knob: a flat / low-energy slice
+  keeps the floor qindex (lossless-ish), while a busy slice raises its
+  own qindex just enough to fit, instead of relying on a generous
+  `slice_size_scaler` and silently truncating the slice on the wire
+  (§13.5.2 bounded reads otherwise zero the tail). The HQ profile
+  applies no §13.5.1 DC prediction, so each slice's coefficients are
+  independent and may be quantised at its own qindex without any
+  cross-slice coupling; the decoder already reads `qindex = read_nbits(7)`
+  per slice (§13.5.2) so **no decode-side change is needed**. The HQ
+  encode path was refactored to keep the *unquantised* coefficient
+  pyramids and quantise each slice's region on the fly at its chosen
+  qindex (the now-unused whole-picture `quantise_pyramid` helper is
+  removed); the `None` path is byte-for-byte identical to the previous
+  output (all 229 prior tests unchanged). A new public
+  `encoder::hq_slice_qindexes` returns the per-slice
+  `(qindex, max_component_length_byte)` vector for introspection,
+  drift-proof against the emit path because both call the same
+  `choose_hq_slice_qindex` / `hq_component_length_byte` helpers. Six
+  integration tests in `tests/encoder_slice_qindex.rs`:
+  `hq_adaptive_qindex_roundtrips_under_tight_budget` (tight budget →
+  decoder accepts the stream and every slice fits its budget),
+  `hq_adaptive_qindex_is_non_vacuous_on_busy_content` (a flat-quadrant +
+  busy-checker picture keeps ≥1 cheap slice at the floor AND escalates
+  ≥1 busy slice above it), `hq_adaptive_qindex_keeps_floor_and_matches_constant_on_flat`
+  (flat content stays at the floor everywhere → stream byte-identical to
+  the constant-qindex stream + bit-exact round-trip),
+  `hq_adaptive_qindex_generous_budget_equals_none` (a budget above every
+  slice's floor length reduces the adaptive path to the constant path),
+  `hq_adaptive_qindex_is_deterministic`, and
+  `hq_adaptive_qindex_tighter_budget_never_lowers_qindex` (a smaller
+  target can only push qindexes up, never down — pins the search
+  direction).
+
+### Fixed
+
+- **`quant::quant_factor` u32 overflow at high qindex** (§13.2.1,
+  round-114). `quant_factor(q)` computed `1u32 << (q/4)` and then
+  `4 * base` / `503_829 * base` / … in `u32`, which overflows for
+  `q >= 124` (and lower for the `q % 4 != 0` branches). The function was
+  previously only ever called with `qindex = 0` so the overflow was
+  dormant; the new §13.5.4 per-slice adaptive search drives `q` up to
+  the 7-bit maximum (127) on busy slices and triggered it. The
+  arithmetic now runs in `u64` and saturates at `u32::MAX`. Saturation
+  is behaviour-preserving: a `qf` that large forward-quantises every
+  8-bit-derived coefficient to 0 (`4*|x|/qf == 0`) and `inverse_quant`
+  reconstructs 0 from a 0 qcoeff regardless of `qf`, so neither encode
+  nor decode observes the clamp.
+
+### Added
+
 - VC-2 low-delay **custom quantisation matrix on the encoder**
   (§12.4.5.3 / §11.3.5 `quant_matrix()`, round-111). Both
   `EncoderParams` (HQ) and `LdEncoderParams` (LD) gain a

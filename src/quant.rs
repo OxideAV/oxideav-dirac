@@ -25,15 +25,26 @@ use crate::subband::Orient;
 use crate::wavelet::WaveletFilter;
 
 /// `quant_factor(q)` (§13.2.1). Valid for any `q ≥ 0`.
+///
+/// The §13.5.4 per-slice adaptive search drives `q` up toward the 7-bit
+/// maximum (127) on busy slices, where `2^(q/4)` exceeds 32 bits; the
+/// arithmetic is therefore done in `u64` and the result saturated at
+/// `u32::MAX`. Saturation is behaviour-preserving: a `qf` that large
+/// forward-quantises every 8-bit-derived coefficient to 0
+/// (`4*|x|/qf == 0`), and [`inverse_quant`] reconstructs 0 from a 0
+/// qcoeff regardless of `qf`, so neither encode nor decode observes the
+/// clamp. Without it, `q >= 124` (or lower for the `q%4 != 0` branches)
+/// would overflow.
 pub fn quant_factor(q: u32) -> u32 {
-    let base: u32 = 1u32 << (q / 4);
-    match q % 4 {
+    let base: u64 = 1u64 << (q / 4);
+    let raw = match q % 4 {
         0 => 4 * base,
         1 => (503_829 * base + 52_958) / 105_917,
         2 => (665_857 * base + 58_854) / 117_708,
         3 => (440_253 * base + 32_722) / 65_444,
         _ => unreachable!(),
-    }
+    };
+    raw.min(u32::MAX as u64) as u32
 }
 
 /// `quant_offset(q)` per VC-2 §13.3.2 (SMPTE ST 2042-1:2022). The
