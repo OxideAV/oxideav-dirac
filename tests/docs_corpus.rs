@@ -463,7 +463,11 @@ fn corpus_i_then_p_320x240() {
         height: 240,
         n_frames: 2,
         sub: Subsampling::Yuv420,
-        tier: Tier::ReportOnly,
+        // Bit-exact since round-128: the §12.3.6.6 Case 4 unbiased-mean
+        // (`div_euclid` floor) fix for intra-block DC prediction inside
+        // inter pictures closed the residual ~1% pixel gap left after
+        // round-125's §13.2.1 inter quant-offset fix.
+        tier: Tier::BitExact,
     });
 }
 
@@ -474,9 +478,7 @@ fn corpus_i_then_p_320x240() {
 /// `decode_fixture` driver sorts them by `pts` (== `picture_number`
 /// when packets carry no explicit pts) before per-frame comparison
 /// so the PSNR numbers measure each picture against its true display
-/// counterpart. With this in place: I (frame 0) ≈ 48.79 dB Y, B
-/// (frame 1) ≈ 7.31 dB Y (the bipred OBMC convention gap), P (frame
-/// 2) ≈ 47.96 dB Y.
+/// counterpart.
 /// Trace: docs/video/dirac/fixtures/i-p-b-320x240/trace.txt.gz
 #[test]
 fn corpus_i_p_b_320x240() {
@@ -486,7 +488,11 @@ fn corpus_i_p_b_320x240() {
         height: 240,
         n_frames: 3,
         sub: Subsampling::Yuv420,
-        tier: Tier::ReportOnly,
+        // Bit-exact since round-128: the §12.3.6.6 Case 4 unbiased-mean
+        // (`div_euclid` floor) fix for intra-block DC prediction inside
+        // inter pictures. Both the P frame and the B frame now match
+        // ffmpeg byte-for-byte across all three pictures (I, P, B).
+        tier: Tier::BitExact,
     });
 }
 

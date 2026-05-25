@@ -742,10 +742,20 @@ fn dc_prediction(motion: &PictureMotionData, x: u32, y: u32, c: usize) -> i32 {
     if values.is_empty() {
         0
     } else {
+        // §12.3.6.6 Case 4: the prediction is the **unbiased** mean of
+        // the available DC values from the (-1, 0), (0, -1) and (-1, -1)
+        // neighbours that are themselves intra-coded. §6.4.3 defines
+        // `mean(S) = (s0 + … + s_(n-1) + (n//2)) // n` with `//` being
+        // *floor* division (rounds toward -infinity), not Rust's `/`
+        // which truncates toward zero. For positive sums the two agree;
+        // for negative sums the truncation gave a result one LSB higher
+        // than the spec, biasing the DC up by 1 LSB on every intra
+        // block whose neighbours' DC values sum negative — visible as a
+        // ~1% pixel-gap region of off-by-+1 luma reconstructions on the
+        // inter `Tier::ReportOnly` corpus fixtures.
         let n = values.len() as i64;
         let sum: i64 = values.iter().sum::<i64>() + n / 2;
-        let q = sum / n;
-        q as i32
+        sum.div_euclid(n) as i32
     }
 }
 
@@ -828,5 +838,60 @@ mod tests {
         // wrapping_add then mod 3 — the previous direct `+` panicked.
         let val = r.wrapping_add(p) % 3;
         assert!(val < 3);
+    }
+
+    /// §12.3.6.6 Case 4: when all three prediction-aperture neighbours
+    /// (-1, 0), (0, -1) and (-1, -1) are intra-coded, the prediction is
+    /// the **unbiased mean** of their DC values. §6.4.3 defines
+    /// `mean(S) = (Σ s_i + n//2) // n` with `//` being floor division.
+    /// Pin the negative-sum case, which is where Rust's truncating `/`
+    /// would diverge from the spec: `(-7 + 1) // 3 = -2` (floor) vs
+    /// `(-7 + 1) / 3 = -1` (Rust truncate). Pre-fix, every intra block
+    /// whose neighbour DCs averaged negative was reconstructed with its
+    /// DC biased up by 1 LSB, which then propagated through OBMC into a
+    /// localised +1 region on inter-corpus fixtures (closing that gap
+    /// promoted `i-then-p` and `i-p-b` to bit-exact in round-128).
+    #[test]
+    fn dc_prediction_uses_floor_unbiased_mean() {
+        // Construct a 2x2 block grid where (0, 0), (0, 1) and (1, 0)
+        // are intra with negative DC values, and check that (1, 1)'s
+        // prediction matches the spec's floor-mean.
+        let mut motion = PictureMotionData {
+            blocks_x: 2,
+            blocks_y: 2,
+            superblocks_x: 1,
+            superblocks_y: 1,
+            sb_split: vec![2], // 4 individual blocks
+            blocks: vec![BlockData::default(); 4],
+            global1: None,
+            global2: None,
+        };
+        for (x, y) in [(0u32, 0u32), (1, 0), (0, 1)] {
+            let b = motion.get_block_mut(x, y);
+            b.rmode = RefPredMode::Intra;
+        }
+        // Three neighbours of (1, 1) sum to -7 with values (-3, -2, -2).
+        // (top-left)=(0,0)=-3, (top)=(1,0)=-2, (left)=(0,1)=-2.
+        motion.get_block_mut(0, 0).dc[0] = -3;
+        motion.get_block_mut(1, 0).dc[0] = -2;
+        motion.get_block_mut(0, 1).dc[0] = -2;
+        // mean = (-7 + 1) // 3 = -6 // 3 = -2 (floor, also truncate).
+        assert_eq!(dc_prediction(&motion, 1, 1, 0), -2);
+
+        // Swap so the sum is -8: (-3, -3, -2). mean = (-8 + 1) // 3 =
+        // -7 // 3 = -3 (floor) vs -2 (Rust truncate). The pre-fix bug
+        // returned -2, biasing reconstructed DC up by 1.
+        motion.get_block_mut(0, 0).dc[0] = -3;
+        motion.get_block_mut(1, 0).dc[0] = -3;
+        motion.get_block_mut(0, 1).dc[0] = -2;
+        assert_eq!(dc_prediction(&motion, 1, 1, 0), -3);
+
+        // Positive sum: floor and truncate agree, so this is just a
+        // sanity check that the +1 unbiased-mean bias is also applied.
+        // (4, 1, 2) sums to 7; mean = (7 + 1) // 3 = 2.
+        motion.get_block_mut(0, 0).dc[0] = 4;
+        motion.get_block_mut(1, 0).dc[0] = 1;
+        motion.get_block_mut(0, 1).dc[0] = 2;
+        assert_eq!(dc_prediction(&motion, 1, 1, 0), 2);
     }
 }

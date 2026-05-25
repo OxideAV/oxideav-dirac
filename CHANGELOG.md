@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **§12.3.6.6 Case 4 unbiased-mean rounding** (round-128). The DC
+  prediction for intra blocks inside inter pictures (the spec's
+  `dc_prediction()` Case 4 — all three neighbours intra-coded) computed
+  the mean of three neighbour DC values as `(a + b + c + 1) / 3` using
+  Rust's `/`, which truncates toward zero. §6.4.3 defines `mean(S)` as
+  `(Σ + n//2) // n` with `//` being **floor** division; for negative
+  sums truncate and floor differ by exactly 1, so every intra block
+  whose neighbours' DC values averaged negative was reconstructed with
+  its DC value biased up by 1 LSB. The bug propagated through OBMC into
+  a localised +1 region on the inter corpus fixtures (closing the
+  ~1% pixel-gap on `i-then-p` and `i-p-b`).
+  The intra-only subband DC predictor (`picture::mean3`) already used
+  `div_euclid` since round-118; this round brings the inter motion-data
+  DC predictor (`picture_inter::dc_prediction`) into line with it. New
+  unit test `dc_prediction_uses_floor_unbiased_mean` pins the
+  negative-sum, positive-sum and exact-multiple-of-3 cases. The r125
+  commit message attributed the residual ~1% gap to "OBMC convention",
+  but the actual root cause was upstream in DC-value decoding; OBMC and
+  the §15.8.5 weighted-sum reconstruction are unchanged.
+  Effect on the docs-corpus fixtures (every previously bit-exact intra
+  fixture stays bit-exact):
+  - `corpus_i_then_p_320x240` — **100.00% bit-exact** (was 99.23%).
+    Promoted from `Tier::ReportOnly` to `Tier::BitExact`.
+  - `corpus_i_p_b_320x240` — **100.00% bit-exact** (was 99.21%).
+    Promoted to `Tier::BitExact`.
+  - `corpus_interlaced_720x576_i_then_p_wavelet_5_3` — **99.68%**
+    pixel-exact (frame 0 100.00%; frame 1 99.36%). Stays
+    `Tier::ReportOnly`; the residual gap is concentrated in the
+    LeGall-5,3 wavelet path on the inter picture and is the next
+    closeable item.
+
 ### Added
 
 - **§13.2.1 inter quant-offset on the decoder** (round-125). The 2008
