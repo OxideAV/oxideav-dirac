@@ -9,6 +9,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **VC-2 HQ picture-level rate-control picker** (round-138). The HQ
+  analogue of round-131's `pick_ld_picture_qindex`: given a target
+  picture-payload byte budget, walk `qindex ∈ params.qindex..=127` and
+  return the smallest qindex for which the entire HQ picture's encoded
+  payload — with that single qindex written into every slice header —
+  fits within the budget. Unlike LD (deterministic picture bytes from
+  `slice_bytes_numer/denom`), HQ length bytes track each slice's actual
+  coefficient block size, so picture bytes shrink monotonically with
+  rising qindex (the dead-zone forward quantiser drives more
+  coefficients toward zero → fewer interleaved exp-Golomb bits per
+  slice). The picker exploits that monotonicity to stop at the first
+  qindex that fits. BBC Dirac Specification v2.2.3 §13.5.2 (per-slice
+  qindex header) + §13.5.4 (`slice_quantisers(qindex)`).
+  - New public API surface in `oxideav_dirac::encoder`:
+    - `hq_picture_payload_bytes_at_qindex(seq, params, y, u, v, qindex)
+      -> usize` — content-dependent exact picture-payload byte count at
+      a uniform qindex (ignores `params.slice_size_target`).
+    - `pick_hq_picture_qindex(seq, params, y, u, v, target_bytes)
+      -> u32` — smallest qindex whose picture bytes ≤ target.
+    - `hq_picture_qindex_diagnostic(seq, params, y, u, v, target_bytes)
+      -> (u32, usize)` — picker plus actual picture bytes at the chosen
+      qindex.
+    - `encode_single_hq_intra_stream_with_size_target(seq, base,
+      target_bytes, picture_number, y, u, v) -> (Vec<u8>, u32, usize)`
+      — full elementary stream wrapper. Clears `slice_size_target` on
+      the input params so the §13.5.4 per-slice search does not also
+      fire; the chosen picture-level qindex is the one written into
+      every slice header.
+  - New test file `tests/encoder_hq_picture_qindex.rs` (9 tests, all
+    passing). Headline acceptance: a 64×64 4:2:0 mid-frequency fixture
+    with q=0 ceiling 1934 B and q=127 floor 839 B sees three budgets
+    `[907, 1420, 1934]` land at actual picture bytes `[905, 1388,
+    1934]` (all ≤ target, picker never overshoots) with chosen
+    qindexes `[35, 16, 0]` — the small budget escalates to a
+    mid-aggressive quantiser, the large budget stays lossless at q=0.
+    Other tests pin: predictor matches actual encode at every qindex
+    `[0, 1, 5, 16, 32, 64, 100, 127]`; picture bytes are monotonically
+    non-increasing across `qindex ∈ 0..=127`; picker is monotone in
+    target_bytes (smaller budget → equal-or-higher qindex); flat
+    content keeps q=0 even under a tight budget; unfit-target case
+    returns q=127 with the q=127 floor as actual bytes (graceful
+    degradation, stream still decodes); determinism (same input →
+    byte-identical stream); wrapper-ignores-`slice_size_target`
+    invariant.
+
 - **VC-2 LD multi-picture rate-controlled sequence encoder** (round-134).
   A stream-level driver on top of the round-131 per-picture
   `pick_ld_picture_qindex` primitive: given a sequence of YUV frames plus

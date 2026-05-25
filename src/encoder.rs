@@ -322,6 +322,238 @@ pub fn hq_slice_qindexes(
     out
 }
 
+/// Encoded payload byte count of a single VC-2 HQ intra picture when
+/// every slice is forced to share `qindex`, ignoring
+/// `params.slice_size_target` (i.e. the constant-qindex picture-byte
+/// count at the given quantiser). Unlike LD's
+/// [`ld_picture_payload_bytes`] this is **content-dependent** — each HQ
+/// slice's length byte tracks the slice's actual coefficient block size,
+/// not a fixed budget — so the function performs a full forward DWT,
+/// quantises at `qindex`, and serialises every slice.
+///
+/// Mirrors [`encode_hq_intra_picture`] exactly for the content-dependent
+/// per-slice size, but with the per-slice [`choose_hq_slice_qindex`]
+/// search replaced by the supplied `qindex` for every slice. Used by
+/// [`pick_hq_picture_qindex`] to walk qindex space against a picture-byte
+/// budget.
+///
+/// Source of truth: BBC Dirac Specification v2.2.3 §13.5.2 (per-slice
+/// qindex header) + §13.5.4 (`slice_quantisers(qindex)`).
+pub fn hq_picture_payload_bytes_at_qindex(
+    sequence: &SequenceHeader,
+    params: &EncoderParams,
+    y: &[u8],
+    u: &[u8],
+    v: &[u8],
+    qindex: u32,
+) -> usize {
+    let luma_w = sequence.luma_width;
+    let luma_h = sequence.luma_height;
+    let chroma_w = sequence.chroma_width;
+    let chroma_h = sequence.chroma_height;
+
+    let y_py = forward_component(y, luma_w, luma_h, sequence.luma_depth, params);
+    let u_py = forward_component(u, chroma_w, chroma_h, sequence.chroma_depth, params);
+    let v_py = forward_component(v, chroma_w, chroma_h, sequence.chroma_depth, params);
+
+    let mut luma_dims: Vec<(usize, usize)> = Vec::with_capacity(params.dwt_depth as usize + 1);
+    let mut chroma_dims: Vec<(usize, usize)> = Vec::with_capacity(params.dwt_depth as usize + 1);
+    for level in 0..=params.dwt_depth {
+        luma_dims.push(subband_dims(luma_w, luma_h, params.dwt_depth, level));
+        chroma_dims.push(subband_dims(chroma_w, chroma_h, params.dwt_depth, level));
+    }
+
+    let mut w = BitWriter::new();
+    // §12.2 picture_header: byte-align then 4-byte picture_number.
+    w.byte_align();
+    w.write_uint_lit(4, 0); // value does not affect size
+                            // §12.3 wavelet_transform.
+    w.byte_align();
+    write_transform_parameters(&mut w, params);
+    w.byte_align();
+    for sy in 0..params.slices_y {
+        for sx in 0..params.slices_x {
+            encode_hq_slice(
+                &mut w,
+                params,
+                qindex,
+                sx,
+                sy,
+                &y_py,
+                &u_py,
+                &v_py,
+                &luma_dims,
+                &chroma_dims,
+            );
+        }
+    }
+    w.finish().len()
+}
+
+/// VC-2 HQ picture-level qindex picker — the HQ analogue of
+/// [`pick_ld_picture_qindex`].
+///
+/// Given a target *picture-payload* byte budget (i.e. the bytes between
+/// the picture's parse-info and the next parse-info, equal to
+/// [`hq_picture_payload_bytes_at_qindex`]'s return), pick the **smallest**
+/// `qindex` in `params.qindex.min(127)..=127` for which the constant-qindex
+/// picture size ≤ `target_bytes`. If even qindex 127 overflows, return 127
+/// (the most aggressive quantiser available; the §13.5.4 length-byte cap
+/// of 255 still applies via the `debug_assert!` in [`encode_hq_slice`]).
+///
+/// `params.slice_size_target` is **ignored** by this picker — it forces a
+/// single picture-level qindex onto every slice, mirroring LD's
+/// per-picture rate model. Callers that want the §13.5.4 per-slice
+/// adaptive search should keep using `with_slice_size_target` directly;
+/// the two knobs are independent rate-control strategies.
+///
+/// Monotone in `target_bytes`: a smaller budget can only push the chosen
+/// qindex up (or leave it). HQ picture bytes shrink monotonically with
+/// increasing qindex because the dead-zone forward quantiser
+/// ([`quantise_coeff`]) drives more coefficients toward zero, which the
+/// interleaved exp-Golomb coder encodes with fewer bits.
+///
+/// Source of truth: BBC Dirac Specification v2.2.3 §13.5.2, §13.5.4.
+pub fn pick_hq_picture_qindex(
+    sequence: &SequenceHeader,
+    params: &EncoderParams,
+    y: &[u8],
+    u: &[u8],
+    v: &[u8],
+    target_bytes: u32,
+) -> u32 {
+    let luma_w = sequence.luma_width;
+    let luma_h = sequence.luma_height;
+    let chroma_w = sequence.chroma_width;
+    let chroma_h = sequence.chroma_height;
+
+    // Forward DWT once — every qindex re-quantises from the same
+    // unquantised coefficient pyramid.
+    let y_py = forward_component(y, luma_w, luma_h, sequence.luma_depth, params);
+    let u_py = forward_component(u, chroma_w, chroma_h, sequence.chroma_depth, params);
+    let v_py = forward_component(v, chroma_w, chroma_h, sequence.chroma_depth, params);
+
+    let mut luma_dims: Vec<(usize, usize)> = Vec::with_capacity(params.dwt_depth as usize + 1);
+    let mut chroma_dims: Vec<(usize, usize)> = Vec::with_capacity(params.dwt_depth as usize + 1);
+    for level in 0..=params.dwt_depth {
+        luma_dims.push(subband_dims(luma_w, luma_h, params.dwt_depth, level));
+        chroma_dims.push(subband_dims(chroma_w, chroma_h, params.dwt_depth, level));
+    }
+
+    let floor = params.qindex.min(127);
+    for qindex in floor..=127 {
+        let bytes = hq_picture_bytes_inner(
+            params,
+            qindex,
+            &y_py,
+            &u_py,
+            &v_py,
+            &luma_dims,
+            &chroma_dims,
+        );
+        if bytes <= target_bytes as usize {
+            return qindex;
+        }
+    }
+    127
+}
+
+/// Inner serialisation helper shared by [`pick_hq_picture_qindex`] and
+/// [`hq_picture_qindex_diagnostic`]: serialises the whole picture at the
+/// given qindex from already-computed pyramids and returns the byte count.
+#[allow(clippy::too_many_arguments)]
+fn hq_picture_bytes_inner(
+    params: &EncoderParams,
+    qindex: u32,
+    y_py: &[[SubbandData; 4]],
+    u_py: &[[SubbandData; 4]],
+    v_py: &[[SubbandData; 4]],
+    luma_dims: &[(usize, usize)],
+    chroma_dims: &[(usize, usize)],
+) -> usize {
+    let mut w = BitWriter::new();
+    w.byte_align();
+    w.write_uint_lit(4, 0);
+    w.byte_align();
+    write_transform_parameters(&mut w, params);
+    w.byte_align();
+    for sy in 0..params.slices_y {
+        for sx in 0..params.slices_x {
+            encode_hq_slice(
+                &mut w,
+                params,
+                qindex,
+                sx,
+                sy,
+                y_py,
+                u_py,
+                v_py,
+                luma_dims,
+                chroma_dims,
+            );
+        }
+    }
+    w.finish().len()
+}
+
+/// Diagnostic counterpart to [`pick_hq_picture_qindex`]: returns
+/// `(qindex, actual_picture_bytes)` so callers can inspect the chosen
+/// quantiser's actual picture-byte cost relative to the supplied budget.
+/// `actual_picture_bytes` is exactly [`hq_picture_payload_bytes_at_qindex`]
+/// at the returned qindex.
+pub fn hq_picture_qindex_diagnostic(
+    sequence: &SequenceHeader,
+    params: &EncoderParams,
+    y: &[u8],
+    u: &[u8],
+    v: &[u8],
+    target_bytes: u32,
+) -> (u32, usize) {
+    let qindex = pick_hq_picture_qindex(sequence, params, y, u, v, target_bytes);
+    let bytes = hq_picture_payload_bytes_at_qindex(sequence, params, y, u, v, qindex);
+    (qindex, bytes)
+}
+
+/// Encode a single VC-2 HQ intra-only Dirac elementary stream sized to a
+/// per-picture byte budget — the HQ analogue of
+/// [`encode_single_ld_intra_stream_with_size_target`].
+///
+/// The picture-level qindex is picked by [`pick_hq_picture_qindex`] (a
+/// single quantiser for every slice; `base.slice_size_target` is
+/// intentionally cleared so the per-slice §13.5.4 search does not also
+/// fire on top). The returned tuple is `(stream, chosen_qindex,
+/// actual_picture_payload_bytes)`. `actual_picture_payload_bytes` is the
+/// bytes between the picture's parse-info and the next parse-info — i.e.
+/// the same `target_bytes` denominator the picker compared against.
+///
+/// The full stream additionally carries the sequence-header unit, the
+/// picture's 13-byte parse-info, and the 13-byte end-of-sequence
+/// parse-info — so `stream.len() = sh_unit_len + 13 +
+/// actual_picture_payload_bytes + 13`.
+pub fn encode_single_hq_intra_stream_with_size_target(
+    sequence: &SequenceHeader,
+    base: &EncoderParams,
+    target_bytes: u32,
+    picture_number: u32,
+    y: &[u8],
+    u: &[u8],
+    v: &[u8],
+) -> (Vec<u8>, u32, usize) {
+    // The picker is a single picture-level qindex over the whole picture
+    // — disable the per-slice §13.5.4 search so the chosen qindex is the
+    // one that actually gets written into every slice header.
+    let mut params = base.clone();
+    params.slice_size_target = None;
+
+    let qindex = pick_hq_picture_qindex(sequence, &params, y, u, v, target_bytes);
+    params.qindex = qindex;
+
+    let stream = encode_single_hq_intra_stream(sequence, &params, picture_number, y, u, v);
+    let actual_picture_bytes =
+        hq_picture_payload_bytes_at_qindex(sequence, &params, y, u, v, qindex);
+    (stream, qindex, actual_picture_bytes)
+}
+
 fn write_transform_parameters(w: &mut BitWriter, params: &EncoderParams) {
     // wavelet_index, dwt_depth, slice parameters, quant matrix flag.
     w.write_uint(wavelet_index(params.wavelet));
