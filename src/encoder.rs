@@ -1504,6 +1504,199 @@ pub fn encode_single_ld_intra_stream_with_size_target(
     Some((out, qindex, adjusted))
 }
 
+/// Rate-control strategy for [`encode_ld_sequence_with_size_target`].
+///
+/// LD picture bytes are deterministic once `slice_bytes_numer` is fixed
+/// (every slice writes its full budget; see [`ld_picture_payload_bytes`]),
+/// so the only freedom is *how* the per-picture byte budget is derived
+/// from the caller's `target_bytes`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LdRateControl {
+    /// Each picture is independently sized to exactly `target_bytes`
+    /// (±1 byte from [`derive_ld_slice_bytes_for_target`]). The stream
+    /// total tracks `N * target_bytes` plus the fixed sequence-header /
+    /// parse-info overhead — there is no carry-over between pictures.
+    PerPicture,
+    /// Constant-bit-rate: a running accumulator carries the signed byte
+    /// over-/under-shoot of every encoded picture into the next picture's
+    /// budget. Because LD picture bytes are deterministic, the actual
+    /// over/undershoot is purely the ±1-byte
+    /// [`derive_ld_slice_bytes_for_target`] residual plus any clamping at
+    /// the minimum picture size — the accumulator drives the running
+    /// stream total to within a byte or two of `N * target_bytes`.
+    Cbr,
+}
+
+/// Per-picture rate-control telemetry returned by
+/// [`encode_ld_sequence_with_size_target_report`].
+#[derive(Debug, Clone, Copy)]
+pub struct LdPictureRate {
+    /// Picture number written into the picture header.
+    pub picture_number: u32,
+    /// Byte budget actually requested for this picture (after the CBR
+    /// accumulator adjustment, if any).
+    pub requested_bytes: u32,
+    /// Actual encoded picture *payload* bytes (excludes the 13-byte
+    /// parse-info wrapper). Equals [`ld_picture_payload_bytes`] of the
+    /// adjusted params.
+    pub actual_payload_bytes: u32,
+    /// qindex chosen by [`pick_ld_picture_qindex`] for this picture.
+    pub qindex: u32,
+}
+
+/// Encode a multi-picture VC-2 LD intra-only sequence with per-picture
+/// rate control driven by [`pick_ld_picture_qindex`].
+///
+/// For every input frame the driver:
+///   1. derives a per-picture byte budget from `target_bytes` and the
+///      chosen [`LdRateControl`] strategy,
+///   2. sizes `slice_bytes_numer / denom` so the encoded picture payload
+///      lands within ±1 byte of that budget
+///      ([`derive_ld_slice_bytes_for_target`]),
+///   3. picks the lowest qindex for which every slice fits without
+///      Funnel-truncation ([`pick_ld_picture_qindex`]), and
+///   4. emits the LD picture with parse code `0xC8` (§D.1.1 — LD permits
+///      only non-reference intra pictures).
+///
+/// The result is a complete elementary stream: sequence header (`0x00`)
+/// plus one LD picture per frame plus end-of-sequence (`0x10`), with the
+/// `next_parse_offset` / `previous_parse_offset` chain wired up so it
+/// round-trips through [`crate::decoder::DiracDecoder`] to one decoded
+/// frame per input frame.
+///
+/// Each frame's `(picture_number, y, u, v)` is taken from the supplied
+/// [`InputPicture`] slice. `base` supplies the wavelet / depth / slice
+/// grid / quant matrix; its `slice_bytes_numer / denom / qindex` are
+/// overridden per-picture by the rate controller.
+///
+/// Pictures whose adjusted budget is too small to hold the LD picture
+/// structure (header + `2 * slices_x * slices_y` minimum slice bytes,
+/// per [`derive_ld_slice_bytes_for_target`]) are clamped up to the
+/// smallest viable budget rather than dropped — a CBR run can therefore
+/// never produce an invalid picture, and the accumulator absorbs the
+/// clamp as an overshoot it pays back on the following pictures.
+///
+/// Source of truth: SMPTE ST 2042-1 §13.5.3.2 (slice byte budget),
+/// §13.5.2 (per-slice qindex header), §D.1.1 (LD parse-code restriction),
+/// §9.6 / §10.4 (parse-info sequence framing).
+pub fn encode_ld_sequence_with_size_target(
+    sequence: &SequenceHeader,
+    base: &LdEncoderParams,
+    frames: &[InputPicture<'_>],
+    target_bytes: u32,
+    mode: LdRateControl,
+) -> Vec<u8> {
+    let (stream, _report) =
+        encode_ld_sequence_with_size_target_report(sequence, base, frames, target_bytes, mode);
+    stream
+}
+
+/// [`encode_ld_sequence_with_size_target`] plus per-picture telemetry
+/// (requested vs. actual bytes and the chosen qindex for each picture).
+/// Returns `(stream, report)`.
+pub fn encode_ld_sequence_with_size_target_report(
+    sequence: &SequenceHeader,
+    base: &LdEncoderParams,
+    frames: &[InputPicture<'_>],
+    target_bytes: u32,
+    mode: LdRateControl,
+) -> (Vec<u8>, Vec<LdPictureRate>) {
+    let sh_payload = encode_sequence_header(sequence);
+    let pi_size = 13usize;
+    let sh_unit_len = pi_size + sh_payload.len();
+
+    let mut out = Vec::new();
+    write_parse_info(&mut out, 0x00, sh_unit_len as u32, 0);
+    out.extend_from_slice(&sh_payload);
+
+    let mut report: Vec<LdPictureRate> = Vec::with_capacity(frames.len());
+    let mut prev_len = sh_unit_len as u32;
+    let mut last_pic_len: Option<u32> = None;
+
+    // CBR accumulator: signed running difference between the bytes we
+    // have *requested* so far and `pictures_seen * target_bytes`. A
+    // positive accumulator means we have overshot the ideal cumulative
+    // budget, so the next picture's request is reduced; negative means
+    // we have headroom to spend.
+    let mut carry: i64 = 0;
+
+    // Smallest viable per-picture budget for this slice grid (header +
+    // 2 bytes per slice). Used to clamp tiny CBR requests rather than
+    // dropping the picture.
+    let n_slices = (base.slices_x.max(1) * base.slices_y.max(1)) as i64;
+    let header_floor = {
+        let probe = LdEncoderParams {
+            slice_bytes_numer: 2 * n_slices as u32,
+            slice_bytes_denom: n_slices as u32,
+            ..base.clone()
+        };
+        ld_picture_payload_bytes(&probe) as i64
+    };
+    let min_budget = header_floor.max(2 * n_slices);
+
+    for pic in frames {
+        let requested: u32 = match mode {
+            LdRateControl::PerPicture => target_bytes,
+            LdRateControl::Cbr => {
+                // Spend `target_bytes` minus whatever we've overshot so
+                // far (carry > 0 ⇒ pull back; carry < 0 ⇒ spend extra).
+                let want = target_bytes as i64 - carry;
+                want.clamp(min_budget, u32::MAX as i64) as u32
+            }
+        };
+
+        // Size + qindex-pick + encode this picture. On the rare clamp
+        // where even `requested` can't fit, step the budget up until
+        // `derive_ld_slice_bytes_for_target` accepts it.
+        let mut budget = requested.max(min_budget as u32);
+        let (pic_payload, qindex, adjusted) = loop {
+            match encode_single_ld_intra_picture_with_size_target(
+                sequence,
+                base,
+                budget,
+                pic.picture_number,
+                pic.y,
+                pic.u,
+                pic.v,
+            ) {
+                Some(triple) => break triple,
+                None => {
+                    // Grow the budget toward viability. The header is
+                    // tiny so a single +n_slices step almost always
+                    // suffices; loop guards against pathological grids.
+                    budget = budget.saturating_add(n_slices.max(1) as u32 + 2);
+                }
+            }
+        };
+
+        let actual_payload = ld_picture_payload_bytes(&adjusted) as i64;
+        // CBR feedback: the accumulator tracks deviation of the actual
+        // requested-then-encoded payload from the ideal `target_bytes`.
+        carry += actual_payload - target_bytes as i64;
+
+        report.push(LdPictureRate {
+            picture_number: pic.picture_number,
+            requested_bytes: budget,
+            actual_payload_bytes: actual_payload as u32,
+            qindex,
+        });
+
+        let pic_unit_len = (pi_size + pic_payload.len()) as u32;
+        write_parse_info(&mut out, 0xC8, pic_unit_len, prev_len);
+        out.extend_from_slice(&pic_payload);
+        prev_len = pic_unit_len;
+        last_pic_len = Some(pic_unit_len);
+    }
+
+    write_parse_info(
+        &mut out,
+        0x10,
+        0,
+        last_pic_len.unwrap_or(sh_unit_len as u32),
+    );
+    (out, report)
+}
+
 fn write_ld_transform_parameters(w: &mut BitWriter, params: &LdEncoderParams) {
     w.write_uint(wavelet_index(params.wavelet));
     w.write_uint(params.dwt_depth);

@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **VC-2 LD multi-picture rate-controlled sequence encoder** (round-134).
+  A stream-level driver on top of the round-131 per-picture
+  `pick_ld_picture_qindex` primitive: given a sequence of YUV frames plus
+  a target byte-budget, it sizes + qindex-picks + encodes each picture
+  and emits a complete VC-2 LD elementary stream (sequence header `0x00`
+  + one `0xC8` LD intra picture per frame + end-of-sequence `0x10`, with
+  the `next_parse_offset` / `previous_parse_offset` chain wired up) that
+  round-trips through `DiracDecoder` to one decoded frame per input frame.
+  SMPTE ST 2042-1 §13.5.3.2 (slice byte budget), §13.5.2 (per-slice
+  qindex header), §D.1.1 (LD parse-code restriction), §9.6 / §10.4
+  (parse-info framing).
+  - New public API surface in `oxideav_dirac::encoder`:
+    - `encode_ld_sequence_with_size_target(seq, base, frames,
+      target_bytes, mode) -> Vec<u8>`
+    - `encode_ld_sequence_with_size_target_report(...) -> (Vec<u8>,
+      Vec<LdPictureRate>)` — same stream plus per-picture telemetry
+      (requested vs. actual bytes + chosen qindex)
+    - `enum LdRateControl { PerPicture, Cbr }`
+    - `struct LdPictureRate { picture_number, requested_bytes,
+      actual_payload_bytes, qindex }`
+  - `PerPicture` sizes every picture independently to `target_bytes`;
+    `Cbr` carries each picture's signed byte over/undershoot into the
+    next picture's budget via a running accumulator. Tiny CBR requests
+    are clamped up to the smallest viable picture (header + 2·N_slices)
+    rather than dropped, so a CBR run can never emit an invalid picture.
+  - New test file `tests/encoder_ld_sequence_rate.rs` (6 tests, all
+    passing). Headline acceptance: a 3-frame sequence at a fixed 1024-byte
+    per-picture budget round-trips to 3 decoded frames each at exactly
+    1024 bytes (0% miss, well under ±10%) with content-driven qindexes
+    `[37, 35, 37]`; a 5-frame CBR run at `target=900` lands the stream
+    total at exactly `5×900 = 4500` bytes (0% miss, under ±5%).
 - **VC-2 LD picture-level rate-control picker** (round-131). The LD
   analogue of HQ's `with_slice_size_target`: given a target
   picture-byte budget, the picker derives `slice_bytes_numer /
