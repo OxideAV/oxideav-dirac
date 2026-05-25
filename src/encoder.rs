@@ -1097,6 +1097,413 @@ pub fn encode_ld_intra_picture(
     w.finish()
 }
 
+/// Number of bytes a complete LD picture payload occupies when
+/// `params` is used verbatim. Independent of the input samples and of
+/// `params.qindex` — every LD slice writes exactly `slice_bytes(sx,sy)`
+/// bytes (the Funnel-bounded 1-padding in [`write_funnel_bounded`] keeps
+/// each slice's emitted byte count equal to its budget regardless of
+/// quantiser or content). Picture-byte count = `picture_header(4) +
+/// byte-aligned transform_parameters + slice_bytes_numer`.
+///
+/// This is the LD analogue of "every HQ slice's emitted length byte ×
+/// `slice_size_scaler` equals its serialised coefficient block": both
+/// profiles cap their picture size at the configured budget, but LD
+/// caps every slice deterministically (the §13.5.3.2 fixed-rate path)
+/// while HQ caps only by `slice_size_scaler × length_byte` and so can
+/// be content-dependent unless §13.5.4 escalates the qindex.
+pub fn ld_picture_payload_bytes(params: &LdEncoderParams) -> usize {
+    // 4-byte picture_number after the leading byte_align in
+    // `encode_ld_intra_picture` (which is a no-op at offset 0).
+    let mut w = BitWriter::new();
+    w.byte_align();
+    w.write_uint_lit(4, 0); // picture_number value doesn't change the size
+    w.byte_align();
+    write_ld_transform_parameters(&mut w, params);
+    w.byte_align();
+    let header_bytes = w.finish().len();
+    header_bytes + params.slice_bytes_numer as usize
+}
+
+/// VC-2 LD §13.5.4 picture-level qindex picker.
+///
+/// LD does NOT carry a per-slice qindex on the wire in the way HQ does
+/// (it does — each LD slice header still holds `qindex = read_nbits(7)`,
+/// but the SMPTE ST 2042-1 §13.5.3 rate-control model is *per-picture*:
+/// every slice in an LD picture writes the same qindex, and the picture
+/// budget is `slice_bytes_numer` plus a fixed header. With that model,
+/// the rate-control knob is `qindex` itself — pick the **lowest** qindex
+/// (best quality) for which the coefficient payload of every slice fits
+/// into its `payload_bits` budget without truncation.
+///
+/// Returns the smallest `qindex ∈ 0..=127` for which **every** slice
+/// satisfies `luma_bits + chroma_bits <= payload_bits`. If even q=127
+/// overflows on some slice the picker returns 127 (the most aggressive
+/// quantiser available; the encoder will simply truncate / 1-pad on
+/// those slices, the decoder reads past-end zeros — i.e. a graceful
+/// degradation rather than an encode failure).
+///
+/// Picture byte count is independent of qindex once `params.slice_bytes_numer
+/// / slice_bytes_denom` are set — every LD slice always emits its full
+/// budget. So the picker's job is purely to **maximise quality** subject
+/// to the picture-budget constraint that the caller has baked into
+/// `slice_bytes_numer`. Pair with [`derive_ld_slice_bytes_for_target`]
+/// to first size `slice_bytes_numer` to a target picture-byte budget.
+pub fn pick_ld_picture_qindex(
+    sequence: &SequenceHeader,
+    params: &LdEncoderParams,
+    y: &[u8],
+    u: &[u8],
+    v: &[u8],
+) -> u32 {
+    let luma_w = sequence.luma_width;
+    let luma_h = sequence.luma_height;
+    let chroma_w = sequence.chroma_width;
+    let chroma_h = sequence.chroma_height;
+
+    // Unquantised forward DWT, once. Quantisation is the only step that
+    // varies with qindex.
+    let y_py = forward_component_ld(y, luma_w, luma_h, sequence.luma_depth, params);
+    let u_py = forward_component_ld(u, chroma_w, chroma_h, sequence.chroma_depth, params);
+    let v_py = forward_component_ld(v, chroma_w, chroma_h, sequence.chroma_depth, params);
+
+    let mut luma_dims: Vec<(usize, usize)> = Vec::with_capacity(params.dwt_depth as usize + 1);
+    let mut chroma_dims: Vec<(usize, usize)> = Vec::with_capacity(params.dwt_depth as usize + 1);
+    for level in 0..=params.dwt_depth {
+        luma_dims.push(subband_dims(luma_w, luma_h, params.dwt_depth, level));
+        chroma_dims.push(subband_dims(chroma_w, chroma_h, params.dwt_depth, level));
+    }
+
+    let floor = params.qindex.min(127);
+    for qindex in floor..=127 {
+        if ld_picture_fits(
+            params,
+            qindex,
+            &y_py,
+            &u_py,
+            &v_py,
+            &luma_dims,
+            &chroma_dims,
+        ) {
+            return qindex;
+        }
+    }
+    127
+}
+
+/// Per-slice diagnostic for the LD picture-qindex picker. Returns
+/// `(qindex, max_slice_bit_overflow)` where `qindex` is the value the
+/// encoder would write into every slice header (a single picture-level
+/// value, mirroring [`pick_ld_picture_qindex`]) and
+/// `max_slice_bit_overflow` is the largest `luma_bits + chroma_bits -
+/// payload_bits` across all slices at that qindex (0 if all slices fit;
+/// positive when some slice's content would be Funnel-truncated). This
+/// is the LD analogue of [`hq_slice_qindexes`].
+pub fn ld_picture_qindex_diagnostic(
+    sequence: &SequenceHeader,
+    params: &LdEncoderParams,
+    y: &[u8],
+    u: &[u8],
+    v: &[u8],
+) -> (u32, i64) {
+    let qindex = pick_ld_picture_qindex(sequence, params, y, u, v);
+    let luma_w = sequence.luma_width;
+    let luma_h = sequence.luma_height;
+    let chroma_w = sequence.chroma_width;
+    let chroma_h = sequence.chroma_height;
+
+    let y_py = forward_component_ld(y, luma_w, luma_h, sequence.luma_depth, params);
+    let u_py = forward_component_ld(u, chroma_w, chroma_h, sequence.chroma_depth, params);
+    let v_py = forward_component_ld(v, chroma_w, chroma_h, sequence.chroma_depth, params);
+
+    let mut luma_dims: Vec<(usize, usize)> = Vec::with_capacity(params.dwt_depth as usize + 1);
+    let mut chroma_dims: Vec<(usize, usize)> = Vec::with_capacity(params.dwt_depth as usize + 1);
+    for level in 0..=params.dwt_depth {
+        luma_dims.push(subband_dims(luma_w, luma_h, params.dwt_depth, level));
+        chroma_dims.push(subband_dims(chroma_w, chroma_h, params.dwt_depth, level));
+    }
+
+    let q_per_level = slice_quantisers(qindex, &params.quant_matrix);
+    let mut y_qpy = quantise_pyramid_ld(&y_py, &q_per_level);
+    let mut u_qpy = quantise_pyramid_ld(&u_py, &q_per_level);
+    let mut v_qpy = quantise_pyramid_ld(&v_py, &q_per_level);
+    forward_dc_prediction(&mut y_qpy[0][0]);
+    forward_dc_prediction(&mut u_qpy[0][0]);
+    forward_dc_prediction(&mut v_qpy[0][0]);
+
+    let mut worst: i64 = 0;
+    for sy in 0..params.slices_y {
+        for sx in 0..params.slices_x {
+            let slice_n_bytes = slice_bytes(
+                params.slices_x,
+                params.slice_bytes_numer,
+                params.slice_bytes_denom,
+                sx,
+                sy,
+            );
+            let total_bits = 8u64 * slice_n_bytes as u64;
+            let length_bits = ld_length_bits(slice_n_bytes);
+            let header_bits = 7u64 + length_bits as u64;
+            let payload_bits = total_bits.saturating_sub(header_bits) as i64;
+
+            let mut luma_tmp = BitWriter::new();
+            write_ld_component(&mut luma_tmp, params, &y_qpy, &luma_dims, sx, sy, true);
+            let luma_bits = luma_tmp.measured_bits() as i64;
+            let mut chroma_tmp = BitWriter::new();
+            write_ld_chroma_interleaved(
+                &mut chroma_tmp,
+                params,
+                &u_qpy,
+                &v_qpy,
+                &chroma_dims,
+                sx,
+                sy,
+            );
+            let chroma_bits = chroma_tmp.measured_bits() as i64;
+            let overflow = (luma_bits + chroma_bits) - payload_bits;
+            if overflow > worst {
+                worst = overflow;
+            }
+        }
+    }
+    (qindex, worst)
+}
+
+/// True iff every slice's `luma_bits + chroma_bits` fits within
+/// `payload_bits` at the given `qindex` — i.e. the LD picture survives
+/// encoding at this qindex without any Funnel-truncation. Helper for
+/// [`pick_ld_picture_qindex`].
+#[allow(clippy::too_many_arguments)]
+fn ld_picture_fits(
+    params: &LdEncoderParams,
+    qindex: u32,
+    y_py: &[[SubbandData; 4]],
+    u_py: &[[SubbandData; 4]],
+    v_py: &[[SubbandData; 4]],
+    luma_dims: &[(usize, usize)],
+    chroma_dims: &[(usize, usize)],
+) -> bool {
+    let q_per_level = slice_quantisers(qindex, &params.quant_matrix);
+    let mut y_qpy = quantise_pyramid_ld(y_py, &q_per_level);
+    let mut u_qpy = quantise_pyramid_ld(u_py, &q_per_level);
+    let mut v_qpy = quantise_pyramid_ld(v_py, &q_per_level);
+    forward_dc_prediction(&mut y_qpy[0][0]);
+    forward_dc_prediction(&mut u_qpy[0][0]);
+    forward_dc_prediction(&mut v_qpy[0][0]);
+
+    for sy in 0..params.slices_y {
+        for sx in 0..params.slices_x {
+            let slice_n_bytes = slice_bytes(
+                params.slices_x,
+                params.slice_bytes_numer,
+                params.slice_bytes_denom,
+                sx,
+                sy,
+            );
+            if slice_n_bytes == 0 {
+                return false;
+            }
+            let total_bits = 8u64 * slice_n_bytes as u64;
+            let length_bits = ld_length_bits(slice_n_bytes);
+            let header_bits = 7u64 + length_bits as u64;
+            if total_bits <= header_bits {
+                return false;
+            }
+            let payload_bits = total_bits - header_bits;
+
+            let mut luma_tmp = BitWriter::new();
+            write_ld_component(&mut luma_tmp, params, &y_qpy, luma_dims, sx, sy, true);
+            let luma_bits = luma_tmp.measured_bits();
+            let mut chroma_tmp = BitWriter::new();
+            write_ld_chroma_interleaved(
+                &mut chroma_tmp,
+                params,
+                &u_qpy,
+                &v_qpy,
+                chroma_dims,
+                sx,
+                sy,
+            );
+            let chroma_bits = chroma_tmp.measured_bits();
+
+            if luma_bits + chroma_bits > payload_bits {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Derive `slice_bytes_numer` so that an LD picture encoded with the
+/// returned [`LdEncoderParams`] occupies ≈ `target_picture_bytes`. The
+/// returned params are `base` cloned with `slice_bytes_numer` updated
+/// and `slice_bytes_denom = slices_x * slices_y` (so each slice gets
+/// exactly `slice_bytes_numer / (slices_x * slices_y)` bytes — uniform
+/// per-slice budget, the standard §13.5.3.2 setup for a single-rate
+/// picture).
+///
+/// Picture-byte size = `ld_picture_payload_bytes(adjusted)` which is
+/// header (picture_number + transform_parameters, both byte-aligned)
+/// plus `slice_bytes_numer`. We solve `header(numer) + numer ==
+/// target_picture_bytes` for `numer` by one fixed-point pass — the
+/// header size depends on `numer` (interleaved exp-Golomb), but only
+/// very weakly (a 32-bit numer needs at most ~13 bytes versus an 8-bit
+/// numer's ~3 bytes), so a single iteration suffices in practice.
+///
+/// Returns `None` if `target_picture_bytes` is too small to fit the
+/// header (i.e. the resulting `slice_bytes_numer` would be ≤ 0 or each
+/// slice would not even hold its 7-bit qindex + length-bits header).
+/// Each slice must hold at minimum 2 bytes (qindex + 1-bit length_bits
+/// plus a single coefficient bit), so the minimum picture target is
+/// `header + 2 * slices_x * slices_y`.
+pub fn derive_ld_slice_bytes_for_target(
+    base: &LdEncoderParams,
+    target_picture_bytes: u32,
+) -> Option<LdEncoderParams> {
+    let n_slices = base.slices_x.checked_mul(base.slices_y)?;
+    if n_slices == 0 {
+        return None;
+    }
+    // Initial guess: assume header is small (~10 bytes).
+    let mut numer = target_picture_bytes.saturating_sub(10);
+    // Iterate at most a handful of times — each round refines the
+    // header-size estimate. Two rounds is enough since header growth
+    // is sub-linear in `numer`.
+    for _ in 0..4 {
+        if numer == 0 {
+            return None;
+        }
+        let candidate = LdEncoderParams {
+            slice_bytes_numer: numer,
+            slice_bytes_denom: n_slices,
+            ..base.clone()
+        };
+        let actual = ld_picture_payload_bytes(&candidate);
+        if actual == target_picture_bytes as usize {
+            // Bytes-per-slice must be > 0 and large enough to hold the
+            // slice header. With uniform denominator the per-slice
+            // budget is `numer / n_slices` which is `>= 2` once
+            // target_picture_bytes exceeds `header + 2*n_slices`.
+            let bps = numer / n_slices;
+            if bps < 2 {
+                return None;
+            }
+            return Some(candidate);
+        }
+        // Adjust numer by the byte gap. Picture-bytes = header + numer
+        // and header is monotone-non-decreasing in numer, so adjusting
+        // by the gap converges quickly.
+        let gap = target_picture_bytes as i64 - actual as i64;
+        let new_numer = numer as i64 + gap;
+        if new_numer <= 0 {
+            return None;
+        }
+        // Clamp to keep monotone progress.
+        if new_numer as u32 == numer {
+            // Hit a fixed point on either side — accept this candidate
+            // if it's within 1 byte of the target.
+            if (actual as i64 - target_picture_bytes as i64).abs() <= 1 {
+                let bps = numer / n_slices;
+                if bps < 2 {
+                    return None;
+                }
+                return Some(candidate);
+            }
+            return None;
+        }
+        numer = new_numer as u32;
+    }
+    // Final accept after iteration cap: emit whatever we converged to.
+    let candidate = LdEncoderParams {
+        slice_bytes_numer: numer,
+        slice_bytes_denom: n_slices,
+        ..base.clone()
+    };
+    let bps = numer / n_slices;
+    if bps < 2 {
+        return None;
+    }
+    Some(candidate)
+}
+
+/// Encode a single LD intra picture targeting `target_picture_bytes`
+/// for the picture **payload** (= what [`encode_ld_intra_picture`]
+/// returns; excludes the 13-byte parse-info wrapper).
+///
+/// The picker:
+///   1. Derives `slice_bytes_numer / denom` so the encoded picture
+///      payload lands within ±1 byte of `target_picture_bytes` (see
+///      [`derive_ld_slice_bytes_for_target`]). The per-slice budget is
+///      uniform — `slice_bytes_numer / (slices_x * slices_y)` bytes per
+///      slice.
+///   2. Calls [`pick_ld_picture_qindex`] to choose the **lowest**
+///      `qindex ∈ base.qindex..=127` for which every slice's content
+///      fits without Funnel-truncation. Lower qindex = higher quality;
+///      a high target picks q=0, a low target may need q=127.
+///
+/// Returns `Some((bytes, qindex, adjusted_params))` on success, `None`
+/// when `target_picture_bytes` is too small for the picture header +
+/// `2 * slices_x * slices_y` minimum slice bytes (i.e. the budget can
+/// not physically fit the LD picture structure regardless of qindex).
+///
+/// Source of truth: SMPTE ST 2042-1 §13.5.3.2 (slice byte budget),
+/// §13.5.2 (per-slice qindex header), §13.5.4 (quantisation matrix
+/// indexing by qindex).
+pub fn encode_single_ld_intra_picture_with_size_target(
+    sequence: &SequenceHeader,
+    base: &LdEncoderParams,
+    target_picture_bytes: u32,
+    picture_number: u32,
+    y: &[u8],
+    u: &[u8],
+    v: &[u8],
+) -> Option<(Vec<u8>, u32, LdEncoderParams)> {
+    let mut adjusted = derive_ld_slice_bytes_for_target(base, target_picture_bytes)?;
+    let qindex = pick_ld_picture_qindex(sequence, &adjusted, y, u, v);
+    adjusted.qindex = qindex;
+    let bytes = encode_ld_intra_picture(sequence, &adjusted, picture_number, y, u, v);
+    Some((bytes, qindex, adjusted))
+}
+
+/// Stream-level analogue of
+/// [`encode_single_ld_intra_picture_with_size_target`]: same picker, but
+/// returns a full elementary stream (sequence header + 1 LD picture +
+/// end-of-sequence). The `target_picture_bytes` argument still refers
+/// to the LD picture *payload* (excludes the 13-byte parse-info
+/// wrapper); the returned stream's total byte count is therefore
+/// `sh_unit_len + 13 + target_picture_bytes(±1) + 13`.
+pub fn encode_single_ld_intra_stream_with_size_target(
+    sequence: &SequenceHeader,
+    base: &LdEncoderParams,
+    target_picture_bytes: u32,
+    picture_number: u32,
+    y: &[u8],
+    u: &[u8],
+    v: &[u8],
+) -> Option<(Vec<u8>, u32, LdEncoderParams)> {
+    let (pic_payload, qindex, adjusted) = encode_single_ld_intra_picture_with_size_target(
+        sequence,
+        base,
+        target_picture_bytes,
+        picture_number,
+        y,
+        u,
+        v,
+    )?;
+
+    let sh_payload = encode_sequence_header(sequence);
+    let pi_size = 13usize;
+    let sh_unit_len = pi_size + sh_payload.len();
+    let pic_unit_len = pi_size + pic_payload.len();
+
+    let mut out = Vec::with_capacity(sh_unit_len + pic_unit_len + pi_size);
+    write_parse_info(&mut out, 0x00, sh_unit_len as u32, 0);
+    out.extend_from_slice(&sh_payload);
+    write_parse_info(&mut out, 0xC8, pic_unit_len as u32, sh_unit_len as u32);
+    out.extend_from_slice(&pic_payload);
+    write_parse_info(&mut out, 0x10, 0, pic_unit_len as u32);
+    Some((out, qindex, adjusted))
+}
+
 fn write_ld_transform_parameters(w: &mut BitWriter, params: &LdEncoderParams) {
     w.write_uint(wavelet_index(params.wavelet));
     w.write_uint(params.dwt_depth);

@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **VC-2 LD picture-level rate-control picker** (round-131). The LD
+  analogue of HQ's `with_slice_size_target`: given a target
+  picture-byte budget, the picker derives `slice_bytes_numer /
+  slice_bytes_denom` so the encoded picture payload lands within ±1
+  byte of the target, then walks `qindex ∈ 0..=127` to pick the
+  smallest qindex for which **every** slice's `luma_bits +
+  chroma_bits` fits the `payload_bits = 8*slice_bytes - header_bits`
+  budget without Funnel-truncation. SMPTE ST 2042-1 §13.5.3.2 (per-
+  slice byte budget), §13.5.2 (per-slice qindex header), §13.5.4
+  (quant-matrix indexing).
+  - New public API surface in `oxideav_dirac::encoder`:
+    - `pick_ld_picture_qindex(seq, params, y, u, v) -> u32`
+    - `ld_picture_qindex_diagnostic(seq, params, y, u, v) -> (u32, i64)`
+    - `ld_picture_payload_bytes(params) -> usize` (size predictor —
+      independent of content & qindex; sole input is `params`)
+    - `derive_ld_slice_bytes_for_target(base, target_bytes) ->
+      Option<LdEncoderParams>` (one-shot fixed-point that converges in
+      ≤4 passes; returns `None` when target can't fit header +
+      2·N_slices minimum)
+    - `encode_single_ld_intra_picture_with_size_target(...)`
+    - `encode_single_ld_intra_stream_with_size_target(...)` — returns
+      `(stream_bytes, chosen_qindex, adjusted_params)`
+  - New test file `tests/encoder_ld_picture_qindex.rs` (8 tests, all
+    passing). The headline acceptance test pins the three-budget
+    behaviour: targets `[200, 1024, 4096]` bytes land at exact actual
+    bytes `[200, 1024, 4096]` (0% miss, well under the ±10% tolerance)
+    and pick qindexes `[127, 37, 6]` — the small budget escalates to
+    the most-aggressive available quantiser while the large budget
+    stays near lossless, satisfying the small > large monotonicity
+    requirement.
+  - Picture-byte size = `picture_header(4) + byte-aligned
+    transform_parameters(numer-dependent) + slice_bytes_numer`. Every
+    slice writes exactly `slice_bytes(sx, sy)` bytes regardless of
+    qindex (Funnel-bounded 1-padding in `write_funnel_bounded`), so
+    once `slice_bytes_numer` is fixed the picture-byte count is
+    deterministic and the picker's only remaining job is quality
+    maximisation under the budget.
+
 ### Fixed
 
 - **§12.3.6.6 Case 4 unbiased-mean rounding** (round-128). The DC
