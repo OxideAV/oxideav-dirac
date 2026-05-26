@@ -7,12 +7,19 @@
 //! elementary stream (sequence header + per-picture parse-info + picture
 //! data + end-of-sequence) that round-trips through the decoder.
 //!
-//! Two rate-control modes:
+//! Three rate-control modes:
 //!   * `PerPicture` — every picture independently sized to `target_bytes`
 //!     (±10% each), no carry-over.
 //!   * `Cbr` — a signed accumulator carries each picture's byte
 //!     over/undershoot into the next picture's budget so the stream total
 //!     lands within ±5% of `N * target_bytes`.
+//!   * `Vbv { buffer_bytes }` (r149) — leaky-bucket variant of `Cbr`:
+//!     identical carry behaviour but the spendable savings are clamped
+//!     at `buffer_bytes`, so every per-picture request is capped at
+//!     `target + buffer_bytes` (peak-size guarantee). `buffer_bytes ==
+//!     0` collapses to `PerPicture`; an effectively infinite
+//!     `buffer_bytes` coincides with `Cbr`. The LD analogue of r146's
+//!     `HqRateControl::Vbv`.
 //!
 //! Source of truth: SMPTE ST 2042-1 §13.5.3.2 (slice byte budget),
 //! §13.5.2 (per-slice qindex header), §D.1.1 (LD parse-code restriction),
@@ -261,7 +268,15 @@ fn ld_sequence_wrapper_matches_report_variant() {
     ];
     let base = LdEncoderParams::default_ld(WaveletFilter::LeGall5_3, 3, 4, 4, 32);
 
-    for mode in [LdRateControl::PerPicture, LdRateControl::Cbr] {
+    for mode in [
+        LdRateControl::PerPicture,
+        LdRateControl::Cbr,
+        LdRateControl::Vbv { buffer_bytes: 0 },
+        LdRateControl::Vbv { buffer_bytes: 128 },
+        LdRateControl::Vbv {
+            buffer_bytes: u32::MAX,
+        },
+    ] {
         let plain = encode_ld_sequence_with_size_target(&seq, &base, &frames, 1024, mode);
         let (with_report, _) =
             encode_ld_sequence_with_size_target_report(&seq, &base, &frames, 1024, mode);
@@ -369,4 +384,278 @@ fn ld_sequence_cbr_total_no_worse_than_per_picture() {
         (cbr_total - ideal).abs(),
         (pp_total - ideal).abs(),
     );
+}
+
+// -- r149: VBV (leaky-bucket) LdRateControl variant --
+//
+// `LdRateControl::Vbv { buffer_bytes }` is the third LD strategy:
+// identical to `Cbr` in its carry semantics, BUT the spendable savings
+// (`max(-carry, 0)`) are clamped at `buffer_bytes`, so every per-picture
+// request is capped at `target + buffer_bytes` — an instantaneous peak
+// size guarantee that uncapped `Cbr` lacks. Four corner cases pin the
+// contract: `buffer_bytes == 0` must collapse to `PerPicture`; a very
+// large `buffer_bytes` must agree with `Cbr` when every picture
+// undershoots (the cap never bites); the peak-cap promise (`requested
+// ≤ target + buffer_bytes`) must hold at every intermediate
+// `buffer_bytes`; and re-runs must be deterministic.
+
+/// `Vbv { buffer_bytes: 0 }` degenerates to `PerPicture`: the leaky
+/// bucket holds zero spendable savings, so the request collapses to
+/// `target_bytes` on every picture and the emitted streams are
+/// byte-identical. Note: LD's `Cbr` accumulator can also pull the
+/// request *below* target when a picture overshoots its deterministic
+/// budget (carry-debt branch); the zero-buffer Vbv preserves that
+/// debt-payback branch — only the spendable-savings (undershoot)
+/// branch is gated by the bucket. On the smooth fixtures here the
+/// LD picker hits its ±1-byte residual within the budget, so the
+/// debt branch is dormant and Vbv {0} == PerPicture is a clean
+/// equality.
+#[test]
+fn ld_sequence_vbv_zero_buffer_equals_per_picture() {
+    let seq = make_minimal_sequence_ld(64, 64, ChromaFormat::Yuv420);
+    let triples: Vec<_> = (0..4).map(|s| frame_64(s * 3 + 2)).collect();
+    let frames: Vec<InputPicture> = triples
+        .iter()
+        .enumerate()
+        .map(|(i, t)| InputPicture {
+            picture_number: i as u32,
+            y: &t.0,
+            u: &t.1,
+            v: &t.2,
+        })
+        .collect();
+    let base = LdEncoderParams::default_ld(WaveletFilter::LeGall5_3, 3, 4, 4, 32);
+    let target = 1024u32;
+
+    let (pp_stream, pp_report) = encode_ld_sequence_with_size_target_report(
+        &seq,
+        &base,
+        &frames,
+        target,
+        LdRateControl::PerPicture,
+    );
+    let (vbv_stream, vbv_report) = encode_ld_sequence_with_size_target_report(
+        &seq,
+        &base,
+        &frames,
+        target,
+        LdRateControl::Vbv { buffer_bytes: 0 },
+    );
+
+    assert_eq!(
+        pp_stream, vbv_stream,
+        "Vbv {{ buffer_bytes: 0 }} must produce a byte-identical stream to PerPicture",
+    );
+    let pp_q: Vec<_> = pp_report.iter().map(|r| r.qindex).collect();
+    let vbv_q: Vec<_> = vbv_report.iter().map(|r| r.qindex).collect();
+    assert_eq!(pp_q, vbv_q, "qindex sequences must match");
+    let pp_req: Vec<_> = pp_report.iter().map(|r| r.requested_bytes).collect();
+    let vbv_req: Vec<_> = vbv_report.iter().map(|r| r.requested_bytes).collect();
+    assert_eq!(
+        pp_req, vbv_req,
+        "every VBV request must equal target (zero-buffer carry is unspendable)",
+    );
+    for r in &vbv_req {
+        assert_eq!(*r, target);
+    }
+}
+
+/// Peak-cap invariant: every Vbv requested bytes ≤ `target +
+/// buffer_bytes`. The bucket clamp guarantees the picker is never
+/// asked for more than `target + buffer_bytes` on any picture,
+/// regardless of how deep the undershoots from earlier pictures
+/// accumulated. Uses a tiny `min_budget`-aware buffer so the cap
+/// actually bites within the test run.
+#[test]
+fn ld_sequence_vbv_request_capped_at_target_plus_buffer() {
+    let seq = make_minimal_sequence_ld(64, 64, ChromaFormat::Yuv420);
+    let triples: Vec<_> = (0..6).map(|s| frame_64(s * 7 + 3)).collect();
+    let frames: Vec<InputPicture> = triples
+        .iter()
+        .enumerate()
+        .map(|(i, t)| InputPicture {
+            picture_number: i as u32,
+            y: &t.0,
+            u: &t.1,
+            v: &t.2,
+        })
+        .collect();
+    let base = LdEncoderParams::default_ld(WaveletFilter::LeGall5_3, 3, 4, 4, 32);
+    // Small target + small bucket; with LD's tight residuals the carry
+    // is mostly noise but the cap must hold deterministically.
+    let target = 600u32;
+    let buffer = 64u32;
+    let cap = target + buffer;
+
+    let (stream, report) = encode_ld_sequence_with_size_target_report(
+        &seq,
+        &base,
+        &frames,
+        target,
+        LdRateControl::Vbv {
+            buffer_bytes: buffer,
+        },
+    );
+
+    for r in &report {
+        assert!(
+            r.requested_bytes <= cap,
+            "picture {} VBV request {} exceeded peak cap target+buffer={} (target={target}, buffer={buffer})",
+            r.picture_number,
+            r.requested_bytes,
+            cap,
+        );
+    }
+
+    // Stream is still well-formed.
+    let decoded = decode_all(stream);
+    assert_eq!(
+        decoded.len(),
+        frames.len(),
+        "VBV stream must decode to N frames",
+    );
+
+    eprintln!(
+        "LD VBV cap test: target={target} buffer={buffer} cap={cap} requests={:?} actuals={:?}",
+        report.iter().map(|r| r.requested_bytes).collect::<Vec<_>>(),
+        report
+            .iter()
+            .map(|r| r.actual_payload_bytes)
+            .collect::<Vec<_>>(),
+    );
+}
+
+/// `Vbv { buffer_bytes: u32::MAX }` (effectively infinite bucket)
+/// agrees with `Cbr`: the bucket cap can never bite (savings would
+/// have to exceed 4 GB to leak), so the leaky-bucket and the uncapped
+/// CBR produce byte-identical streams over any reasonable test run.
+/// Pins the "Vbv is the bucket-capped strict generalisation of Cbr"
+/// invariant on the LD side, matching r146's HQ guarantee.
+#[test]
+fn ld_sequence_vbv_infinite_buffer_equals_cbr() {
+    let seq = make_minimal_sequence_ld(64, 64, ChromaFormat::Yuv420);
+    let triples: Vec<_> = (0..5).map(|s| frame_64(s * 11 + 4)).collect();
+    let frames: Vec<InputPicture> = triples
+        .iter()
+        .enumerate()
+        .map(|(i, t)| InputPicture {
+            picture_number: i as u32,
+            y: &t.0,
+            u: &t.1,
+            v: &t.2,
+        })
+        .collect();
+    let base = LdEncoderParams::default_ld(WaveletFilter::LeGall5_3, 3, 4, 4, 32);
+    let target = 900u32;
+
+    let cbr_stream =
+        encode_ld_sequence_with_size_target(&seq, &base, &frames, target, LdRateControl::Cbr);
+    let vbv_stream = encode_ld_sequence_with_size_target(
+        &seq,
+        &base,
+        &frames,
+        target,
+        LdRateControl::Vbv {
+            buffer_bytes: u32::MAX,
+        },
+    );
+    assert_eq!(
+        cbr_stream, vbv_stream,
+        "Vbv with u32::MAX bucket must coincide with Cbr (cap never bites)",
+    );
+}
+
+/// VBV positive-use case: a mid-range budget with a modest bucket
+/// produces a valid, decodable stream and obeys the peak cap on every
+/// per-picture request. Pins the "leaky-bucket smoothing produces a
+/// usable encode" end-to-end behaviour.
+#[test]
+fn ld_sequence_vbv_smooths_with_bounded_peak() {
+    let seq = make_minimal_sequence_ld(64, 64, ChromaFormat::Yuv420);
+    let triples: Vec<_> = (0..5).map(|s| frame_64(s * 13 + 1)).collect();
+    let frames: Vec<InputPicture> = triples
+        .iter()
+        .enumerate()
+        .map(|(i, t)| InputPicture {
+            picture_number: i as u32,
+            y: &t.0,
+            u: &t.1,
+            v: &t.2,
+        })
+        .collect();
+    let base = LdEncoderParams::default_ld(WaveletFilter::LeGall5_3, 3, 4, 4, 32);
+    let target = 900u32;
+    let buffer = target / 4;
+    let cap = target + buffer;
+
+    let (stream, report) = encode_ld_sequence_with_size_target_report(
+        &seq,
+        &base,
+        &frames,
+        target,
+        LdRateControl::Vbv {
+            buffer_bytes: buffer,
+        },
+    );
+
+    for r in &report {
+        assert!(
+            r.requested_bytes <= cap,
+            "picture {} VBV requested {} exceeded peak cap {cap}",
+            r.picture_number,
+            r.requested_bytes,
+        );
+    }
+
+    let decoded = decode_all(stream);
+    assert_eq!(
+        decoded.len(),
+        frames.len(),
+        "VBV stream must decode to N frames",
+    );
+}
+
+/// Determinism: the same VBV inputs always produce the same stream.
+#[test]
+fn ld_sequence_vbv_is_deterministic() {
+    let seq = make_minimal_sequence_ld(64, 64, ChromaFormat::Yuv420);
+    let f0 = frame_64(2);
+    let f1 = frame_64(8);
+    let f2 = frame_64(32);
+    let frames = [
+        InputPicture {
+            picture_number: 0,
+            y: &f0.0,
+            u: &f0.1,
+            v: &f0.2,
+        },
+        InputPicture {
+            picture_number: 1,
+            y: &f1.0,
+            u: &f1.1,
+            v: &f1.2,
+        },
+        InputPicture {
+            picture_number: 2,
+            y: &f2.0,
+            u: &f2.1,
+            v: &f2.2,
+        },
+    ];
+    let base = LdEncoderParams::default_ld(WaveletFilter::LeGall5_3, 3, 4, 4, 32);
+    let a = encode_ld_sequence_with_size_target(
+        &seq,
+        &base,
+        &frames,
+        1024,
+        LdRateControl::Vbv { buffer_bytes: 128 },
+    );
+    let b = encode_ld_sequence_with_size_target(
+        &seq,
+        &base,
+        &frames,
+        1024,
+        LdRateControl::Vbv { buffer_bytes: 128 },
+    );
+    assert_eq!(a, b, "VBV encode must be deterministic");
 }

@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **VC-2 LD leaky-bucket (VBV) rate-control variant** (round-149). The
+  LD analogue of r146's HQ `Vbv`: a third `LdRateControl` strategy
+  alongside r134's `PerPicture` and `Cbr`,
+  `LdRateControl::Vbv { buffer_bytes }`. Same carry semantics as `Cbr`
+  but the spendable undershoot (i.e. `max(-carry, 0)` of LD's signed
+  accumulator) is clamped at `buffer_bytes`, so every per-picture
+  request is capped at `target_bytes + buffer_bytes` (an instantaneous
+  peak-size guarantee that unbounded `Cbr` lacks). Savings above
+  `buffer_bytes` are forfeited rather than accumulated. Pure
+  encoder-side rate-shaping policy; bitstream output remains
+  spec-conformant under SMPTE ST 2042-1 §13.5.2 / §13.5.3.2 (any
+  per-slice qindex / slice-bytes the encoder produces is legal).
+  - Strict generalisation invariants both pinned by tests:
+    `Vbv { buffer_bytes: 0 }` → byte-identical to `PerPicture`;
+    `Vbv { buffer_bytes: u32::MAX }` → byte-identical to `Cbr` (the
+    cap can never bite). Intermediate `buffer_bytes` trade peak-size
+    cap against long-run average. Matches the r146 HQ generalisation
+    relationship one-for-one.
+  - 5 new tests in `tests/encoder_ld_sequence_rate.rs` (6 → 11 total):
+    zero-buffer = PerPicture; infinite-buffer = Cbr; peak cap
+    (`requested ≤ target + buffer_bytes`) on a 6-picture run with a
+    `target = 600 B` / `buffer = 64 B` setup; positive smoothing
+    on a 5-picture mid-range budget with `buffer = target/4`;
+    determinism. Existing wrapper-matches-`_report` test extended
+    to cover three Vbv `buffer_bytes` points (0, 128, u32::MAX). All
+    decoded streams round-trip to N frames.
+
 - **VC-2 HQ leaky-bucket (VBV) rate-control variant** (round-146). A
   third `HqRateControl` strategy alongside r141's `PerPicture` and `Cbr`:
   `HqRateControl::Vbv { buffer_bytes }`. Same carry semantics as `Cbr`

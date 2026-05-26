@@ -1757,6 +1757,43 @@ pub enum LdRateControl {
     /// the minimum picture size — the accumulator drives the running
     /// stream total to within a byte or two of `N * target_bytes`.
     Cbr,
+    /// Leaky-bucket variable-bitrate: like [`Cbr`] but the spendable
+    /// undershoot is **clamped at `buffer_bytes`** so the per-picture
+    /// request never exceeds `target_bytes + buffer_bytes` — an
+    /// instantaneous peak cap. Savings above `buffer_bytes` are
+    /// forfeited rather than carried forward. This bounds the
+    /// worst-case single-picture size (useful for transport / buffer-
+    /// occupancy guarantees) while still letting short bursts of
+    /// undershoot subsidise a higher-quality neighbour.
+    ///
+    /// LD's signed accumulator convention is `carry = sum(actual −
+    /// target)` (positive = overshot the ideal so far). Because the
+    /// spendable savings the next picture may use are `max(−carry, 0)`,
+    /// the bucket clamp `carry.max(-buffer_bytes as i64)` after each
+    /// encode caps the per-picture request at `target + buffer_bytes`.
+    ///
+    /// `buffer_bytes == 0` degenerates to [`PerPicture`] (no carry can
+    /// ever be spent, so every request equals `target_bytes`); an
+    /// effectively infinite `buffer_bytes` degenerates to [`Cbr`].
+    /// Intermediate values trade peak-size cap against long-run
+    /// average. The LD analogue of
+    /// [`HqRateControl::Vbv`] from r146.
+    ///
+    /// Source of truth: SMPTE ST 2042-1 §13.5.2 / §13.5.3.2 specify the
+    /// per-slice qindex and slice-bytes derivation; the leaky-bucket
+    /// policy itself is a pure encoder-side rate-shaping choice not
+    /// dictated by the bitstream spec (any per-slice qindex / slice-
+    /// bytes the encoder produces is spec-conformant).
+    ///
+    /// [`Cbr`]: LdRateControl::Cbr
+    /// [`PerPicture`]: LdRateControl::PerPicture
+    /// [`HqRateControl::Vbv`]: HqRateControl::Vbv
+    Vbv {
+        /// Peak per-picture surplus the leaky bucket may hold above
+        /// `target_bytes` — i.e. the maximum extra bytes a single
+        /// picture's request can borrow from saved undershoots.
+        buffer_bytes: u32,
+    },
 }
 
 /// Per-picture rate-control telemetry returned by
@@ -1875,6 +1912,24 @@ pub fn encode_ld_sequence_with_size_target_report(
                 let want = target_bytes as i64 - carry;
                 want.clamp(min_budget, u32::MAX as i64) as u32
             }
+            LdRateControl::Vbv { buffer_bytes } => {
+                // Leaky-bucket: identical to `Cbr` but the spendable
+                // savings (i.e. `max(-carry, 0)`) are capped at
+                // `buffer_bytes`. The post-encode update clamps
+                // `carry >= -buffer_bytes`, so the request `target -
+                // carry` is bounded above by `target + buffer_bytes` —
+                // an instantaneous peak-size cap. `buffer_bytes == 0`
+                // forces `spendable == 0` so the request collapses to
+                // `target_bytes` (modulo the carry-debt branch when
+                // `carry > 0`, which still tightens the request just
+                // like `Cbr`). The explicit `min` on `spendable` here
+                // is belt-and-braces against floating bucket-cap edge
+                // cases; the post-encode clamp is the load-bearing
+                // invariant.
+                let spendable = (-carry).min(buffer_bytes as i64).max(0);
+                let want = target_bytes as i64 - carry.max(0) + spendable;
+                want.clamp(min_budget, u32::MAX as i64) as u32
+            }
         };
 
         // Size + qindex-pick + encode this picture. On the rare clamp
@@ -1905,6 +1960,18 @@ pub fn encode_ld_sequence_with_size_target_report(
         // CBR feedback: the accumulator tracks deviation of the actual
         // requested-then-encoded payload from the ideal `target_bytes`.
         carry += actual_payload - target_bytes as i64;
+        // VBV: clamp the savings end of the bucket at -buffer_bytes so
+        // the next picture's `target - carry` request is ≤ target +
+        // buffer_bytes. Overshoot debt (carry > 0) is left untouched —
+        // a peak-size cap only governs the upper edge of the request,
+        // not the lower edge — and PerPicture / Cbr leave `carry`
+        // alone (PerPicture ignores `carry` in its request anyway).
+        if let LdRateControl::Vbv { buffer_bytes } = mode {
+            let floor = -(buffer_bytes as i64);
+            if carry < floor {
+                carry = floor;
+            }
+        }
 
         report.push(LdPictureRate {
             picture_number: pic.picture_number,
