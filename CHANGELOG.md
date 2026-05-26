@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **VC-2 drain-rate-hysteresis (`VbvHysteresis`) rate-control variant**
+  (round-159). Both `HqRateControl` and `LdRateControl` gain a fourth
+  variant `VbvHysteresis { buffer_bytes, max_drain_per_picture }`,
+  identical to r146/r149's `Vbv` on the bucket *fill* side (savings
+  forfeited above `buffer_bytes`) but with the savings *spent* on any
+  one picture additionally clamped at `max_drain_per_picture`. Plain
+  `Vbv` lets a single picture drain the entire bucket in one step
+  (request can equal `target + buffer_bytes` the moment the bucket
+  fills); `VbvHysteresis` instead spreads the savings across multiple
+  pictures by capping the instantaneous drain. The remaining savings
+  stay in the bucket for the next picture, smoothing the cliff between
+  "bucket full → one picture spends everything → bucket empty" and the
+  zero-carry pictures that follow it.
+  - Per-picture request bound: `target ≤ requested ≤ target +
+    min(buffer_bytes, max_drain_per_picture)` on the savings side.
+    The debt branch (carry > 0 on LD, carry < 0 on HQ q=127 edge)
+    is unchanged from `Vbv` — debt repayment is mandatory, not
+    rate-limited.
+  - Strict generalisation invariants pinned by tests:
+    `max_drain_per_picture == 0` ≡ `PerPicture` (no savings can be
+    spent — byte-identical stream); `max_drain_per_picture >=
+    buffer_bytes` ≡ `Vbv { buffer_bytes }` (drain cap inert — byte-
+    identical stream). Matches the r146/r149 `Vbv` generalisation
+    relationship one-for-one.
+  - The post-encode carry clamp is the same as `Vbv` (savings forfeit
+    at `buffer_bytes`), so the `running_surplus_bytes ≤ buffer_bytes`
+    telemetry invariant from r152 holds verbatim. Pure encoder-side
+    rate-shaping policy — any qindex-per-picture sequence the encoder
+    produces remains spec-conformant under BBC Dirac Specification
+    v2.2.3 §13.5.4 (HQ) and SMPTE ST 2042-1 §13.5.2 / §13.5.3.2 (LD).
+  - 10 new tests across `tests/encoder_hq_sequence_rate.rs` (16 → 21)
+    and `tests/encoder_ld_sequence_rate.rs` (14 → 19): zero-drain
+    degeneracy → `PerPicture`; `drain >= buffer` degeneracy → `Vbv`
+    (both `drain == buffer` and `drain == u32::MAX`); drain-cap upper
+    bound on requested bytes; `surplus ≤ buffer_bytes` invariant
+    preserved; determinism. Bitstream output for the existing `Vbv` /
+    `Cbr` / `PerPicture` variants is byte-identical to r152.
+
 - **Per-picture `running_surplus_bytes` rate-control telemetry**
   (round-152). Both `LdPictureRate` (LD driver) and `HqPictureRate`
   (HQ driver) gain a public `running_surplus_bytes: i64` field reported

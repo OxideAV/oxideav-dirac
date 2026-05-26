@@ -1024,3 +1024,315 @@ fn hq_sequence_vbv_running_surplus_bounded_above_by_buffer_bytes() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// r159: VbvHysteresis (drain-rate hysteresis) HqRateControl variant
+//
+// `HqRateControl::VbvHysteresis { buffer_bytes, max_drain_per_picture }`
+// is the fourth strategy: identical bucket fill / forfeit semantics as
+// `Vbv` (the post-encode carry clamp is the same), but the savings
+// *spent* on any one picture are additionally clamped at
+// `max_drain_per_picture`. The bucket fills at the natural rate (any
+// undershoot, up to `buffer_bytes`); only the *drain* rate per picture
+// is bounded. This smooths bursty single-picture spending so multiple
+// neighbours share the bucket instead of one neighbour draining it.
+//
+// Four corner cases pin the contract:
+//   * `max_drain_per_picture == 0` ≡ `PerPicture` (no savings spent),
+//   * `max_drain_per_picture >= buffer_bytes` ≡ `Vbv { buffer_bytes }`
+//     (drain cap inert; bucket cap already bites first),
+//   * Per-picture spend bound: `requested ≤ target + min(buffer_bytes,
+//     max_drain_per_picture)` for every row,
+//   * Determinism.
+// Plus a `surplus ≤ buffer_bytes` post-clamp invariant identical to
+// plain Vbv (the bucket cap is the same).
+// ---------------------------------------------------------------------------
+
+/// `VbvHysteresis { max_drain_per_picture: 0 }` zeros the per-picture
+/// spend, so the request collapses to `target_bytes` on every picture
+/// and the emitted stream is byte-identical to `PerPicture` regardless
+/// of `buffer_bytes`. Mirrors the `Vbv { buffer_bytes: 0 }` degeneracy
+/// — same effect via a different knob.
+#[test]
+fn hq_sequence_vbv_hysteresis_zero_drain_equals_per_picture() {
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let sources: Vec<_> = (0..5).map(|s| frame_64(s * 11 + 9)).collect();
+    let frames: Vec<InputPicture> = sources
+        .iter()
+        .enumerate()
+        .map(|(i, t)| InputPicture {
+            picture_number: i as u32,
+            y: &t.0,
+            u: &t.1,
+            v: &t.2,
+        })
+        .collect();
+    let base = base_hq_params();
+    let q0 = hq_picture_payload_bytes_at_qindex(
+        &seq,
+        &base,
+        &sources[0].0,
+        &sources[0].1,
+        &sources[0].2,
+        0,
+    ) as u32;
+    // Generous target so the underlying bucket *would* fill if drain
+    // were uncapped — only the zero-drain knob is keeping the request
+    // at `target`.
+    let target = (q0 * 4 / 5).max(64);
+
+    let pp_stream = encode_hq_sequence_with_size_target(
+        &seq,
+        &base,
+        &frames,
+        target,
+        HqRateControl::PerPicture,
+    );
+    let h_stream = encode_hq_sequence_with_size_target(
+        &seq,
+        &base,
+        &frames,
+        target,
+        HqRateControl::VbvHysteresis {
+            // Bucket is large but drain is zero — drain cap dominates.
+            buffer_bytes: 1024,
+            max_drain_per_picture: 0,
+        },
+    );
+    assert_eq!(
+        pp_stream, h_stream,
+        "VbvHysteresis with max_drain_per_picture: 0 must equal PerPicture (no savings can be spent)",
+    );
+}
+
+/// `VbvHysteresis { max_drain_per_picture: buffer_bytes }` makes the
+/// drain cap exactly coincide with the bucket cap, so it never bites
+/// before the bucket cap does — the variant collapses to plain `Vbv {
+/// buffer_bytes }`. Same effect with a strictly larger
+/// `max_drain_per_picture` (also tested).
+#[test]
+fn hq_sequence_vbv_hysteresis_drain_ge_buffer_equals_vbv() {
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let sources: Vec<_> = (0..5).map(|s| frame_64(s * 5 + 21)).collect();
+    let frames: Vec<InputPicture> = sources
+        .iter()
+        .enumerate()
+        .map(|(i, t)| InputPicture {
+            picture_number: i as u32,
+            y: &t.0,
+            u: &t.1,
+            v: &t.2,
+        })
+        .collect();
+    let base = base_hq_params();
+    let q0 = hq_picture_payload_bytes_at_qindex(
+        &seq,
+        &base,
+        &sources[0].0,
+        &sources[0].1,
+        &sources[0].2,
+        0,
+    ) as u32;
+    let target = (q0 * 3 / 4).max(64);
+    let buffer = 96u32;
+
+    let vbv_stream = encode_hq_sequence_with_size_target(
+        &seq,
+        &base,
+        &frames,
+        target,
+        HqRateControl::Vbv {
+            buffer_bytes: buffer,
+        },
+    );
+    let h_eq_stream = encode_hq_sequence_with_size_target(
+        &seq,
+        &base,
+        &frames,
+        target,
+        HqRateControl::VbvHysteresis {
+            buffer_bytes: buffer,
+            max_drain_per_picture: buffer,
+        },
+    );
+    assert_eq!(
+        vbv_stream, h_eq_stream,
+        "VbvHysteresis with max_drain_per_picture == buffer_bytes must coincide with Vbv (drain cap inert)",
+    );
+    let h_gt_stream = encode_hq_sequence_with_size_target(
+        &seq,
+        &base,
+        &frames,
+        target,
+        HqRateControl::VbvHysteresis {
+            buffer_bytes: buffer,
+            max_drain_per_picture: u32::MAX,
+        },
+    );
+    assert_eq!(
+        vbv_stream, h_gt_stream,
+        "VbvHysteresis with max_drain_per_picture: u32::MAX must coincide with Vbv (drain cap inert)",
+    );
+}
+
+/// Drain-cap invariant: every per-picture request ≤ `target +
+/// min(buffer_bytes, max_drain_per_picture)`. The drain cap is a
+/// strictly tighter peak than plain `Vbv`'s cap whenever
+/// `max_drain_per_picture < buffer_bytes`.
+#[test]
+fn hq_sequence_vbv_hysteresis_request_capped_at_target_plus_min_buffer_drain() {
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let sources: Vec<_> = (0..6).map(|s| frame_64(s * 7 + 11)).collect();
+    let frames: Vec<InputPicture> = sources
+        .iter()
+        .enumerate()
+        .map(|(i, t)| InputPicture {
+            picture_number: i as u32,
+            y: &t.0,
+            u: &t.1,
+            v: &t.2,
+        })
+        .collect();
+    let base = base_hq_params();
+    // Generous budget — every picture undershoots so the bucket would
+    // fill to `buffer_bytes` under plain Vbv. The drain cap is half
+    // the bucket, so the per-picture request peak should land at
+    // `target + max_drain_per_picture`, not `target + buffer_bytes`.
+    let max_q0 = sources
+        .iter()
+        .map(|s| hq_picture_payload_bytes_at_qindex(&seq, &base, &s.0, &s.1, &s.2, 0))
+        .max()
+        .unwrap() as u32;
+    let target = max_q0 + 256;
+    let buffer: u32 = 512;
+    let max_drain: u32 = 128;
+    let drain_cap = target + max_drain;
+    let vbv_cap = target + buffer;
+
+    let (stream, report) = encode_hq_sequence_with_size_target_report(
+        &seq,
+        &base,
+        &frames,
+        target,
+        HqRateControl::VbvHysteresis {
+            buffer_bytes: buffer,
+            max_drain_per_picture: max_drain,
+        },
+    );
+
+    for r in &report {
+        assert!(
+            r.requested_bytes <= drain_cap,
+            "picture {} VbvHysteresis request {} exceeded drain cap target+max_drain={} (target={target}, drain={max_drain}, buffer={buffer})",
+            r.picture_number,
+            r.requested_bytes,
+            drain_cap,
+        );
+        // Confirm the drain cap is a strictly tighter peak than the
+        // bucket cap; otherwise the test isn't actually exercising the
+        // hysteretic behaviour.
+        assert!(
+            drain_cap < vbv_cap,
+            "test misconfigured: drain cap {drain_cap} must be tighter than bucket cap {vbv_cap}",
+        );
+    }
+
+    let decoded = decode_all(stream);
+    assert_eq!(
+        decoded.len(),
+        frames.len(),
+        "VbvHysteresis stream must decode to N frames",
+    );
+}
+
+/// The `surplus ≤ buffer_bytes` post-clamp invariant from r152 holds
+/// identically under `VbvHysteresis` because the bucket cap is the
+/// same (the drain cap only affects per-picture *spend*, not bucket
+/// *fill*). Pins that the telemetry contract is preserved across the
+/// new variant.
+#[test]
+fn hq_sequence_vbv_hysteresis_running_surplus_bounded_above_by_buffer_bytes() {
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let sources: Vec<_> = (0..6).map(|s| frame_64(s * 13 + 4)).collect();
+    let frames: Vec<InputPicture> = sources
+        .iter()
+        .enumerate()
+        .map(|(i, t)| InputPicture {
+            picture_number: i as u32,
+            y: &t.0,
+            u: &t.1,
+            v: &t.2,
+        })
+        .collect();
+    let base = base_hq_params();
+    let q0 = hq_picture_payload_bytes_at_qindex(
+        &seq,
+        &base,
+        &sources[0].0,
+        &sources[0].1,
+        &sources[0].2,
+        0,
+    ) as u32;
+    let target = (q0 * 6 / 5).max(64);
+    let buffer: u32 = 96;
+    let max_drain: u32 = 32;
+
+    let (_stream, report) = encode_hq_sequence_with_size_target_report(
+        &seq,
+        &base,
+        &frames,
+        target,
+        HqRateControl::VbvHysteresis {
+            buffer_bytes: buffer,
+            max_drain_per_picture: max_drain,
+        },
+    );
+
+    for r in &report {
+        assert!(
+            r.running_surplus_bytes <= buffer as i64,
+            "VbvHysteresis: picture {} surplus {} exceeds bucket cap {} after clamp",
+            r.picture_number,
+            r.running_surplus_bytes,
+            buffer,
+        );
+    }
+}
+
+/// Determinism: the same VbvHysteresis inputs always produce the same
+/// stream. Mirrors the `Vbv` determinism test.
+#[test]
+fn hq_sequence_vbv_hysteresis_is_deterministic() {
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let f0 = frame_64(2);
+    let f1 = frame_64(8);
+    let f2 = frame_64(32);
+    let frames = [
+        InputPicture {
+            picture_number: 0,
+            y: &f0.0,
+            u: &f0.1,
+            v: &f0.2,
+        },
+        InputPicture {
+            picture_number: 1,
+            y: &f1.0,
+            u: &f1.1,
+            v: &f1.2,
+        },
+        InputPicture {
+            picture_number: 2,
+            y: &f2.0,
+            u: &f2.1,
+            v: &f2.2,
+        },
+    ];
+    let base = base_hq_params();
+    let mode = HqRateControl::VbvHysteresis {
+        buffer_bytes: 256,
+        max_drain_per_picture: 64,
+    };
+    let a = encode_hq_sequence_with_size_target(&seq, &base, &frames, 1024, mode);
+    let b = encode_hq_sequence_with_size_target(&seq, &base, &frames, 1024, mode);
+    assert_eq!(a, b, "VbvHysteresis encode must be deterministic");
+}

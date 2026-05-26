@@ -1794,6 +1794,65 @@ pub enum LdRateControl {
         /// picture's request can borrow from saved undershoots.
         buffer_bytes: u32,
     },
+    /// Drain-rate hysteresis variant of [`Vbv`] — same bucket fill /
+    /// forfeit semantics, but the savings *spent* on any one picture's
+    /// request are additionally clamped at `max_drain_per_picture`.
+    /// The LD analogue of [`HqRateControl::VbvHysteresis`].
+    ///
+    /// Plain [`Vbv`] lets a single picture drain the entire bucket
+    /// (its request can equal `target + buffer_bytes` the moment
+    /// savings fill the bucket). That delivers maximum quality on
+    /// whichever picture wins the lottery but produces a sudden
+    /// cliff — the bucket empties abruptly, then sits at zero until
+    /// the next undershoot refills it. `VbvHysteresis` smooths the
+    /// drain so the instantaneous request bump is capped at
+    /// `max_drain_per_picture` even if the bucket is full; the
+    /// remaining savings stay in the bucket for the *next* picture.
+    ///
+    /// LD's signed accumulator convention is `carry = sum(actual −
+    /// target)` (positive = overshot the ideal so far, i.e. *debt*;
+    /// negative = saved budget, i.e. *credit*). The spendable savings
+    /// the next picture may use are `max(−carry, 0)`. Under
+    /// `VbvHysteresis` we additionally clamp that spend at
+    /// `max_drain_per_picture`, so the per-picture request becomes
+    /// `target + max(0, min(−carry, buffer_bytes, max_drain_per_picture))`
+    /// in the savings branch (`carry < 0`), and the debt branch
+    /// (`carry > 0`) collapses the request toward `target − carry` —
+    /// identical to `Vbv` because debt repayment is mandatory, not
+    /// rate-limited.
+    ///
+    /// Strict generalisation invariants:
+    ///   * `max_drain_per_picture == 0` ≡ [`PerPicture`] on streams
+    ///     where the LD picker hits its target (no debt branch, no
+    ///     spendable savings → byte-identical),
+    ///   * `max_drain_per_picture >= buffer_bytes` ≡ [`Vbv`] (the drain
+    ///     cap never bites because the bucket cap already does;
+    ///     byte-identical).
+    ///
+    /// Pure encoder-side rate-shaping policy; the bitstream output is
+    /// spec-conformant under SMPTE ST 2042-1 §13.5.2 / §13.5.3.2 (any
+    /// per-slice qindex / slice-bytes the encoder produces is legal).
+    ///
+    /// [`Vbv`]: LdRateControl::Vbv
+    /// [`PerPicture`]: LdRateControl::PerPicture
+    /// [`HqRateControl::VbvHysteresis`]: HqRateControl::VbvHysteresis
+    VbvHysteresis {
+        /// Peak per-picture surplus the leaky bucket may hold above
+        /// `target_bytes`. Same role as [`Vbv::buffer_bytes`].
+        ///
+        /// [`Vbv::buffer_bytes`]: LdRateControl::Vbv::buffer_bytes
+        buffer_bytes: u32,
+        /// Maximum savings that may be drained into a single picture's
+        /// request. Bounds how aggressively a full bucket is emptied
+        /// onto one neighbour — `0` means no savings can be spent
+        /// (collapses to [`PerPicture`] when the picker hits target);
+        /// values `≥ buffer_bytes` make the drain cap inert and
+        /// collapse back to plain [`Vbv`].
+        ///
+        /// [`PerPicture`]: LdRateControl::PerPicture
+        /// [`Vbv`]: LdRateControl::Vbv
+        max_drain_per_picture: u32,
+    },
 }
 
 /// Per-picture rate-control telemetry returned by
@@ -1812,20 +1871,25 @@ pub struct LdPictureRate {
     /// qindex chosen by [`pick_ld_picture_qindex`] for this picture.
     pub qindex: u32,
     /// Running rate-control surplus *after* this picture has been
-    /// encoded and the [`LdRateControl::Vbv`] bucket clamp (if any) has
-    /// been applied. Sign convention: **positive = savings** (cumulative
-    /// undershoot — future pictures may spend it), **negative = debt**
-    /// (cumulative overshoot — future pictures must pay it back).
+    /// encoded and the [`LdRateControl::Vbv`] / [`LdRateControl::VbvHysteresis`]
+    /// bucket clamp (if any) has been applied. Sign convention:
+    /// **positive = savings** (cumulative undershoot — future pictures
+    /// may spend it), **negative = debt** (cumulative overshoot —
+    /// future pictures must pay it back).
     ///
     /// Computed identically for every rate-control mode as the signed
     /// deviation of the ideal cumulative budget from the encoded
     /// cumulative bytes (`pictures_seen × target_bytes − Σ
     /// actual_payload_bytes`). The modes differ only in whether the
     /// next picture's request *uses* the accumulator
-    /// ([`LdRateControl::Cbr`] / [`LdRateControl::Vbv`] do,
-    /// [`LdRateControl::PerPicture`] does not). Under VBV the bucket
-    /// clamp additionally guarantees `running_surplus_bytes ≤
-    /// buffer_bytes` once a picture has been folded in.
+    /// ([`LdRateControl::Cbr`] / [`LdRateControl::Vbv`] /
+    /// [`LdRateControl::VbvHysteresis`] do,
+    /// [`LdRateControl::PerPicture`] does not) and how much of it any
+    /// one picture may *spend* (Vbv: up to `buffer_bytes`;
+    /// VbvHysteresis: additionally capped at `max_drain_per_picture`).
+    /// Under VBV / VbvHysteresis the bucket clamp guarantees
+    /// `running_surplus_bytes ≤ buffer_bytes` once a picture has been
+    /// folded in.
     pub running_surplus_bytes: i64,
 }
 
@@ -1946,6 +2010,31 @@ pub fn encode_ld_sequence_with_size_target_report(
                 let want = target_bytes as i64 - carry.max(0) + spendable;
                 want.clamp(min_budget, u32::MAX as i64) as u32
             }
+            LdRateControl::VbvHysteresis {
+                buffer_bytes,
+                max_drain_per_picture,
+            } => {
+                // Drain-rate hysteresis: identical bucket fill / forfeit
+                // semantics as `Vbv`, but the spendable savings are
+                // additionally clamped at `max_drain_per_picture`. The
+                // debt-payback branch (`carry > 0`) is unchanged from
+                // `Vbv` because debt repayment is mandatory, not
+                // rate-limited — only the *spend* side of the bucket
+                // is hysteretic. `max_drain_per_picture == 0` zeros
+                // `spendable`, so the request collapses to
+                // `target - max(carry, 0)` — same as the carry-debt
+                // branch of every other VBV variant, and identical to
+                // `PerPicture` whenever the LD picker hits target
+                // (the picker's residual ±1-byte deviation means
+                // `carry` stays at zero on smooth fixtures, so
+                // `target - carry.max(0) == target`).
+                let spendable = (-carry)
+                    .min(buffer_bytes as i64)
+                    .min(max_drain_per_picture as i64)
+                    .max(0);
+                let want = target_bytes as i64 - carry.max(0) + spendable;
+                want.clamp(min_budget, u32::MAX as i64) as u32
+            }
         };
 
         // Size + qindex-pick + encode this picture. On the rare clamp
@@ -1982,11 +2071,15 @@ pub fn encode_ld_sequence_with_size_target_report(
         // a peak-size cap only governs the upper edge of the request,
         // not the lower edge — and PerPicture / Cbr leave `carry`
         // alone (PerPicture ignores `carry` in its request anyway).
-        if let LdRateControl::Vbv { buffer_bytes } = mode {
-            let floor = -(buffer_bytes as i64);
-            if carry < floor {
-                carry = floor;
+        match mode {
+            LdRateControl::Vbv { buffer_bytes }
+            | LdRateControl::VbvHysteresis { buffer_bytes, .. } => {
+                let floor = -(buffer_bytes as i64);
+                if carry < floor {
+                    carry = floor;
+                }
             }
+            LdRateControl::PerPicture | LdRateControl::Cbr => {}
         }
 
         // Telemetry: report the running surplus *after* the VBV clamp
@@ -2491,6 +2584,61 @@ pub enum HqRateControl {
         /// picture's request can borrow from saved undershoots.
         buffer_bytes: u32,
     },
+    /// Drain-rate hysteresis variant of [`Vbv`] — same bucket fill /
+    /// forfeit semantics, but the savings *spent* on any one picture
+    /// are additionally clamped at `max_drain_per_picture`. The bucket
+    /// can still hold up to `buffer_bytes` of savings; what changes is
+    /// how *fast* those savings flow out to a single picture's request.
+    ///
+    /// Plain [`Vbv`] permits a single picture to drain the entire
+    /// bucket in one step (its request may equal `target + buffer_bytes`
+    /// the moment savings fill the bucket). That delivers maximum
+    /// quality on whichever picture wins the lottery but exposes the
+    /// next several pictures to a sudden cliff — the bucket empties
+    /// abruptly, then the carry stays at zero until the next undershoot
+    /// refills it. `VbvHysteresis` smooths the drain by spreading
+    /// savings across multiple pictures: each picture's request is
+    /// `min(target + carry, target + buffer_bytes, target +
+    /// max_drain_per_picture)`, so even with a full bucket the
+    /// instantaneous bump is capped at `max_drain_per_picture` and the
+    /// remaining savings stay in the bucket for the *next* picture.
+    ///
+    /// Per-picture request: `min(target + carry, target + buffer_bytes,
+    /// target + max_drain_per_picture)`. The post-encode carry update is
+    /// identical to [`Vbv`] — savings forfeit at `buffer_bytes`, no
+    /// drain limit on the *fill* side (only on the *spend* side).
+    ///
+    /// Strict generalisation invariants:
+    ///   * `max_drain_per_picture == 0` ≡ [`PerPicture`] (no savings can
+    ///     ever be spent, byte-identical stream),
+    ///   * `max_drain_per_picture >= buffer_bytes` ≡ [`Vbv {
+    ///     buffer_bytes }`] (the drain cap never bites because the
+    ///     bucket cap already does; byte-identical stream),
+    ///   * `max_drain_per_picture == buffer_bytes == 0` ≡ [`PerPicture`]
+    ///     by both routes.
+    ///
+    /// Pure encoder-side rate-shaping policy; the bitstream output is
+    /// spec-conformant under BBC Dirac Specification v2.2.3 §13.5.4
+    /// (any per-picture qindex the encoder produces is legal).
+    ///
+    /// [`Vbv`]: HqRateControl::Vbv
+    /// [`PerPicture`]: HqRateControl::PerPicture
+    VbvHysteresis {
+        /// Peak per-picture surplus the leaky bucket may hold above
+        /// `target_bytes`. Same role as [`Vbv::buffer_bytes`].
+        ///
+        /// [`Vbv::buffer_bytes`]: HqRateControl::Vbv::buffer_bytes
+        buffer_bytes: u32,
+        /// Maximum savings that may be drained into a single picture's
+        /// request. Bounds how aggressively a full bucket is emptied
+        /// onto one neighbour — `0` means no savings can be spent
+        /// (collapses to [`PerPicture`]); values `≥ buffer_bytes` make
+        /// the drain cap inert and collapse back to plain [`Vbv`].
+        ///
+        /// [`PerPicture`]: HqRateControl::PerPicture
+        /// [`Vbv`]: HqRateControl::Vbv
+        max_drain_per_picture: u32,
+    },
 }
 
 /// Per-picture rate-control telemetry returned by
@@ -2516,22 +2664,27 @@ pub struct HqPictureRate {
     /// indices. Matches [`encode_hq_intra_multi_stream`]'s alternation.
     pub parse_code: u8,
     /// Running rate-control surplus *after* this picture has been
-    /// encoded and the [`HqRateControl::Vbv`] bucket clamp (if any) has
-    /// been applied. Sign convention: **positive = savings** (cumulative
-    /// undershoot — future pictures may spend it), **negative = debt**
-    /// (cumulative overshoot — future pictures must pay it back).
+    /// encoded and the [`HqRateControl::Vbv`] / [`HqRateControl::VbvHysteresis`]
+    /// bucket clamp (if any) has been applied. Sign convention:
+    /// **positive = savings** (cumulative undershoot — future pictures
+    /// may spend it), **negative = debt** (cumulative overshoot —
+    /// future pictures must pay it back).
     ///
     /// Computed identically for every rate-control mode as the signed
     /// deviation of the ideal cumulative budget from the encoded
     /// cumulative bytes (`pictures_seen × target_bytes − Σ
     /// actual_payload_bytes`). The modes differ only in whether the
     /// next picture's request *uses* the accumulator
-    /// ([`HqRateControl::Cbr`] / [`HqRateControl::Vbv`] do,
-    /// [`HqRateControl::PerPicture`] does not). Because the HQ picker
-    /// never overshoots unless `qindex == 127`, this value is monotone
-    /// non-decreasing in the usual case; the q=127 floor edge case is
-    /// the only way the per-picture contribution can be negative.
-    /// Under VBV the bucket clamp additionally guarantees
+    /// ([`HqRateControl::Cbr`] / [`HqRateControl::Vbv`] /
+    /// [`HqRateControl::VbvHysteresis`] do,
+    /// [`HqRateControl::PerPicture`] does not) and how much of it any
+    /// one picture may *spend* (Vbv: up to `buffer_bytes`;
+    /// VbvHysteresis: additionally capped at `max_drain_per_picture`).
+    /// Because the HQ picker never overshoots unless `qindex == 127`,
+    /// this value is monotone non-decreasing in the usual case; the
+    /// q=127 floor edge case is the only way the per-picture
+    /// contribution can be negative.
+    /// Under VBV / VbvHysteresis the bucket clamp additionally guarantees
     /// `running_surplus_bytes ≤ buffer_bytes` once a picture has been
     /// folded in.
     pub running_surplus_bytes: i64,
@@ -2642,6 +2795,29 @@ pub fn encode_hq_sequence_with_size_target_report(
                 let want = target_bytes as i64 + spendable;
                 want.clamp(1, u32::MAX as i64) as u32
             }
+            HqRateControl::VbvHysteresis {
+                buffer_bytes,
+                max_drain_per_picture,
+            } => {
+                // Drain-rate hysteresis: same bucket fill / forfeit
+                // semantics as `Vbv` (post-encode carry clamp at
+                // `buffer_bytes`), but the per-picture spend is
+                // additionally capped at `max_drain_per_picture`.
+                // Spendable = min(carry, buffer_bytes, max_drain_per_picture).
+                // `max_drain_per_picture == 0` zeroes the spend and
+                // collapses to `PerPicture`; `max_drain_per_picture >=
+                // buffer_bytes` makes the drain cap inert and reduces
+                // to plain `Vbv`. Either way the post-encode carry
+                // update below clamps at `buffer_bytes` exactly as
+                // `Vbv` does, so the bucket-fill state machine is
+                // bit-identical between the two variants.
+                let spendable = carry
+                    .min(buffer_bytes as i64)
+                    .min(max_drain_per_picture as i64)
+                    .max(0);
+                let want = target_bytes as i64 + spendable;
+                want.clamp(1, u32::MAX as i64) as u32
+            }
         };
 
         // Re-pick + re-encode at the (possibly carry-adjusted) budget.
@@ -2668,11 +2844,18 @@ pub fn encode_hq_sequence_with_size_target_report(
         // in which case `carry` may go briefly negative, naturally
         // tightening the next picture's budget.
         carry += target_bytes as i64 - actual_payload;
-        // VBV: clamp the running bucket at `buffer_bytes`; savings above
-        // the bucket size are forfeited. PerPicture / Cbr leave `carry`
-        // untouched (PerPicture's request ignores carry anyway).
-        if let HqRateControl::Vbv { buffer_bytes } = mode {
-            carry = carry.min(buffer_bytes as i64);
+        // VBV / VbvHysteresis: clamp the running bucket at
+        // `buffer_bytes`; savings above the bucket size are forfeited.
+        // PerPicture / Cbr leave `carry` untouched (PerPicture's
+        // request ignores carry anyway). VbvHysteresis uses the same
+        // bucket cap as Vbv — only the per-picture *spend* is rate-
+        // limited, the *fill* is identical.
+        match mode {
+            HqRateControl::Vbv { buffer_bytes }
+            | HqRateControl::VbvHysteresis { buffer_bytes, .. } => {
+                carry = carry.min(buffer_bytes as i64);
+            }
+            HqRateControl::PerPicture | HqRateControl::Cbr => {}
         }
 
         // Alternate parse codes — even index → non-reference (0xE8),
