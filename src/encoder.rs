@@ -2368,6 +2368,38 @@ pub enum HqRateControl {
     /// that picture, the carry continues to grow without effect (no
     /// further savings to spend).
     Cbr,
+    /// Leaky-bucket variable-bitrate: like [`Cbr`] but the carry is
+    /// **clamped at `buffer_bytes`** so the per-picture request never
+    /// exceeds `target_bytes + buffer_bytes` — an instantaneous peak
+    /// cap. Savings above `buffer_bytes` are forfeited rather than
+    /// accumulated. This bounds the worst-case single-picture size
+    /// (useful for transport / buffer-occupancy guarantees) while still
+    /// letting short bursts of undershoot fund a higher-quality
+    /// neighbour.
+    ///
+    /// Per-picture request: `min(target + carry, target + buffer_bytes)`.
+    /// After encoding, `carry = min(carry + target - actual,
+    /// buffer_bytes)` (still non-negative thanks to the picker's
+    /// no-overshoot guarantee, modulo the q=127 edge case).
+    ///
+    /// `buffer_bytes == 0` degenerates to [`PerPicture`]; an effectively
+    /// infinite `buffer_bytes` degenerates to [`Cbr`]. Intermediate
+    /// values trade peak-size cap against long-run average.
+    ///
+    /// Source of truth: BBC Dirac Specification v2.2.3 §13.5.4 specifies
+    /// the slice-qindex range; the leaky-bucket policy itself is a pure
+    /// encoder-side rate-shaping choice not dictated by the bitstream
+    /// spec (any qindex-per-picture sequence the encoder produces is
+    /// spec-conformant).
+    ///
+    /// [`Cbr`]: HqRateControl::Cbr
+    /// [`PerPicture`]: HqRateControl::PerPicture
+    Vbv {
+        /// Peak per-picture surplus the leaky bucket may hold above
+        /// `target_bytes` — i.e. the maximum extra bytes a single
+        /// picture's request can borrow from saved undershoots.
+        buffer_bytes: u32,
+    },
 }
 
 /// Per-picture rate-control telemetry returned by
@@ -2486,6 +2518,19 @@ pub fn encode_hq_sequence_with_size_target_report(
                 let want = target_bytes as i64 + carry;
                 want.clamp(1, u32::MAX as i64) as u32
             }
+            HqRateControl::Vbv { buffer_bytes } => {
+                // Leaky-bucket: identical to Cbr but the carry that may
+                // be spent on this picture is capped at `buffer_bytes`,
+                // so the per-picture request never exceeds
+                // `target + buffer_bytes` — an instantaneous peak cap.
+                // `carry` is already kept ≤ `buffer_bytes` at the
+                // post-encode update below, so a simple `min` here
+                // suffices; the explicit clamp guards against the
+                // degenerate `buffer_bytes == 0` case (request == target).
+                let spendable = carry.min(buffer_bytes as i64).max(0);
+                let want = target_bytes as i64 + spendable;
+                want.clamp(1, u32::MAX as i64) as u32
+            }
         };
 
         // Re-pick + re-encode at the (possibly carry-adjusted) budget.
@@ -2505,13 +2550,19 @@ pub fn encode_hq_sequence_with_size_target_report(
         );
         let actual_payload = pic_payload.len() as i64;
 
-        // CBR feedback: target minus actual. The HQ picker never
+        // CBR / VBV feedback: target minus actual. The HQ picker never
         // overshoots `requested`, so for `target ≤ requested` (CBR is
         // monotone non-decreasing) the contribution is non-negative
         // unless qindex == 127 and even the floor overshoots target —
         // in which case `carry` may go briefly negative, naturally
         // tightening the next picture's budget.
         carry += target_bytes as i64 - actual_payload;
+        // VBV: clamp the running bucket at `buffer_bytes`; savings above
+        // the bucket size are forfeited. PerPicture / Cbr leave `carry`
+        // untouched (PerPicture's request ignores carry anyway).
+        if let HqRateControl::Vbv { buffer_bytes } = mode {
+            carry = carry.min(buffer_bytes as i64);
+        }
 
         // Alternate parse codes — even index → non-reference (0xE8),
         // odd index → reference (0xEC). Matches the LD driver's

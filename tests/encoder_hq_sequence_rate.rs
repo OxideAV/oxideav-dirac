@@ -7,13 +7,19 @@
 //! elementary stream (sequence header + per-picture parse-info + picture
 //! data + end-of-sequence) that round-trips through the decoder.
 //!
-//! Two rate-control modes:
+//! Three rate-control modes:
 //!   * `PerPicture` — every picture independently sized to `target_bytes`,
 //!     no carry-over. The picker never overshoots, so each picture's
 //!     actual bytes ≤ target (within the q=127 floor edge case).
 //!   * `Cbr` — a signed carry accumulator adds each picture's
 //!     undershoot to the next picture's request, letting subsequent
 //!     pictures spend the surplus.
+//!   * `Vbv { buffer_bytes }` (r146) — leaky-bucket variant of `Cbr`:
+//!     identical carry behaviour but the spendable savings are clamped
+//!     at `buffer_bytes`, so every per-picture request is capped at
+//!     `target + buffer_bytes` (peak-size guarantee). `buffer_bytes ==
+//!     0` collapses to `PerPicture`; `buffer_bytes == u32::MAX`
+//!     coincides with `Cbr` on streams with no overshoot.
 //!
 //! Source of truth: BBC Dirac Specification v2.2.3 §13.5.2 (per-slice
 //! qindex header), §13.5.4 (`slice_quantisers(qindex)`), §9.6 / §10.4
@@ -531,4 +537,324 @@ fn hq_sequence_cbr_requested_bytes_monotone_non_decreasing_under_undershoot() {
         }
         prev_req = r.requested_bytes;
     }
+}
+
+// -- r146: VBV (leaky-bucket) HqRateControl variant --
+//
+// `HqRateControl::Vbv { buffer_bytes }` is the third strategy: like Cbr,
+// every picture's request is `target + carry`, BUT `carry` is clamped at
+// `buffer_bytes` (savings above the bucket are forfeited). This caps the
+// instantaneous peak per-picture request at `target + buffer_bytes` while
+// still letting short bursts of undershoot subsidise a higher-quality
+// neighbour. Three corner cases pin the contract: `buffer_bytes == 0`
+// must collapse to `PerPicture`; a very large `buffer_bytes` must agree
+// with `Cbr` while every picture undershoots (the cap never bites); the
+// peak-cap promise (`requested ≤ target + buffer_bytes`) holds at every
+// intermediate `buffer_bytes`. Plus an end-to-end decode check.
+
+/// `Vbv { buffer_bytes: 0 }` degenerates to `PerPicture`: the carry has
+/// zero spendable headroom, so every request equals `target_bytes` and
+/// the emitted streams are byte-identical.
+#[test]
+fn hq_sequence_vbv_zero_buffer_equals_per_picture() {
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let sources: Vec<_> = (0..4).map(|s| frame_64(s * 3 + 2)).collect();
+    let frames: Vec<InputPicture> = sources
+        .iter()
+        .enumerate()
+        .map(|(i, t)| InputPicture {
+            picture_number: i as u32,
+            y: &t.0,
+            u: &t.1,
+            v: &t.2,
+        })
+        .collect();
+    let base = base_hq_params();
+
+    // Tight budget so the picker actually escalates; if VBV is wrong
+    // and the bucket leaks any non-zero carry through, the qindex
+    // sequence differs from PerPicture's.
+    let q0 = hq_picture_payload_bytes_at_qindex(
+        &seq,
+        &base,
+        &sources[0].0,
+        &sources[0].1,
+        &sources[0].2,
+        0,
+    ) as u32;
+    let target = (q0 / 2).max(64);
+
+    let (pp_stream, pp_report) = encode_hq_sequence_with_size_target_report(
+        &seq,
+        &base,
+        &frames,
+        target,
+        HqRateControl::PerPicture,
+    );
+    let (vbv_stream, vbv_report) = encode_hq_sequence_with_size_target_report(
+        &seq,
+        &base,
+        &frames,
+        target,
+        HqRateControl::Vbv { buffer_bytes: 0 },
+    );
+
+    assert_eq!(
+        pp_stream, vbv_stream,
+        "Vbv {{ buffer_bytes: 0 }} must produce a byte-identical stream to PerPicture",
+    );
+    let pp_q: Vec<_> = pp_report.iter().map(|r| r.qindex).collect();
+    let vbv_q: Vec<_> = vbv_report.iter().map(|r| r.qindex).collect();
+    assert_eq!(pp_q, vbv_q, "qindex sequences must match");
+    let pp_req: Vec<_> = pp_report.iter().map(|r| r.requested_bytes).collect();
+    let vbv_req: Vec<_> = vbv_report.iter().map(|r| r.requested_bytes).collect();
+    assert_eq!(
+        pp_req, vbv_req,
+        "every VBV request must equal target (zero-buffer carry is unspendable)",
+    );
+    for r in &vbv_req {
+        assert_eq!(*r, target);
+    }
+}
+
+/// Peak-cap invariant: every Vbv requested bytes ≤ `target +
+/// buffer_bytes`. The bucket clamp guarantees the picker is never asked
+/// for more than `target + buffer_bytes` on any picture, regardless of
+/// how deep the undershoots from earlier pictures accumulated.
+#[test]
+fn hq_sequence_vbv_request_capped_at_target_plus_buffer() {
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let sources: Vec<_> = (0..6).map(|s| frame_64(s * 13)).collect();
+    let frames: Vec<InputPicture> = sources
+        .iter()
+        .enumerate()
+        .map(|(i, t)| InputPicture {
+            picture_number: i as u32,
+            y: &t.0,
+            u: &t.1,
+            v: &t.2,
+        })
+        .collect();
+    let base = base_hq_params();
+
+    // Pick a budget that comfortably accommodates every picture at
+    // q=0 — every picture undershoots, so carry would grow without
+    // bound under Cbr. Vbv must clip it.
+    let max_q0 = sources
+        .iter()
+        .map(|s| hq_picture_payload_bytes_at_qindex(&seq, &base, &s.0, &s.1, &s.2, 0))
+        .max()
+        .unwrap() as u32;
+    let target = max_q0 + 512; // every picture undershoots
+    let buffer = 128u32; // small bucket — cap will bite quickly
+
+    let (stream, report) = encode_hq_sequence_with_size_target_report(
+        &seq,
+        &base,
+        &frames,
+        target,
+        HqRateControl::Vbv {
+            buffer_bytes: buffer,
+        },
+    );
+
+    let cap = target + buffer;
+    for r in &report {
+        assert!(
+            r.requested_bytes <= cap,
+            "picture {} VBV request {} exceeded peak cap target+buffer={} (target={target}, buffer={buffer})",
+            r.picture_number,
+            r.requested_bytes,
+            cap,
+        );
+    }
+
+    // Stream is still well-formed.
+    let decoded = decode_all(stream);
+    assert_eq!(
+        decoded.len(),
+        frames.len(),
+        "VBV stream must decode to N frames",
+    );
+
+    eprintln!(
+        "HQ VBV cap test: target={target} buffer={buffer} cap={cap} requests={:?} actuals={:?}",
+        report.iter().map(|r| r.requested_bytes).collect::<Vec<_>>(),
+        report
+            .iter()
+            .map(|r| r.actual_payload_bytes)
+            .collect::<Vec<_>>(),
+    );
+}
+
+/// `Vbv { buffer_bytes: u32::MAX }` (effectively infinite bucket) agrees
+/// with `Cbr` on a stream where every picture undershoots: the carry
+/// never reaches the cap, so the leaky-bucket and the uncapped CBR
+/// produce byte-identical streams. Pins the "Vbv is the bucket-capped
+/// strict generalisation of Cbr" invariant.
+#[test]
+fn hq_sequence_vbv_infinite_buffer_equals_cbr() {
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let sources: Vec<_> = (0..4).map(|s| frame_64(s * 17 + 7)).collect();
+    let frames: Vec<InputPicture> = sources
+        .iter()
+        .enumerate()
+        .map(|(i, t)| InputPicture {
+            picture_number: i as u32,
+            y: &t.0,
+            u: &t.1,
+            v: &t.2,
+        })
+        .collect();
+    let base = base_hq_params();
+
+    // Same setup as the Cbr undershoot test: a budget every picture's
+    // q=0 ceiling stays under, so carry only ever grows.
+    let max_q0 = sources
+        .iter()
+        .map(|s| hq_picture_payload_bytes_at_qindex(&seq, &base, &s.0, &s.1, &s.2, 0))
+        .max()
+        .unwrap() as u32;
+    let target = max_q0 + 256;
+
+    let cbr_stream =
+        encode_hq_sequence_with_size_target(&seq, &base, &frames, target, HqRateControl::Cbr);
+    let vbv_stream = encode_hq_sequence_with_size_target(
+        &seq,
+        &base,
+        &frames,
+        target,
+        HqRateControl::Vbv {
+            buffer_bytes: u32::MAX,
+        },
+    );
+    assert_eq!(
+        cbr_stream, vbv_stream,
+        "Vbv with u32::MAX bucket must coincide with Cbr when no picture overshoots",
+    );
+}
+
+/// VBV positive use case: a tight budget where some pictures overshoot
+/// the per-picture target but the bucket lets an undershoot pay for a
+/// later overshoot, without exceeding the peak cap. The encoded stream
+/// decodes to N frames and obeys the peak cap on every request.
+#[test]
+fn hq_sequence_vbv_smooths_with_bounded_peak() {
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let sources: Vec<_> = (0..5).map(|s| frame_64(s * 23 + 5)).collect();
+    let frames: Vec<InputPicture> = sources
+        .iter()
+        .enumerate()
+        .map(|(i, t)| InputPicture {
+            picture_number: i as u32,
+            y: &t.0,
+            u: &t.1,
+            v: &t.2,
+        })
+        .collect();
+    let base = base_hq_params();
+
+    // Mid-range budget: some pictures will undershoot (savings) and
+    // some will need to escalate qindex. The bucket spends savings on
+    // the later pictures up to the cap.
+    let q0 = hq_picture_payload_bytes_at_qindex(
+        &seq,
+        &base,
+        &sources[0].0,
+        &sources[0].1,
+        &sources[0].2,
+        0,
+    ) as u32;
+    let target = (q0 * 7 / 10).max(64);
+    let buffer = (target / 4).max(32);
+
+    let (stream, report) = encode_hq_sequence_with_size_target_report(
+        &seq,
+        &base,
+        &frames,
+        target,
+        HqRateControl::Vbv {
+            buffer_bytes: buffer,
+        },
+    );
+
+    let cap = target + buffer;
+    for r in &report {
+        assert!(
+            r.requested_bytes <= cap,
+            "picture {} VBV requested {} exceeded peak cap {cap}",
+            r.picture_number,
+            r.requested_bytes,
+        );
+        assert!(
+            r.requested_bytes >= target,
+            "picture {} VBV requested {} < target {target} — bucket shouldn't go negative when picker doesn't overshoot",
+            r.picture_number,
+            r.requested_bytes,
+        );
+        // The picker still honours its no-overshoot promise for the
+        // (possibly capped) request.
+        if r.qindex < 127 {
+            assert!(
+                r.actual_payload_bytes <= r.requested_bytes,
+                "picture {} VBV actual {} > requested {} but qindex {} < 127",
+                r.picture_number,
+                r.actual_payload_bytes,
+                r.requested_bytes,
+                r.qindex,
+            );
+        }
+    }
+
+    let decoded = decode_all(stream);
+    assert_eq!(
+        decoded.len(),
+        frames.len(),
+        "VBV stream must decode to N frames",
+    );
+}
+
+/// Determinism: the same VBV inputs always produce the same stream.
+#[test]
+fn hq_sequence_vbv_is_deterministic() {
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let f0 = frame_64(2);
+    let f1 = frame_64(8);
+    let f2 = frame_64(32);
+    let frames = [
+        InputPicture {
+            picture_number: 0,
+            y: &f0.0,
+            u: &f0.1,
+            v: &f0.2,
+        },
+        InputPicture {
+            picture_number: 1,
+            y: &f1.0,
+            u: &f1.1,
+            v: &f1.2,
+        },
+        InputPicture {
+            picture_number: 2,
+            y: &f2.0,
+            u: &f2.1,
+            v: &f2.2,
+        },
+    ];
+    let base = base_hq_params();
+    let a = encode_hq_sequence_with_size_target(
+        &seq,
+        &base,
+        &frames,
+        1024,
+        HqRateControl::Vbv { buffer_bytes: 256 },
+    );
+    let b = encode_hq_sequence_with_size_target(
+        &seq,
+        &base,
+        &frames,
+        1024,
+        HqRateControl::Vbv { buffer_bytes: 256 },
+    );
+    assert_eq!(a, b, "VBV encode must be deterministic");
 }

@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **VC-2 HQ leaky-bucket (VBV) rate-control variant** (round-146). A
+  third `HqRateControl` strategy alongside r141's `PerPicture` and `Cbr`:
+  `HqRateControl::Vbv { buffer_bytes }`. Same carry semantics as `Cbr`
+  but the savings the next picture may spend are clamped at
+  `buffer_bytes`, so every per-picture request is capped at
+  `target + buffer_bytes` (an instantaneous peak-size guarantee that
+  unbounded `Cbr` lacks). Savings above `buffer_bytes` are forfeited
+  rather than accumulated. Pure encoder-side rate-shaping policy;
+  bitstream output remains spec-conformant under BBC Dirac Specification
+  v2.2.3 §13.5.2 / §13.5.4 (any qindex-per-picture sequence the encoder
+  produces is legal).
+  - Strict generalisation invariants both pinned by tests:
+    `Vbv { buffer_bytes: 0 }` → byte-identical to `PerPicture`;
+    `Vbv { buffer_bytes: u32::MAX }` → byte-identical to `Cbr` on
+    streams where no picture overshoots (the cap never bites).
+    Intermediate `buffer_bytes` trade peak-size cap against long-run
+    average.
+  - 5 new tests in `tests/encoder_hq_sequence_rate.rs` (8 → 13 total):
+    zero-buffer = PerPicture; infinite-buffer = Cbr; peak cap
+    (`requested ≤ target + buffer_bytes`) on a 6-picture undershoot
+    stream with `buffer = 128 B`; positive smoothing on a 5-picture
+    mid-range budget with `buffer = target/4`; determinism. All decoded
+    streams round-trip to N frames.
+
 - **VC-2 HQ multi-picture rate-controlled sequence encoder** (round-141).
   A stream-level driver on top of round-138's per-picture
   `pick_hq_picture_qindex` primitive: given a sequence of YUV frames plus
