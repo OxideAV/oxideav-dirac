@@ -659,3 +659,145 @@ fn ld_sequence_vbv_is_deterministic() {
     );
     assert_eq!(a, b, "VBV encode must be deterministic");
 }
+
+// ---------------------------------------------------------------------------
+// running_surplus_bytes telemetry (r152)
+//
+// Every `LdPictureRate` carries a signed `running_surplus_bytes` reported
+// AFTER any VBV bucket clamp. Convention:
+//   * positive = cumulative savings (future pictures may spend it),
+//   * negative = cumulative debt (future pictures must pay it back).
+// Computed identically across modes: `pictures_seen × target − Σ actual`
+// folded picture-by-picture, with VBV additionally clamping savings at
+// `buffer_bytes`. Modes differ only in whether the next request uses it.
+// ---------------------------------------------------------------------------
+
+/// PerPicture: the accumulator is still tracked as an observable signed
+/// `target × seen − Σ actual` running sum (mode-agnostic), but the
+/// request derivation ignores it — the *reported* surplus must match
+/// the cumulative budget-minus-actual sum, not be silently zero.
+#[test]
+fn ld_sequence_per_picture_running_surplus_matches_cumulative_budget_minus_actual() {
+    let seq = make_minimal_sequence_ld(64, 64, ChromaFormat::Yuv420);
+    let triples: Vec<_> = (0..5).map(|s| frame_64(s * 11 + 1)).collect();
+    let frames: Vec<InputPicture> = triples
+        .iter()
+        .enumerate()
+        .map(|(i, t)| InputPicture {
+            picture_number: i as u32,
+            y: &t.0,
+            u: &t.1,
+            v: &t.2,
+        })
+        .collect();
+    let base = LdEncoderParams::default_ld(WaveletFilter::LeGall5_3, 3, 4, 4, 32);
+    let target: u32 = 900;
+
+    let (_stream, report) = encode_ld_sequence_with_size_target_report(
+        &seq,
+        &base,
+        &frames,
+        target,
+        LdRateControl::PerPicture,
+    );
+
+    let mut cum_actual: i64 = 0;
+    for (k, r) in report.iter().enumerate() {
+        cum_actual += r.actual_payload_bytes as i64;
+        let cum_budget = (k as i64 + 1) * target as i64;
+        let expected_surplus = cum_budget - cum_actual;
+        assert_eq!(
+            r.running_surplus_bytes, expected_surplus,
+            "PerPicture: picture {} surplus mismatch — got {}, expected (k+1)*target - Σactual = {}",
+            r.picture_number, r.running_surplus_bytes, expected_surplus,
+        );
+    }
+}
+
+/// Cbr: the reported `running_surplus_bytes` after picture `k`
+/// equals `(k+1) × target − Σ actual_payload_bytes[0..=k]` — i.e. the
+/// signed deviation of the ideal cumulative budget from the
+/// actually-encoded cumulative bytes, in "positive = savings" sign.
+/// Pins the explicit accumulator semantics across the stream.
+#[test]
+fn ld_sequence_cbr_running_surplus_matches_cumulative_budget_minus_actual() {
+    let seq = make_minimal_sequence_ld(64, 64, ChromaFormat::Yuv420);
+    let triples: Vec<_> = (0..5).map(|s| frame_64(s * 13 + 7)).collect();
+    let frames: Vec<InputPicture> = triples
+        .iter()
+        .enumerate()
+        .map(|(i, t)| InputPicture {
+            picture_number: i as u32,
+            y: &t.0,
+            u: &t.1,
+            v: &t.2,
+        })
+        .collect();
+    let base = LdEncoderParams::default_ld(WaveletFilter::LeGall5_3, 3, 4, 4, 32);
+    let target: u32 = 950;
+
+    let (_stream, report) = encode_ld_sequence_with_size_target_report(
+        &seq,
+        &base,
+        &frames,
+        target,
+        LdRateControl::Cbr,
+    );
+
+    let mut cum_actual: i64 = 0;
+    for (k, r) in report.iter().enumerate() {
+        cum_actual += r.actual_payload_bytes as i64;
+        let cum_budget = (k as i64 + 1) * target as i64;
+        let expected_surplus = cum_budget - cum_actual;
+        assert_eq!(
+            r.running_surplus_bytes, expected_surplus,
+            "Cbr: picture {} surplus mismatch — got {}, expected (k+1)*target - Σactual = {}",
+            r.picture_number, r.running_surplus_bytes, expected_surplus,
+        );
+    }
+}
+
+/// VBV: the bucket clamp guarantees `running_surplus_bytes ≤
+/// buffer_bytes` for every reported row (savings above the bucket are
+/// forfeited). The lower edge — debt — is not clamped; only the
+/// savings end of the bucket is bounded.
+#[test]
+fn ld_sequence_vbv_running_surplus_bounded_above_by_buffer_bytes() {
+    let seq = make_minimal_sequence_ld(64, 64, ChromaFormat::Yuv420);
+    let triples: Vec<_> = (0..6).map(|s| frame_64(s * 5 + 2)).collect();
+    let frames: Vec<InputPicture> = triples
+        .iter()
+        .enumerate()
+        .map(|(i, t)| InputPicture {
+            picture_number: i as u32,
+            y: &t.0,
+            u: &t.1,
+            v: &t.2,
+        })
+        .collect();
+    let base = LdEncoderParams::default_ld(WaveletFilter::LeGall5_3, 3, 4, 4, 32);
+    // Pick a target generous enough that the LD encoder undershoots
+    // most pictures so the savings end of the bucket actually fills.
+    let target: u32 = 2000;
+    let buffer: u32 = 128;
+
+    let (_stream, report) = encode_ld_sequence_with_size_target_report(
+        &seq,
+        &base,
+        &frames,
+        target,
+        LdRateControl::Vbv {
+            buffer_bytes: buffer,
+        },
+    );
+
+    for r in &report {
+        assert!(
+            r.running_surplus_bytes <= buffer as i64,
+            "VBV: picture {} surplus {} exceeds bucket cap {} after clamp",
+            r.picture_number,
+            r.running_surplus_bytes,
+            buffer,
+        );
+    }
+}

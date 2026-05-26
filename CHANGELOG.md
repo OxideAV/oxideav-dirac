@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Per-picture `running_surplus_bytes` rate-control telemetry**
+  (round-152). Both `LdPictureRate` (LD driver) and `HqPictureRate`
+  (HQ driver) gain a public `running_surplus_bytes: i64` field reported
+  *after* any [`Vbv`] bucket clamp has been applied. Sign convention:
+  **positive = cumulative savings** (future pictures may spend it),
+  **negative = cumulative debt** (future pictures must pay it back).
+  Computed identically across all three rate-control modes as the
+  signed deviation of the ideal cumulative budget from the encoded
+  cumulative bytes (`pictures_seen × target_bytes − Σ
+  actual_payload_bytes`); modes differ only in whether the next
+  picture's request *uses* the accumulator. Under VBV the bucket clamp
+  additionally guarantees `running_surplus_bytes ≤ buffer_bytes` per
+  row. Pure telemetry — the bitstream output is byte-identical to
+  r149/r146, only the report struct grew a field.
+  - 6 new tests across `tests/encoder_ld_sequence_rate.rs` (11 → 14)
+    and `tests/encoder_hq_sequence_rate.rs` (13 → 16): per-mode
+    cumulative-budget-minus-Σ-actual identity for `PerPicture` and
+    `Cbr`, and the VBV bucket-cap `surplus ≤ buffer_bytes` invariant.
+
 - **VC-2 LD leaky-bucket (VBV) rate-control variant** (round-149). The
   LD analogue of r146's HQ `Vbv`: a third `LdRateControl` strategy
   alongside r134's `PerPicture` and `Cbr`,

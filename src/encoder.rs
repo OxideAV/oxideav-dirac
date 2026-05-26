@@ -1811,6 +1811,22 @@ pub struct LdPictureRate {
     pub actual_payload_bytes: u32,
     /// qindex chosen by [`pick_ld_picture_qindex`] for this picture.
     pub qindex: u32,
+    /// Running rate-control surplus *after* this picture has been
+    /// encoded and the [`LdRateControl::Vbv`] bucket clamp (if any) has
+    /// been applied. Sign convention: **positive = savings** (cumulative
+    /// undershoot — future pictures may spend it), **negative = debt**
+    /// (cumulative overshoot — future pictures must pay it back).
+    ///
+    /// Computed identically for every rate-control mode as the signed
+    /// deviation of the ideal cumulative budget from the encoded
+    /// cumulative bytes (`pictures_seen × target_bytes − Σ
+    /// actual_payload_bytes`). The modes differ only in whether the
+    /// next picture's request *uses* the accumulator
+    /// ([`LdRateControl::Cbr`] / [`LdRateControl::Vbv`] do,
+    /// [`LdRateControl::PerPicture`] does not). Under VBV the bucket
+    /// clamp additionally guarantees `running_surplus_bytes ≤
+    /// buffer_bytes` once a picture has been folded in.
+    pub running_surplus_bytes: i64,
 }
 
 /// Encode a multi-picture VC-2 LD intra-only sequence with per-picture
@@ -1973,11 +1989,19 @@ pub fn encode_ld_sequence_with_size_target_report(
             }
         }
 
+        // Telemetry: report the running surplus *after* the VBV clamp
+        // applied above, in the "positive = savings, negative = debt"
+        // convention. The LD accumulator's internal sign is the
+        // mirror — `carry > 0` is overshoot debt and `carry < 0` is
+        // savings — so we negate it on the way out.
+        let running_surplus_bytes = -carry;
+
         report.push(LdPictureRate {
             picture_number: pic.picture_number,
             requested_bytes: budget,
             actual_payload_bytes: actual_payload as u32,
             qindex,
+            running_surplus_bytes,
         });
 
         let pic_unit_len = (pi_size + pic_payload.len()) as u32;
@@ -2491,6 +2515,26 @@ pub struct HqPictureRate {
     /// intra) on even indices, `0xEC` (HQ reference intra) on odd
     /// indices. Matches [`encode_hq_intra_multi_stream`]'s alternation.
     pub parse_code: u8,
+    /// Running rate-control surplus *after* this picture has been
+    /// encoded and the [`HqRateControl::Vbv`] bucket clamp (if any) has
+    /// been applied. Sign convention: **positive = savings** (cumulative
+    /// undershoot — future pictures may spend it), **negative = debt**
+    /// (cumulative overshoot — future pictures must pay it back).
+    ///
+    /// Computed identically for every rate-control mode as the signed
+    /// deviation of the ideal cumulative budget from the encoded
+    /// cumulative bytes (`pictures_seen × target_bytes − Σ
+    /// actual_payload_bytes`). The modes differ only in whether the
+    /// next picture's request *uses* the accumulator
+    /// ([`HqRateControl::Cbr`] / [`HqRateControl::Vbv`] do,
+    /// [`HqRateControl::PerPicture`] does not). Because the HQ picker
+    /// never overshoots unless `qindex == 127`, this value is monotone
+    /// non-decreasing in the usual case; the q=127 floor edge case is
+    /// the only way the per-picture contribution can be negative.
+    /// Under VBV the bucket clamp additionally guarantees
+    /// `running_surplus_bytes ≤ buffer_bytes` once a picture has been
+    /// folded in.
+    pub running_surplus_bytes: i64,
 }
 
 /// Encode a multi-picture VC-2 HQ intra-only sequence with per-picture
@@ -2637,12 +2681,19 @@ pub fn encode_hq_sequence_with_size_target_report(
         // exercises both HQ intra codes across the sequence.
         let parse_code = if i % 2 == 0 { 0xE8 } else { 0xEC };
 
+        // Telemetry: report the running surplus *after* the VBV clamp
+        // applied above. The HQ accumulator already follows the
+        // "positive = savings, negative = debt" convention directly
+        // (`carry += target - actual`), so no flip is needed.
+        let running_surplus_bytes = carry;
+
         report.push(HqPictureRate {
             picture_number: pic.picture_number,
             requested_bytes: requested,
             actual_payload_bytes: actual_payload as u32,
             qindex,
             parse_code,
+            running_surplus_bytes,
         });
 
         let pic_unit_len = (pi_size + pic_payload.len()) as u32;

@@ -858,3 +858,169 @@ fn hq_sequence_vbv_is_deterministic() {
     );
     assert_eq!(a, b, "VBV encode must be deterministic");
 }
+
+// ---------------------------------------------------------------------------
+// running_surplus_bytes telemetry (r152)
+//
+// Every `HqPictureRate` carries a signed `running_surplus_bytes` reported
+// AFTER any VBV bucket clamp. Convention:
+//   * positive = cumulative savings (future pictures may spend it),
+//   * negative = cumulative debt (future pictures must pay it back —
+//     only reachable when qindex == 127 and even the floor overshoots).
+// Computed identically across modes: `pictures_seen × target − Σ actual`
+// folded picture-by-picture, with VBV additionally clamping savings at
+// `buffer_bytes`. Modes differ only in whether the next request uses it.
+// ---------------------------------------------------------------------------
+
+/// PerPicture: the accumulator is still tracked as an observable
+/// `target × seen − Σ actual` running sum, but the request derivation
+/// ignores it — the *reported* surplus must match the cumulative
+/// budget-minus-actual sum, not be silently zero.
+#[test]
+fn hq_sequence_per_picture_running_surplus_matches_cumulative_budget_minus_actual() {
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let sources: Vec<_> = (0..5).map(|s| frame_64(s * 3 + 1)).collect();
+    let frames: Vec<InputPicture> = sources
+        .iter()
+        .enumerate()
+        .map(|(i, t)| InputPicture {
+            picture_number: i as u32,
+            y: &t.0,
+            u: &t.1,
+            v: &t.2,
+        })
+        .collect();
+    let base = base_hq_params();
+    let q0 = hq_picture_payload_bytes_at_qindex(
+        &seq,
+        &base,
+        &sources[0].0,
+        &sources[0].1,
+        &sources[0].2,
+        0,
+    ) as u32;
+    let target = (q0 * 3 / 5).max(64);
+
+    let (_stream, report) = encode_hq_sequence_with_size_target_report(
+        &seq,
+        &base,
+        &frames,
+        target,
+        HqRateControl::PerPicture,
+    );
+
+    let mut cum_actual: i64 = 0;
+    for (k, r) in report.iter().enumerate() {
+        cum_actual += r.actual_payload_bytes as i64;
+        let cum_budget = (k as i64 + 1) * target as i64;
+        let expected_surplus = cum_budget - cum_actual;
+        assert_eq!(
+            r.running_surplus_bytes, expected_surplus,
+            "PerPicture: picture {} surplus mismatch — got {}, expected (k+1)*target - Σactual = {}",
+            r.picture_number, r.running_surplus_bytes, expected_surplus,
+        );
+    }
+}
+
+/// Cbr: the reported `running_surplus_bytes` after picture `k`
+/// equals `(k+1) × target − Σ actual_payload_bytes[0..=k]`. Pins the
+/// explicit accumulator semantics across the stream.
+#[test]
+fn hq_sequence_cbr_running_surplus_matches_cumulative_budget_minus_actual() {
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let sources: Vec<_> = (0..5).map(|s| frame_64(s * 11 + 4)).collect();
+    let frames: Vec<InputPicture> = sources
+        .iter()
+        .enumerate()
+        .map(|(i, t)| InputPicture {
+            picture_number: i as u32,
+            y: &t.0,
+            u: &t.1,
+            v: &t.2,
+        })
+        .collect();
+    let base = base_hq_params();
+    // Mid-range budget — the HQ picker never overshoots, so the
+    // cumulative surplus is monotone non-negative for q < 127.
+    let q0 = hq_picture_payload_bytes_at_qindex(
+        &seq,
+        &base,
+        &sources[0].0,
+        &sources[0].1,
+        &sources[0].2,
+        0,
+    ) as u32;
+    let target = (q0 * 4 / 5).max(64);
+
+    let (_stream, report) = encode_hq_sequence_with_size_target_report(
+        &seq,
+        &base,
+        &frames,
+        target,
+        HqRateControl::Cbr,
+    );
+
+    let mut cum_actual: i64 = 0;
+    for (k, r) in report.iter().enumerate() {
+        cum_actual += r.actual_payload_bytes as i64;
+        let cum_budget = (k as i64 + 1) * target as i64;
+        let expected_surplus = cum_budget - cum_actual;
+        assert_eq!(
+            r.running_surplus_bytes, expected_surplus,
+            "Cbr: picture {} surplus mismatch — got {}, expected (k+1)*target - Σactual = {}",
+            r.picture_number, r.running_surplus_bytes, expected_surplus,
+        );
+    }
+}
+
+/// VBV: the bucket clamp guarantees `running_surplus_bytes ≤
+/// buffer_bytes` for every reported row (savings above the bucket are
+/// forfeited).
+#[test]
+fn hq_sequence_vbv_running_surplus_bounded_above_by_buffer_bytes() {
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let sources: Vec<_> = (0..6).map(|s| frame_64(s * 7 + 2)).collect();
+    let frames: Vec<InputPicture> = sources
+        .iter()
+        .enumerate()
+        .map(|(i, t)| InputPicture {
+            picture_number: i as u32,
+            y: &t.0,
+            u: &t.1,
+            v: &t.2,
+        })
+        .collect();
+    let base = base_hq_params();
+    // Generous target: most pictures undershoot, so the bucket fills
+    // and the clamp actually fires.
+    let q0 = hq_picture_payload_bytes_at_qindex(
+        &seq,
+        &base,
+        &sources[0].0,
+        &sources[0].1,
+        &sources[0].2,
+        0,
+    ) as u32;
+    let target = (q0 * 6 / 5).max(64);
+    let buffer: u32 = 96;
+
+    let (_stream, report) = encode_hq_sequence_with_size_target_report(
+        &seq,
+        &base,
+        &frames,
+        target,
+        HqRateControl::Vbv {
+            buffer_bytes: buffer,
+        },
+    );
+
+    for r in &report {
+        assert!(
+            r.running_surplus_bytes <= buffer as i64,
+            "VBV: picture {} surplus {} exceeds bucket cap {} after clamp",
+            r.picture_number,
+            r.running_surplus_bytes,
+            buffer,
+        );
+    }
+}
