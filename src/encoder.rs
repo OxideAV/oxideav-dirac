@@ -2337,6 +2337,212 @@ pub fn encode_hq_intra_multi_stream(
     out
 }
 
+/// Rate-control strategy for [`encode_hq_sequence_with_size_target`].
+///
+/// Unlike LD — where the picture-byte count is a deterministic function
+/// of `slice_bytes_numer/denom` and constant across qindex — the HQ
+/// profile lets each slice's length byte track its actual coefficient
+/// block size, so picture bytes shrink monotonically with rising qindex
+/// (the dead-zone forward quantiser drives more coefficients toward
+/// zero → fewer interleaved exp-Golomb bits per slice). The picker
+/// ([`pick_hq_picture_qindex`]) walks `qindex ∈ floor..=127` and stops
+/// at the first one whose constant-qindex picture bytes ≤ target — so
+/// it **never overshoots** the requested budget but may undershoot
+/// when even q=0 already fits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HqRateControl {
+    /// Each picture is independently sized to `target_bytes`. No
+    /// carry-over between pictures: the per-picture residual (target
+    /// minus actual bytes, always ≥ 0 because the picker never
+    /// overshoots) is lost.
+    PerPicture,
+    /// Constant-bit-rate: a running signed accumulator carries each
+    /// picture's residual (target − actual; positive when the picture
+    /// undershot, signalling spare budget) into the next picture's
+    /// request. The next request becomes `target_bytes + carry` — extra
+    /// headroom when previous pictures undershot, no debt to pay back
+    /// (the picker never overshoots a request, so `carry` is monotone
+    /// non-negative across the stream). Drives the running stream
+    /// total upward toward `N * target_bytes` as long as the budget is
+    /// reachable; once a picture's budget exceeds the q=0 ceiling for
+    /// that picture, the carry continues to grow without effect (no
+    /// further savings to spend).
+    Cbr,
+}
+
+/// Per-picture rate-control telemetry returned by
+/// [`encode_hq_sequence_with_size_target_report`].
+#[derive(Debug, Clone, Copy)]
+pub struct HqPictureRate {
+    /// Picture number written into the picture header.
+    pub picture_number: u32,
+    /// Byte budget actually requested for this picture (after the CBR
+    /// carry-over, if any).
+    pub requested_bytes: u32,
+    /// Actual encoded HQ picture *payload* bytes (excludes the 13-byte
+    /// parse-info wrapper). Equals
+    /// [`hq_picture_payload_bytes_at_qindex`] at the chosen qindex.
+    pub actual_payload_bytes: u32,
+    /// qindex chosen by [`pick_hq_picture_qindex`] for this picture
+    /// (`0..=127`). The picker promises `actual_payload_bytes ≤
+    /// requested_bytes` unless `qindex == 127` (in which case the
+    /// q=127 floor still overshoots; graceful degradation).
+    pub qindex: u32,
+    /// Parse code written for this picture: `0xE8` (HQ non-reference
+    /// intra) on even indices, `0xEC` (HQ reference intra) on odd
+    /// indices. Matches [`encode_hq_intra_multi_stream`]'s alternation.
+    pub parse_code: u8,
+}
+
+/// Encode a multi-picture VC-2 HQ intra-only sequence with per-picture
+/// rate control driven by [`pick_hq_picture_qindex`].
+///
+/// For every input frame the driver:
+///   1. derives a per-picture byte budget from `target_bytes` and the
+///      chosen [`HqRateControl`] strategy,
+///   2. picks the smallest picture-level qindex whose constant-qindex
+///      HQ picture payload ≤ budget ([`pick_hq_picture_qindex`]; HQ
+///      picture bytes are monotone non-increasing in qindex), and
+///   3. emits the HQ picture with parse code `0xE8` (non-reference)
+///      on even indices and `0xEC` (reference) on odd indices —
+///      same alternation as [`encode_hq_intra_multi_stream`].
+///
+/// The result is a complete elementary stream: sequence header (`0x00`)
+/// plus one HQ picture per frame plus end-of-sequence (`0x10`), with
+/// the `next_parse_offset` / `previous_parse_offset` chain wired so it
+/// round-trips through [`crate::decoder::DiracDecoder`] to one decoded
+/// frame per input frame.
+///
+/// The picker **never overshoots** the requested budget on the budget
+/// it was given (the §13.5.4 length-byte cap is the only edge case,
+/// guarded by `debug_assert!` in [`encode_hq_slice`]); if even q=127
+/// cannot fit the budget the picker returns 127 and the actual bytes
+/// land at the q=127 floor for that picture's content — a graceful
+/// degradation rather than an encode failure.
+///
+/// `base.slice_size_target` is intentionally cleared before invoking
+/// the picker so the picture-level qindex is the one actually written
+/// into every slice header — matching
+/// [`encode_single_hq_intra_stream_with_size_target`].
+///
+/// Source of truth: BBC Dirac Specification v2.2.3 §13.5.2 (per-slice
+/// qindex header), §13.5.4 (`slice_quantisers(qindex)`), §9.6 / §10.4
+/// (parse-info sequence framing).
+pub fn encode_hq_sequence_with_size_target(
+    sequence: &SequenceHeader,
+    base: &EncoderParams,
+    frames: &[InputPicture<'_>],
+    target_bytes: u32,
+    mode: HqRateControl,
+) -> Vec<u8> {
+    let (stream, _report) =
+        encode_hq_sequence_with_size_target_report(sequence, base, frames, target_bytes, mode);
+    stream
+}
+
+/// [`encode_hq_sequence_with_size_target`] plus per-picture telemetry
+/// (requested vs. actual bytes, chosen qindex, parse code).
+/// Returns `(stream, report)`.
+pub fn encode_hq_sequence_with_size_target_report(
+    sequence: &SequenceHeader,
+    base: &EncoderParams,
+    frames: &[InputPicture<'_>],
+    target_bytes: u32,
+    mode: HqRateControl,
+) -> (Vec<u8>, Vec<HqPictureRate>) {
+    // Mirror the per-stream wrapper: clear the per-slice §13.5.4 search
+    // so the picture-level qindex is the one written into every slice
+    // header.
+    let mut params = base.clone();
+    params.slice_size_target = None;
+
+    let sh_payload = encode_sequence_header(sequence);
+    let pi_size = 13usize;
+    let sh_unit_len = pi_size + sh_payload.len();
+
+    let mut out = Vec::new();
+    write_parse_info(&mut out, 0x00, sh_unit_len as u32, 0);
+    out.extend_from_slice(&sh_payload);
+
+    let mut report: Vec<HqPictureRate> = Vec::with_capacity(frames.len());
+    let mut prev_len = sh_unit_len as u32;
+    let mut last_pic_len: Option<u32> = None;
+
+    // CBR carry: signed running surplus from previous pictures'
+    // undershoots. The HQ picker never overshoots, so `carry` is
+    // monotone non-negative — every CBR request equals `target_bytes +
+    // carry`, growing the budget the picture is allowed to use until
+    // either q=0 fits (and the picture undershoots further) or the
+    // chosen qindex reaches 0 (further headroom is wasted).
+    let mut carry: i64 = 0;
+
+    for (i, pic) in frames.iter().enumerate() {
+        let requested: u32 = match mode {
+            HqRateControl::PerPicture => target_bytes,
+            HqRateControl::Cbr => {
+                // Grow the per-picture budget by accumulated surplus.
+                // Clamp at u32::MAX so degenerate huge carries do not
+                // wrap the requested-bytes field.
+                let want = target_bytes as i64 + carry;
+                want.clamp(1, u32::MAX as i64) as u32
+            }
+        };
+
+        // Re-pick + re-encode at the (possibly carry-adjusted) budget.
+        // Each picture's params keep `slice_size_target = None` and
+        // get its own picked qindex written into every slice.
+        let mut pic_params = params.clone();
+        let qindex = pick_hq_picture_qindex(sequence, &pic_params, pic.y, pic.u, pic.v, requested);
+        pic_params.qindex = qindex;
+
+        let pic_payload = encode_hq_intra_picture(
+            sequence,
+            &pic_params,
+            pic.picture_number,
+            pic.y,
+            pic.u,
+            pic.v,
+        );
+        let actual_payload = pic_payload.len() as i64;
+
+        // CBR feedback: target minus actual. The HQ picker never
+        // overshoots `requested`, so for `target ≤ requested` (CBR is
+        // monotone non-decreasing) the contribution is non-negative
+        // unless qindex == 127 and even the floor overshoots target —
+        // in which case `carry` may go briefly negative, naturally
+        // tightening the next picture's budget.
+        carry += target_bytes as i64 - actual_payload;
+
+        // Alternate parse codes — even index → non-reference (0xE8),
+        // odd index → reference (0xEC). Matches the LD driver's
+        // single-code choice (LD permits only non-ref per §D.1.1) but
+        // exercises both HQ intra codes across the sequence.
+        let parse_code = if i % 2 == 0 { 0xE8 } else { 0xEC };
+
+        report.push(HqPictureRate {
+            picture_number: pic.picture_number,
+            requested_bytes: requested,
+            actual_payload_bytes: actual_payload as u32,
+            qindex,
+            parse_code,
+        });
+
+        let pic_unit_len = (pi_size + pic_payload.len()) as u32;
+        write_parse_info(&mut out, parse_code, pic_unit_len, prev_len);
+        out.extend_from_slice(&pic_payload);
+        prev_len = pic_unit_len;
+        last_pic_len = Some(pic_unit_len);
+    }
+
+    write_parse_info(
+        &mut out,
+        0x10,
+        0,
+        last_pic_len.unwrap_or(sh_unit_len as u32),
+    );
+    (out, report)
+}
+
 /// Build a synthetic 64x64 4:2:0 YUV test pattern: a diagonal luma
 /// gradient with a cross + a tinted chroma. Useful for the encoder
 /// round-trip tests below.

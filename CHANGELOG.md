@@ -9,6 +9,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **VC-2 HQ multi-picture rate-controlled sequence encoder** (round-141).
+  A stream-level driver on top of round-138's per-picture
+  `pick_hq_picture_qindex` primitive: given a sequence of YUV frames plus
+  a target byte-budget, it sizes + qindex-picks + encodes each picture
+  and emits a complete VC-2 HQ elementary stream (sequence header `0x00`
+  + one HQ intra picture per frame alternating non-reference `0xE8` /
+  reference `0xEC` + end-of-sequence `0x10`, with the `next_parse_offset`
+  / `previous_parse_offset` chain wired up) that round-trips through
+  `DiracDecoder` to one decoded frame per input frame. The HQ analogue
+  of round-134's LD multi-picture driver. BBC Dirac Specification v2.2.3
+  §13.5.2 (per-slice qindex header), §13.5.4 (`slice_quantisers(qindex)`),
+  §9.6 / §10.4 (parse-info sequence framing).
+  - New public API surface in `oxideav_dirac::encoder`:
+    - `encode_hq_sequence_with_size_target(seq, base, frames,
+      target_bytes, mode) -> Vec<u8>` — full HQ elementary stream.
+    - `encode_hq_sequence_with_size_target_report(seq, base, frames,
+      target_bytes, mode) -> (Vec<u8>, Vec<HqPictureRate>)` — same
+      stream plus per-picture telemetry (requested vs. actual bytes,
+      chosen qindex, written parse code).
+    - `HqRateControl::{PerPicture, Cbr}` — `PerPicture` sizes every
+      picture independently to `target_bytes` (no carry-over);
+      `Cbr` carries each picture's signed residual (`target − actual`,
+      monotone non-negative outside the q=127 floor edge case) into the
+      next picture's request so undershoots become future spending
+      power.
+    - `HqPictureRate` — `{ picture_number, requested_bytes,
+      actual_payload_bytes, qindex, parse_code }`. The picker's
+      `actual_payload_bytes ≤ requested_bytes` contract is preserved
+      end-to-end; `parse_code` is the byte actually written into the
+      picture's parse-info (alternating `0xE8` / `0xEC`).
+    - Driver clears `base.slice_size_target` before invoking the picker
+      so the chosen picture-level qindex is the one written into every
+      slice header — same wrapper invariant as
+      `encode_single_hq_intra_stream_with_size_target` (round-138).
+  - New test file `tests/encoder_hq_sequence_rate.rs` (8 tests, all
+    passing). Headline acceptance: a **5-picture** 64x64 4:2:0 sequence
+    with `slice_size_scaler = 2`, 4x4 slices, mid-frequency-cross
+    fixtures, exercised under both `PerPicture` and `Cbr`:
+    - **PerPicture** at `target = 1234 B` → actuals `[1221, 1223, 1185,
+      1221, 1223]` (all ≤ target; picker never overshoots) at qindexes
+      `[23, 24, 26, 27, 27]`. Decoded 5 frames all > 8 dB Y PSNR.
+    - **Cbr** at `target = 1031 B` (N=5 → ideal 5155 B total) → per-pic
+      `[1015, 1035, 1035, 1021, 1047]` at qindexes `[32, 32, 33, 32,
+      31]`. CBR total **5153 B vs ideal 5155 B** (0.04% miss; PerPicture
+      total 5035 B at 2.3% under) — CBR carry converges the running
+      stream total to within 2 bytes of `N × target` by spending each
+      picture's undershoot on the next picture's qindex.
+    Other tests pin: parse-code alternation (`0xE8`/`0xEC`/`0xE8`/`0xEC`)
+    matches `encode_hq_intra_multi_stream`; wrapper output is
+    byte-identical to `_report` for both modes; determinism (same input
+    → byte-identical stream); empty frame list yields a valid sh+eos
+    stream that decodes to zero frames; CBR request is monotone
+    non-decreasing across the sequence when every picture undershoots
+    (carry-only-grows contract); generous budget (≥ 2× max q=0 ceiling
+    across all frames) keeps every picture at qindex 0 and reconstructs
+    > 25 dB Y PSNR.
+
 - **VC-2 HQ picture-level rate-control picker** (round-138). The HQ
   analogue of round-131's `pick_ld_picture_qindex`: given a target
   picture-payload byte budget, walk `qindex ∈ params.qindex..=127` and
