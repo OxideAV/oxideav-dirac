@@ -19,7 +19,7 @@ the goal here is to land the bitstream framing and primitives first.
 | Parse Info header (`BBCD` + codes)  | Parse + walk next/previous offsets                            |
 | Parse code taxonomy                 | Sequence-header / end-of-sequence / auxiliary / padding       |
 |                                     | Intra / inter / reference / AC / low-delay predicates         |
-| Bit reader (MSB-first)              | Implemented — `read_bit`, `read_nbits`, `read_uint_lit`       |
+| Bit reader (MSB-first)              | Implemented — `read_bit`, `read_nbits`, `read_uint_lit`. **Round-165**: `read_uint` EOF + 31-iteration cap so a post-EOF interleaved exp-Golomb (all-zero `read_bit`) returns the partial value instead of live-locking — caught by the new fuzz-oracle truncation walk on the sequence-header / core-transform-parameters parsers. |
 | Exp-Golomb (interleaved)            | Unsigned + signed decoders (`read_uint` / `read_sint`)        |
 | Sequence header                     | Parse parameters + base video format + source overrides       |
 | Predefined video formats            | Full table (indices 0-20) with frame size, chroma, range etc. |

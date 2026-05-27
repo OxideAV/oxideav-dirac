@@ -195,17 +195,39 @@ impl<'a, 'b> Funnel<'a, 'b> {
 
     fn read_uintb(&mut self) -> u32 {
         let mut value: u32 = 1;
+        // Cap shift depth at 31 so `value <<= 1` cannot overflow past
+        // `u32::MAX`. A well-formed stream never gets close to this
+        // (Dirac fields are small) but a malformed / truncated buffer
+        // whose every follow bit is 0 would otherwise wrap `value` to
+        // 0 and underflow on `value - 1` (debug panic / release wrap).
+        // The bounded reader's "follow defaults to 1 at EOF" rule
+        // already terminates the loop, but only after bits_left/2
+        // iterations — which can exceed 31 on large slices. Saturate
+        // here for safety.
+        let mut depth = 0u32;
         while self.read_bitb() == 0 {
+            if depth >= 31 {
+                return value.saturating_sub(1);
+            }
             value <<= 1;
             if self.read_bitb() == 1 {
                 value += 1;
             }
+            depth += 1;
         }
         value - 1
     }
 
     fn read_sintb(&mut self) -> i32 {
-        let v = self.read_uintb() as i32;
+        // Clamp the unsigned magnitude to `i32::MAX` so the negate
+        // never overflows. `read_uintb` is already capped at 31
+        // shifts (i.e. value ≤ u32::MAX), but a value of exactly
+        // `i32::MIN as u32 = 0x8000_0000` casts to `i32::MIN` and
+        // `-i32::MIN` overflows. This only happens on adversarial /
+        // truncated input — well-formed Dirac coefficients fit in
+        // a handful of bits.
+        let raw = self.read_uintb().min(i32::MAX as u32);
+        let v = raw as i32;
         if v != 0 && self.read_bitb() == 1 {
             -v
         } else {

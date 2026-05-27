@@ -9,6 +9,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Decoder-side robustness fuzz oracle for malformed VC-2 LD/HQ inputs**
+  (round-165). New `tests/decoder_fuzz_oracle.rs` (14 tests) drives the
+  `DiracDecoder` through a structured corpus of corrupted byte streams
+  and asserts the decoder either decodes (gracefully degraded) or
+  returns a clean `Error::{InvalidData, Unsupported, NeedMore, Eof}` —
+  never panics, never integer-overflows, never livelocks. Coverage:
+  - **Truncation walks** — every 7-byte-step prefix of valid HQ + LD
+    streams (~280 cuts each).
+  - **Single-byte mutation walks** — every 11-byte-step position in a
+    valid HQ + LD stream flipped to `{0x00, 0xFF, !orig}` (~600
+    mutations per profile).
+  - **Pathological gibberish** — empty / all-zero / all-`0xFF` / BBCD-
+    prefix-spam (64 KiB) buffers, the every-parse-code walk (all 256
+    single-byte codes wrapped in a parse-info).
+  - **Oversized parse-info offsets** — `next_parse_offset = u32::MAX`
+    and `0xFFFF_FFF0` (near-wrap), confirming the stream walker's
+    `saturating_add` + fallback-to-byte-search recovery.
+  - **Hand-crafted invalid headers** — unknown `base_video_format`,
+    out-of-range `dwt_depth=99` (rejected by
+    `PictureError::UnsupportedDwtDepth` → `Error::InvalidData`).
+
+### Fixed
+
+- **`BitReader::read_uint` livelock on post-EOF interleaved exp-Golomb**
+  (round-165 fuzz-oracle dependency). When the unbounded `BitReader`
+  walks past end-of-data it returns `0` from `read_bit` forever — a
+  naive `read_uint` would then loop indefinitely (no follow-bit ever
+  becomes `1`). The unbounded reader is called by the sequence-header
+  parser (§10) and core-syntax transform-parameter parser (§11.3.1),
+  both of which would hang on a truncated stream. Added an EOF +
+  31-iteration cap that returns the partial value when either fires.
+  Validated by all 14 fuzz oracle tests passing in <1 s total
+  (without the fix, the HQ truncation walk hangs at cut=14).
+
+- **Bounded exp-Golomb `read_uintb` accumulator overflow** (round-165
+  fuzz-oracle dependency). The `BoundedBitReader::read_uintb` (used
+  inside arithmetic-coded blocks) and the per-picture `Funnel::read_uintb`
+  (used by the §13.5.3 LD and §13.5.4 HQ slice decoders) both shift the
+  exp-Golomb accumulator left without bound. On a well-formed stream the
+  loop terminates in a handful of iterations, but on a truncated /
+  corrupted slice whose every data bit reads as 0 the bounded reader's
+  `bits_left / 2` upper bound is much larger than 31 — `value <<= 1`
+  wraps to 0 and `value - 1` underflows (`attempt to subtract with
+  overflow` in debug). Same 31-iteration cap applied to both, matching
+  the unbounded fix above.
+
+- **Signed exp-Golomb negate-overflow on `i32::MIN`** (round-165
+  fuzz-oracle dependency). `read_sint{,b}` cast the unsigned magnitude
+  to `i32` and then negate when the sign bit follows. A saturated
+  magnitude of exactly `0x8000_0000` cast to `i32::MIN` makes the
+  `-value` step overflow. Clamp to `i32::MAX` before the cast on all
+  three readers (`BitReader::read_sint`, `BoundedBitReader::read_sintb`,
+  `Funnel::read_sintb`).
+
+- **`quant_factor` multiplication overflow on out-of-spec qindex**
+  (round-165 fuzz-oracle dependency). `decode_hq_slice` reads qindex
+  via `read_uint_lit(1)` (8-bit field) without masking to the 7-bit
+  spec range, so a malformed HQ slice can deliver `qindex = 0xFF`.
+  `quant_factor(255)` then walks `1u64 << (255/4) = 1u64 << 63` and
+  `503_829 * (1<<63)` (and the other branch multipliers) overflows u64
+  before the docstring's "saturate at `u32::MAX`" final step can fire.
+  Clamp `q` to 127 (the spec maximum) inside `quant_factor` so the
+  documented "valid for any q ≥ 0" contract holds without forcing every
+  caller to pre-mask the field. Saturation behaviour is preserved for
+  in-spec inputs — q == 127 was already the previous overflow ceiling.
+
 - **VC-2 drain-rate-hysteresis (`VbvHysteresis`) rate-control variant**
   (round-159). Both `HqRateControl` and `LdRateControl` gain a fourth
   variant `VbvHysteresis { buffer_bytes, max_drain_per_picture }`,

@@ -148,20 +148,49 @@ impl<'a> BitReader<'a> {
     ///
     /// The code is a sequence of (follow, data) pairs terminated by a
     /// `1` follow bit. If the first follow bit is `1`, the value is 0.
+    ///
+    /// EOF behaviour (decoder robustness, not part of the spec proper):
+    /// after the reader has walked past end-of-data, `read_bit` returns
+    /// 0 forever. A naive loop on that would never terminate because
+    /// no follow bit would ever be `1`. We additionally bail out once
+    /// `eof` is set OR the accumulator's leading `1` reaches the top
+    /// bit of `u32` (i.e. we've seen 31 follow-zeros and would shift
+    /// the implicit terminator off the value). Both bail-outs return
+    /// the partial value verbatim, which is sufficient for the
+    /// fuzz-oracle property "no panic / no livelock on malformed
+    /// input"; an upstream caller that needs the bit position to fail
+    /// hard should be using [`BoundedBitReader::read_uintb`] inside a
+    /// `Funnel` and the parser will surface `Truncated`.
     pub fn read_uint(&mut self) -> u32 {
         let mut value: u32 = 1;
+        // 31 follow-bit zeros + the implicit leading 1 saturate a
+        // u32. Capping the loop iteration prevents value from
+        // wrapping to 0 (which would re-enable the infinite loop on
+        // any EOF-zero stream) and matches the practical decode
+        // ceiling: every Dirac field is bounded by a handful of bits.
+        let mut depth = 0u32;
         while self.read_bit() == 0 {
+            if self.eof || depth >= 31 {
+                // Past end of buffer with no terminator in sight.
+                // Treat as the all-zero default; callers above use
+                // bounded reads for safety-critical fields.
+                return value.saturating_sub(1);
+            }
             value <<= 1;
             if self.read_bit() == 1 {
                 value += 1;
             }
+            depth += 1;
         }
         value - 1
     }
 
     /// Decode a signed interleaved exp-Golomb value (Annex A.3.3).
     pub fn read_sint(&mut self) -> i32 {
-        let value = self.read_uint() as i32;
+        // See [`BoundedBitReader::read_sintb`] / [`Funnel::read_sintb`]
+        // for the negate-overflow safety rationale.
+        let raw = self.read_uint().min(i32::MAX as u32);
+        let value = raw as i32;
         if value != 0 && self.read_bit() == 1 {
             -value
         } else {
@@ -219,18 +248,38 @@ impl<'a> BoundedBitReader<'a> {
     }
 
     pub fn read_uintb(&mut self) -> u32 {
+        // Same 31-iteration cap as the per-picture `Funnel::read_uintb`:
+        // see picture.rs for the rationale. The bounded-reader's "follow
+        // defaults to 1 at EOF" already guarantees loop termination, but
+        // only after `bits_left / 2` iterations — which on large slice
+        // payloads can exceed 31 and overflow the `value <<= 1`
+        // accumulator. Saturating here matches the spec's intent of
+        // "values are practically small" without changing well-formed
+        // decode (Dirac fields never come within 5 follow-bits of the
+        // cap).
         let mut value: u32 = 1;
+        let mut depth = 0u32;
         while self.read_bitb() == 0 {
+            if depth >= 31 {
+                return value.saturating_sub(1);
+            }
             value <<= 1;
             if self.read_bitb() == 1 {
                 value += 1;
             }
+            depth += 1;
         }
         value - 1
     }
 
     pub fn read_sintb(&mut self) -> i32 {
-        let value = self.read_uintb() as i32;
+        // Clamp to i32::MAX before casting so a saturated `read_uintb`
+        // return of exactly `i32::MIN as u32 = 0x8000_0000` cannot
+        // negate-overflow. See picture.rs:Funnel::read_sintb for the
+        // full rationale — only adversarial / truncated input can
+        // produce a value this large.
+        let raw = self.read_uintb().min(i32::MAX as u32);
+        let value = raw as i32;
         if value != 0 && self.read_bitb() == 1 {
             -value
         } else {

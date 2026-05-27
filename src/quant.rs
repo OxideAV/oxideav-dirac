@@ -36,6 +36,20 @@ use crate::wavelet::WaveletFilter;
 /// clamp. Without it, `q >= 124` (or lower for the `q%4 != 0` branches)
 /// would overflow.
 pub fn quant_factor(q: u32) -> u32 {
+    // The qindex field is 7-bit (§13.5.4 — read as `read_nbits(7)` for LD
+    // or `read_uint_lit(1) & 0x7F` semantically for HQ), so the spec
+    // upper bound is q == 127. A malformed bitstream can deliver q == 255
+    // through the unmasked `read_uint_lit(1)` path (`decode_hq_slice`)
+    // which would walk `1u64 << (255/4) = 1u64 << 63` and then overflow
+    // the per-branch multiplications (e.g. `503_829 * (1<<63)`). Clamp
+    // here so the function honours its "valid for any q ≥ 0" docstring
+    // without needing every caller to pre-validate the field. Clamping
+    // at 127 keeps the saturation behaviour identical for in-spec inputs
+    // and at most produces a `u32::MAX` `qf` for out-of-range qindex
+    // values — which then forward-quantises every coefficient to 0,
+    // exactly the "saturation is behaviour-preserving" property the
+    // docstring relies on.
+    let q = q.min(127);
     let base: u64 = 1u64 << (q / 4);
     let raw = match q % 4 {
         0 => 4 * base,
