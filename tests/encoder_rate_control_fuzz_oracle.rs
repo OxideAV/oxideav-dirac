@@ -77,14 +77,16 @@ use oxideav_dirac::wavelet::WaveletFilter;
 
 /// One 64x64 4:2:0 frame seeded so successive frames differ. Mid-range
 /// luma energy + chroma mid-grey so every variant has measurable cost
-/// to quantise.
+/// to quantise. The amplitude (`& 0x3F`) is intentionally moderate so
+/// that even on a 4x4 slice grid the per-component serialised byte
+/// length at q=0 stays well below the §13.5.2 length-byte ceiling.
 fn frame_64(seed: u32) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     let mut y = vec![0u8; 64 * 64];
     let u = vec![128u8; 32 * 32];
     let v = vec![128u8; 32 * 32];
     for row in 0..64 {
         for col in 0..64 {
-            y[row * 64 + col] = ((((row + col) as u32 * 5) + seed * 11) & 0xFF) as u8;
+            y[row * 64 + col] = 64 + (((((row + col) as u32 * 5) + seed * 11) & 0x3F) as u8);
         }
     }
     (y, u, v)
@@ -168,10 +170,15 @@ fn decode_count(stream: &[u8]) -> usize {
 
 fn hq_default_params() -> EncoderParams {
     let mut p = EncoderParams::default_hq(WaveletFilter::LeGall5_3, 3);
-    // A small 2x2 slice grid keeps each picture under a few KiB so the
-    // sweep stays fast.
-    p.slices_x = 2;
-    p.slices_y = 2;
+    // A 4x4 slice grid (16 slices) on a 64x64 luma gives each slice a
+    // 16x16 region — small enough that even at q=0 the per-component
+    // serialised byte length stays well under the 255 ceiling on the
+    // §13.5.2 single-byte length field, so the sweep does not trip the
+    // documented `length_byte overflow` debug-assert. A larger scaler
+    // would also work, but more slices is closer to what callers
+    // actually use for rate-controlled streams.
+    p.slices_x = 4;
+    p.slices_y = 4;
     p
 }
 
