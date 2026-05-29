@@ -9,6 +9,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Encoder-side rate-control fuzz oracle for VC-2 HQ + LD profiles**
+  (round-179). New `tests/encoder_rate_control_fuzz_oracle.rs` (13
+  tests) exercises the four rate-control variants (`PerPicture`, `Cbr`,
+  `Vbv`, `VbvHysteresis`) on both `encode_hq_sequence_with_size_target`
+  and `encode_ld_sequence_with_size_target` through a Cartesian sweep of
+  `target_bytes ∈ {0, 1, 100, 1_000, 10_000}` × `buffer_bytes ∈ {0, 1,
+  100, 10_000}` × `max_drain_per_picture ∈ {0, 1, 100, 10_000}` —
+  asserting that every combination produces a non-empty stream, every
+  per-picture row's `actual_payload_bytes > 0`, the post-clamp VBV
+  invariant `running_surplus_bytes ≤ buffer_bytes` holds, and the
+  encoded stream round-trips through the `DiracDecoder` to the expected
+  frame count without panic / debug-assert. The encoder-side analogue
+  of round-165's decoder fuzz oracle, covering panic / livelock /
+  integer-overflow classes on the rate-control surface.
+  - Strict-generalisation invariants pinned across pathological-target
+    sweeps: `Vbv { buffer_bytes: 0 }` ≡ `PerPicture` (r146/r149) and
+    `VbvHysteresis { max_drain_per_picture: 0, .. }` ≡ `PerPicture`
+    (r159) and `VbvHysteresis { buffer_bytes: B, max_drain: B }` ≡
+    `Vbv { buffer_bytes: B }` (r159) are each asserted byte-identical
+    on both HQ + LD across `target ∈ {200, 1_000, 10_000}`. A future
+    encoder change that subtly breaks one of these documented
+    degeneracies is caught by the oracle rather than by downstream
+    consumers.
+  - Pathological pixel inputs: all-zero / all-`0xFF` / mid-grey solid
+    luma + single-pixel-pulse frames are each fed through every
+    rate-control variant. Tests that the picker's `qindex ∈ floor..=127`
+    walk handles "no AC energy" (q=0 fits trivially) and "maximally
+    concentrated AC energy" (one coefficient at the extreme,
+    background near-zero) without panic / livelock.
+  - Empty input slice (`frames.len() == 0`) is pinned to produce an
+    empty per-picture report + a non-empty stream containing just the
+    sequence-header / end-of-sequence brackets, for every variant.
+  - Cumulative surplus identity from the r152 documentation
+    (`running_surplus_bytes == (i+1) × target − Σ actual_payload_bytes`)
+    is pinned for `PerPicture` + `Cbr` on a 5-picture run, on both HQ
+    and LD. The r146/r149/r159 VBV variants additionally clamp the
+    accumulator at `buffer_bytes`, asserted by the per-row VBV
+    invariant above.
+
+### Documented
+
+- **LD picture payload bytes are linear in the requested target**
+  (round-179 oracle finding). `ld_picture_payload_bytes(params) ==
+  header_bytes + params.slice_bytes_numer`, and
+  `derive_ld_slice_bytes_for_target` sets `slice_bytes_numer ≈
+  target_picture_bytes − header`, so a `target_bytes = u32::MAX`
+  request to `encode_ld_sequence_with_size_target` allocates a
+  multi-GiB picture buffer per picture and OOMs the test runner before
+  the picker ever returns. This is the documented §13.5.3.2 LD
+  contract — the per-slice budget is fixed-rate and every slice writes
+  its full budget regardless of coefficient energy — not a defect. The
+  fuzz oracle's `target_bytes` sweep caps at 10_000 bytes per picture
+  to keep the test tractable without exercising new code paths.
+
 - **Decoder-side robustness fuzz oracle for malformed VC-2 LD/HQ inputs**
   (round-165). New `tests/decoder_fuzz_oracle.rs` (14 tests) drives the
   `DiracDecoder` through a structured corpus of corrupted byte streams
