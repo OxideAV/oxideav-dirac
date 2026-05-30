@@ -45,6 +45,30 @@ the goal here is to land the bitstream framing and primitives first.
   from the specification pseudocode only. FFmpeg is used solely as an
   opaque oracle to generate test bitstreams.
 
+## Benchmarks
+
+Round 190 adds a Criterion bench suite for the decode / encode /
+roundtrip hot paths. Each bench synthesises a deterministic
+64x64 4:2:0 YUV input via xorshift32 (no committed fixture files; no
+third-party crate / binary in the timed region) and drives the
+production `encode_single_hq_intra_stream` /
+`encode_single_ld_intra_stream` + registry-backed decoder. Throughput
+is reported in input pixels per second.
+
+```
+cargo bench -p oxideav-dirac --bench decode
+cargo bench -p oxideav-dirac --bench encode
+cargo bench -p oxideav-dirac --bench roundtrip
+```
+
+Three scenarios per binary: HQ intra qindex 0 (near-lossless), HQ
+intra qindex 32 (lossy / short slice payloads), LD intra qindex 16
+(fixed-rate, most-timing-stable). The matching IDs across the three
+binaries (`hq_intra_64x64/qindex=0`, `hq_intra_64x64/qindex=32`,
+`ld_intra_64x64/qindex=16`) let future rounds A/B encoder / decoder
+algorithm tweaks against a stable baseline. Pairs with r165's
+decoder fuzz oracle + r179's encoder rate-control fuzz oracle.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

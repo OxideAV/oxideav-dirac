@@ -15,3 +15,33 @@ categories = ["multimedia::encoding", "multimedia::video"]
 
 [dependencies]
 oxideav-core = "0.1"
+
+[dev-dependencies]
+# Round 190 (depth-mode benchmarks): Criterion drives the three bench
+# harnesses (`decode`, `encode`, `roundtrip`) that future encoder /
+# decoder rounds use to A/B their algorithm tweaks (intra DC
+# prediction, codeblock quant-offset walk, slice-bytes derivation,
+# rate-control picker, IDWT inner loop). Pinned to the same 0.5 line
+# every other OxideAV crate with benches (flac, cinepak, tta,
+# magicyuv, h264, pixfmt) already tracks.
+criterion = "0.5"
+
+# Round 190 benches. Each binary lives in `benches/<name>.rs` and is
+# self-contained — every YUV input is synthesised in-bench from a
+# deterministic xorshift seed, then fed through the crate's own
+# production `encode_single_hq_intra_stream` /
+# `encode_single_ld_intra_stream` + registry-backed decoder. No
+# committed fixture files; no third-party crate / binary in the timed
+# region. Run with:
+#     cargo bench -p oxideav-dirac --bench <name>
+[[bench]]
+name = "decode"
+harness = false
+
+[[bench]]
+name = "encode"
+harness = false
+
+[[bench]]
+name = "roundtrip"
+harness = false

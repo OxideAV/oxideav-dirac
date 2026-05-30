@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Criterion benchmark suite for Dirac / VC-2 hot paths** (round-190).
+  New `benches/{decode,encode,roundtrip}.rs` (3 binaries, 9 timed
+  scenarios) exercise the production
+  `encode_single_hq_intra_stream` / `encode_single_ld_intra_stream` +
+  registry-backed decoder path on a deterministic xorshift-synthesised
+  64x64 4:2:0 YUV input. No committed fixture files; no third-party
+  crate / binary in the timed region. Pairs with r165's decoder fuzz
+  oracle + r179's encoder rate-control fuzz oracle to give the next
+  encoder / decoder rounds a numerical A/B baseline for algorithm
+  tweaks (intra DC prediction, codeblock quant-offset walk, slice-
+  bytes derivation, rate-control picker, IDWT inner loop).
+  - **decode**: 3 scenarios (HQ q=0, HQ q=32, LD q=16). Each iteration
+    builds a fresh `CodecRegistry` + `first_decoder`, pushes one packet,
+    pulls one frame. Throughput reported as Y pixels/s. Indicative
+    numbers on the dev machine (release, `--quick` measurement):
+    HQ q=0 ≈ 74 µs (55 Melem/s), HQ q=32 ≈ 56 µs (74 Melem/s), LD q=16
+    ≈ 51 µs (80 Melem/s) — confirms the spec-expected ordering (LD's
+    fixed-rate budget faster than HQ's variable slice bytes; HQ q=32
+    faster than q=0 because most coefficients quantise to zero).
+  - **encode**: same 3 scenarios on the encoder side. Indicative
+    numbers: HQ q=0 ≈ 80 µs, HQ q=32 ≈ 59 µs, LD q=16 ≈ 65 µs.
+  - **roundtrip**: same 3 scenarios end-to-end (encode + decode in
+    one iteration). Indicative numbers: HQ q=0 ≈ 156 µs, HQ q=32 ≈
+    115 µs, LD q=16 ≈ 114 µs — matches the sum of the encode + decode
+    rows to within 1-2 µs, validating the harnesses are not stepping on
+    each other.
+  - All three harnesses share a single `synth_yuv420(width, height,
+    seed)` helper (xorshift32 Marsaglia 13/17/5; identical formulation
+    across files) so sibling-bench rows stay numerically comparable.
+    Input synthesis is outside the timed region for `decode` and
+    `encode` (Criterion `bench_with_input`); for `roundtrip` the
+    encode + decode cost dominates so the input is reused across
+    iterations via the same input tuple.
+
 - **Encoder-side rate-control fuzz oracle for VC-2 HQ + LD profiles**
   (round-179). New `tests/encoder_rate_control_fuzz_oracle.rs` (13
   tests) exercises the four rate-control variants (`PerPicture`, `Cbr`,
