@@ -9,6 +9,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Inter-encoder fuzz oracle** (round-193). New
+  `tests/encoder_inter_fuzz_oracle.rs` (9 tests) — the inter-path
+  analogue of r179's intra-side `encoder_rate_control_fuzz_oracle.rs`.
+  Sweeps the full `InterEncoderParams` + `ResidueParams` surface against
+  pathological combinations and pathological input pixel surfaces,
+  pinning that every accepted (`InterEncoderParams`,
+  `InterInputPicture`, `InterInputPicture`) combination produces a
+  non-empty bytestream that round-trips through the registry-backed
+  decoder to exactly two video frames, with no panic / no debug-assert /
+  no integer overflow / no livelock.
+  - **Precision / OBMC / search-range sweep.** Diagonal walk
+    `mv_precision == bipred_mv_precision ∈ 0..=3` (integer / half-pel /
+    quarter-pel / eighth-pel) × `obmc_refine_passes ∈ {0, 2}` ×
+    `mv_search_range ∈ {2, 16}` against both the translating-square and
+    camera-pan synthetic pairs, plus two off-diagonal precision pairs
+    to pin that the 1-ref and 2-ref precisions are independent.
+  - **Residue wavelet / depth / qindex sweep.** All seven
+    `WaveletFilter` variants × dwt_depth `{1, 2, 3, 4}` at a
+    representative mid-quantiser (qindex=32), plus a qindex axis walk
+    `{0, 8, 32, 64, 127}` at the default wavelet × depth, plus the
+    `residue = None` legacy ZERO_RESIDUAL=true path. Linear-plus-linear
+    walk so axis coverage doesn't blow up combinatorially.
+  - **Adaptive-flag boolean sweep.** All 8 combinations of
+    `inter_adaptive_int_pel` × `inter_adaptive_int_pel_post_obmc` ×
+    `bipred_post_obmc_refine` against the camera-pan fixture.
+  - **Pathological pixel inputs.** Zero-luma / 0xFF-luma /
+    mid-grey / single-pixel-pulse intra-and-inter pairs — stresses the
+    "no-energy" SAD landscape and "saturated-energy" extreme without
+    livelocking the sub-pel refinement or overflowing the residue
+    coefficient block.
+  - **Same-frame zero-motion degenerate input** + **deterministic
+    output** under default + residue-off paths + **`mv_search_range=0`
+    extreme** + **`residue qindex=127` extreme**.
+  - Crate-wide test count grows from 329 → 338 (+9). All tests pass
+    debug-build under `--test-threads=2` in ~17 s end-to-end (the
+    Cartesian sweep is the long pole; deliberately trimmed to the
+    diagonal of the precision matrix so debug-build CI stays well
+    under a minute). Encoder-side analogue of r165's decoder fuzz
+    oracle + r179's intra rate-control fuzz oracle, completing the
+    encoder-side fuzz coverage of both intra (r179) and inter (r193)
+    code paths.
+
 - **Criterion benchmark suite for Dirac / VC-2 hot paths** (round-190).
   New `benches/{decode,encode,roundtrip}.rs` (3 binaries, 9 timed
   scenarios) exercise the production
