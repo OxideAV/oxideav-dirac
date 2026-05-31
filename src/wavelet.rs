@@ -310,6 +310,21 @@ pub fn one_d_synthesis(a: &mut [i32], filter: WaveletFilter) {
 /// `SubbandData` whose width / height are exactly doubled. The lifting
 /// runs first down every column, then across every row. Finally, if
 /// `filter_shift() > 0`, the entire array is rounded and right-shifted.
+///
+/// Round 195 profile-driven optimisation: the body is rewritten to drive
+/// the row-major backing `Vec<i32>` directly instead of going through
+/// `SubbandData::{get,set}`. The interleave loop pre-slices the input
+/// rows once per output row-pair, eliminating four bounds-checks per
+/// output sample. The vertical lifting pass uses a scratch buffer so the
+/// `one_d_synthesis` inner loop sees a contiguous slice — but the
+/// row-major scatter back into `synth.data` is now a tight indexed write
+/// instead of a per-element `set()` call. The post-shift fold collapses
+/// into a single `data` iter. Decoder hot path (the `idwt` driver runs
+/// this `dwt_depth` times per picture, per component) and encoder hot
+/// path (`encode_*_intra_stream` runs the matching `vh_analysis`).
+/// Comprehensive bit-exactness is guarded by the seven-filter ×
+/// depth-{1,2,3} `dwt_idwt_roundtrip_all_filters_all_depths` test that
+/// already lives in this module.
 pub fn vh_synth(
     ll: &SubbandData,
     hl: &SubbandData,
@@ -328,27 +343,51 @@ pub fn vh_synth(
     let out_w = 2 * w;
     let out_h = 2 * h;
     let mut synth = SubbandData::new(out_w, out_h);
-    // Step 2: interleave.
-    for y in 0..h {
-        for x in 0..w {
-            synth.set(2 * y, 2 * x, ll.get(y, x));
-            synth.set(2 * y, 2 * x + 1, hl.get(y, x));
-            synth.set(2 * y + 1, 2 * x, lh.get(y, x));
-            synth.set(2 * y + 1, 2 * x + 1, hh.get(y, x));
+    // Step 2: interleave. Drive the row-major backing slices directly
+    // so the compiler can elide the per-element bounds checks `set()`
+    // would issue.
+    {
+        let dst = &mut synth.data[..];
+        let ll_d = &ll.data[..];
+        let hl_d = &hl.data[..];
+        let lh_d = &lh.data[..];
+        let hh_d = &hh.data[..];
+        for y in 0..h {
+            let in_off = y * w;
+            let out_off = (2 * y) * out_w;
+            let ll_row = &ll_d[in_off..in_off + w];
+            let hl_row = &hl_d[in_off..in_off + w];
+            let lh_row = &lh_d[in_off..in_off + w];
+            let hh_row = &hh_d[in_off..in_off + w];
+            let two_rows = &mut dst[out_off..out_off + 2 * out_w];
+            let (dst_even, dst_odd) = two_rows.split_at_mut(out_w);
+            for x in 0..w {
+                dst_even[2 * x] = ll_row[x];
+                dst_even[2 * x + 1] = hl_row[x];
+                dst_odd[2 * x] = lh_row[x];
+                dst_odd[2 * x + 1] = hh_row[x];
+            }
         }
     }
     // Step 3a: vertical synthesis — one lifting pass per column.
+    // `col_buf` is reused across columns. Gather / scatter use indexed
+    // raw access into `synth.data` so the compiler sees the
+    // monotonic-stride pattern.
     let mut col_buf = vec![0i32; out_h];
-    for x in 0..out_w {
-        for y in 0..out_h {
-            col_buf[y] = synth.get(y, x);
-        }
-        one_d_synthesis(&mut col_buf, filter);
-        for y in 0..out_h {
-            synth.set(y, x, col_buf[y]);
+    {
+        let data = &mut synth.data[..];
+        for x in 0..out_w {
+            for y in 0..out_h {
+                col_buf[y] = data[y * out_w + x];
+            }
+            one_d_synthesis(&mut col_buf, filter);
+            for y in 0..out_h {
+                data[y * out_w + x] = col_buf[y];
+            }
         }
     }
-    // Step 3b: horizontal synthesis — one lifting pass per row.
+    // Step 3b: horizontal synthesis — one lifting pass per row, in
+    // place on a contiguous slice (already optimal).
     for y in 0..out_h {
         let row = synth.row_mut(y);
         one_d_synthesis(row, filter);
@@ -493,35 +532,58 @@ pub fn vh_analysis(
             *v = v.wrapping_shl(shift);
         }
     }
-    // Step 2: horizontal analysis.
+    // Step 2: horizontal analysis (in place on contiguous rows).
     for y in 0..out_h {
         let row = work.row_mut(y);
         one_d_analysis(row, filter);
     }
-    // Step 3: vertical analysis.
+    // Step 3: vertical analysis. Round 195 profile-driven optimisation:
+    // gather / scatter use indexed raw access into `work.data` instead
+    // of `get` / `set` so the bounds-check elision applies.
     let mut col_buf = vec![0i32; out_h];
-    for x in 0..out_w {
-        for y in 0..out_h {
-            col_buf[y] = work.get(y, x);
-        }
-        one_d_analysis(&mut col_buf, filter);
-        for y in 0..out_h {
-            work.set(y, x, col_buf[y]);
+    {
+        let data = &mut work.data[..];
+        for x in 0..out_w {
+            for y in 0..out_h {
+                col_buf[y] = data[y * out_w + x];
+            }
+            one_d_analysis(&mut col_buf, filter);
+            for y in 0..out_h {
+                data[y * out_w + x] = col_buf[y];
+            }
         }
     }
-    // Step 4: de-interleave.
+    // Step 4: de-interleave. Round 195 profile-driven optimisation:
+    // pre-slice the source two rows + four destination rows once per
+    // output-row index, dropping the four bounds-checked `get` +
+    // four `set` calls per output sample.
     let half_w = out_w / 2;
     let half_h = out_h / 2;
     let mut ll = SubbandData::new(half_w, half_h);
     let mut hl = SubbandData::new(half_w, half_h);
     let mut lh = SubbandData::new(half_w, half_h);
     let mut hh = SubbandData::new(half_w, half_h);
-    for y in 0..half_h {
-        for x in 0..half_w {
-            ll.set(y, x, work.get(2 * y, 2 * x));
-            hl.set(y, x, work.get(2 * y, 2 * x + 1));
-            lh.set(y, x, work.get(2 * y + 1, 2 * x));
-            hh.set(y, x, work.get(2 * y + 1, 2 * x + 1));
+    {
+        let src = &work.data[..];
+        let ll_d = &mut ll.data[..];
+        let hl_d = &mut hl.data[..];
+        let lh_d = &mut lh.data[..];
+        let hh_d = &mut hh.data[..];
+        for y in 0..half_h {
+            let src_off = (2 * y) * out_w;
+            let two_rows = &src[src_off..src_off + 2 * out_w];
+            let (src_even, src_odd) = two_rows.split_at(out_w);
+            let dst_off = y * half_w;
+            let ll_row = &mut ll_d[dst_off..dst_off + half_w];
+            let hl_row = &mut hl_d[dst_off..dst_off + half_w];
+            let lh_row = &mut lh_d[dst_off..dst_off + half_w];
+            let hh_row = &mut hh_d[dst_off..dst_off + half_w];
+            for x in 0..half_w {
+                ll_row[x] = src_even[2 * x];
+                hl_row[x] = src_even[2 * x + 1];
+                lh_row[x] = src_odd[2 * x];
+                hh_row[x] = src_odd[2 * x + 1];
+            }
         }
     }
     (ll, hl, lh, hh)

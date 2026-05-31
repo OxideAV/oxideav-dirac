@@ -16,6 +16,14 @@
 //! iteration) so the runs compare meaningfully across resolutions and
 //! against the matching `decode.rs` rows.
 //!
+//! Round 195 (depth-mode benchmarks, follow-up): adds a fourth row
+//! mirroring the matching `decode.rs` extension — HQ q=0 with the
+//! DD9/7 wavelet (`wavelet_index = 0`, Dirac's default), so the
+//! encoder-side forward-DWT cost gets the same wavelet-variant
+//! coverage the decoder bench now has. The forward DWT (`vh_analysis`)
+//! shares the same lifting kernel as the inverse `vh_synth`, so any
+//! IDWT-targeted micro-tuning shows up here too.
+//!
 //! Scenarios:
 //!
 //!   - **encode_hq_intra_64x64_q0**: 64x64 4:2:0 HQ intra at qindex 0
@@ -30,6 +38,10 @@
 //!     16. LD's fixed-rate slice budget makes the per-slice path
 //!     length independent of energy — the most timing-stable row
 //!     for A/B comparisons of LD-specific work.
+//!   - **encode_hq_intra_64x64_q0_dd9_7** (round-195): 64x64 4:2:0 HQ
+//!     intra at qindex 0 using the **DD9/7** wavelet
+//!     (`wavelet_index = 0`, Dirac's default). Forward-DWT-heavy
+//!     companion to `encode_hq_intra_64x64_q0`.
 //!
 //! Run with:
 //!     cargo bench -p oxideav-dirac --bench encode
@@ -135,12 +147,29 @@ fn bench_encode(c: &mut Criterion) {
     let seq_ld = make_minimal_sequence_ld(64, 64, ChromaFormat::Yuv420);
     let mut params_ld_q16 = LdEncoderParams::default_ld(WaveletFilter::LeGall5_3, 3, 4, 4, 64);
     params_ld_q16.qindex = 16;
+    let (y_ld, u_ld, v_ld) = synth_yuv420(64, 64, 0xDEAD_BEEF);
     g.bench_with_input(
         BenchmarkId::new("ld_intra_64x64", "qindex=16"),
-        &(seq_ld, params_ld_q16, y, u, v),
+        &(seq_ld, params_ld_q16, y_ld, u_ld, v_ld),
         |b, (seq, params, y, u, v): &(SequenceHeader, LdEncoderParams, Vec<u8>, Vec<u8>, Vec<u8>)| {
             b.iter(|| {
                 let s = encode_single_ld_intra_stream(seq, params, 0, y, u, v);
+                std::hint::black_box(s.len());
+            })
+        },
+    );
+
+    // HQ encoder, qindex 0, DD9/7 wavelet (round-195). Forward-DWT
+    // companion to the matching `decode.rs` row.
+    let (y_dd, u_dd, v_dd) = synth_yuv420(64, 64, 0xDEAD_BEEF);
+    let mut params_hq_q0_dd = EncoderParams::default_hq(WaveletFilter::DeslauriersDubuc9_7, 3);
+    params_hq_q0_dd.qindex = 0;
+    g.bench_with_input(
+        BenchmarkId::new("hq_intra_64x64", "qindex=0/wavelet=dd9_7"),
+        &(seq_hq.clone(), params_hq_q0_dd, y_dd, u_dd, v_dd),
+        |b, (seq, params, y, u, v): &(SequenceHeader, EncoderParams, Vec<u8>, Vec<u8>, Vec<u8>)| {
+            b.iter(|| {
+                let s = encode_single_hq_intra_stream(seq, params, 0, y, u, v);
                 std::hint::black_box(s.len());
             })
         },

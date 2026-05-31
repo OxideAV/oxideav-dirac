@@ -88,6 +88,21 @@ binaries (`hq_intra_64x64/qindex=0`, `hq_intra_64x64/qindex=32`,
 algorithm tweaks against a stable baseline. Pairs with r165's
 decoder fuzz oracle + r179's encoder rate-control fuzz oracle.
 
+Round 195 extends each binary with a fourth scenario covering the
+**DD9/7** wavelet (`hq_intra_64x64/qindex=0/wavelet=dd9_7`) — Dirac's
+default filter (`wavelet_index = 0`), which the original three rows
+omitted in favour of LeGall 5/3 only. DD9/7's second lifting step is
+4-tap vs. LeGall's 2-tap, so this row's IDWT / forward-DWT cost is the
+dominant per-frame work and is the right A/B fixture for future
+profile-driven `vh_synth` / `vh_analysis` tweaks. Same round also
+re-shapes `vh_synth` / `vh_analysis` to drive their row-major backing
+slice directly (interleave + de-interleave drop their per-element
+`SubbandData::set` calls; vertical-pass gather / scatter use raw
+indexing into `data` so bounds-check elision applies). All 14 wavelet
+unit tests + the 7-filter × depth-{1,2,3} roundtrip test + all ffmpeg
+cross-decode interop tests stay green; decode q=32 row improved
+~1.15% (`p < 0.05`), other rows within noise — bit-exactness preserved.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

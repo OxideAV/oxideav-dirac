@@ -9,6 +9,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **DD9/7 wavelet bench coverage** (round-195). All three Criterion bench
+  harnesses (`decode`, `encode`, `roundtrip`) grow a fourth scenario,
+  `hq_intra_64x64/qindex=0/wavelet=dd9_7`, covering the
+  Deslauriers-Dubuc 9/7 wavelet (`wavelet_index = 0`) — Dirac's *default*
+  filter, which the original r190 rows omitted in favour of LeGall 5/3
+  only. DD9/7's second lifting step is 4-tap vs. LeGall's 2-tap, so this
+  row's IDWT / forward-DWT cost is the dominant per-frame work and is the
+  right A/B fixture for future profile-driven wavelet tweaks.
+  - Bench harness: 9 → 12 timed scenarios (4 per binary).
+  - Measured (M2, --measurement-time 3): decode dd9_7 row at
+    80.7 µs / frame (50.7 Melem/s) vs. 73.2 µs / 56.0 Melem/s for the
+    LeGall companion at the same `qindex=0` setting (~10% heavier
+    inverse-DWT kernel as expected); encode dd9_7 row at 85.0 µs vs.
+    78.3 µs LeGall (~9% heavier); roundtrip dd9_7 at 166.0 µs vs.
+    148.0 µs LeGall (~12% heavier joint cost).
+
+### Changed
+
+- **IDWT / forward-DWT row-major slice driving** (round-195).
+  `wavelet::vh_synth` and `wavelet::vh_analysis` are rewritten to drive
+  the row-major backing `Vec<i32>` directly instead of going through
+  `SubbandData::{get, set}`:
+  - Interleave / de-interleave loops pre-slice the source two rows + four
+    destination rows (or the four input subband rows + two destination
+    rows for `vh_synth`) once per output row-pair, eliminating the four
+    bounds-checked `set` / `get` calls per output sample.
+  - Vertical lifting pass keeps the `col_buf` scratch buffer reuse but
+    gathers / scatters via raw indexing into the underlying `data` slice
+    so the compiler's bounds-check elision applies.
+  - Horizontal lifting pass and the step-4 accuracy-bit shift fold were
+    already optimal (`row_mut` slice + single `data.iter_mut()`).
+  - Bit-exactness preserved: all 14 wavelet unit tests pass, including
+    the 7-filter × depth-{1,2,3} `dwt_idwt_roundtrip_all_filters_all_depths`
+    invariant and the all-filter ffmpeg cross-decode interop tests
+    (Dirac-default DD9/7, LeGall 5/3, DD13/7, Haar0/1, Fidelity,
+    Daubechies 9/7). Crate-wide test count unchanged at 338, all green.
+  - Measured (M2, --measurement-time 3, criterion 100-sample baseline
+    re-set per round): decode q=32 row -1.15% (p < 0.05 — statistically
+    significant); decode q=0, decode ld q=16, encode/roundtrip rows
+    within noise. The optimisation is small in absolute terms because
+    at 64x64 with `dwt_depth = 3` the IDWT is co-dominant with the
+    entropy-coder path; future rounds running the new DD9/7 row (where
+    the IDWT *is* the dominant cost) will surface bigger deltas from
+    follow-on wavelet-loop tuning.
+
+### Added
+
 - **Inter-encoder fuzz oracle** (round-193). New
   `tests/encoder_inter_fuzz_oracle.rs` (9 tests) — the inter-path
   analogue of r179's intra-side `encoder_rate_control_fuzz_oracle.rs`.

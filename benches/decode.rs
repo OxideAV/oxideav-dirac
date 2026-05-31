@@ -15,6 +15,17 @@
 //! prediction, codeblock quant-offset walk, slice-bytes derivation,
 //! rate-control picker).
 //!
+//! Round 195 (depth-mode benchmarks, follow-up): the original three
+//! decoder rows covered only LeGall 5/3 (`wavelet_index = 1`). This
+//! round adds a fourth row covering Deslauriers-Dubuc 9/7
+//! (`wavelet_index = 0`) — the Dirac *default* filter — at HQ q=0.
+//! DD9/7 has a 4-tap second lifting step (vs. LeGall's 2-tap), so its
+//! per-row lifting cost in the IDWT is ~2x LeGall's. Adding this row
+//! makes the bench harness sensitive to wavelet-specific work the
+//! LeGall-only rows wouldn't catch, and gives future profile-driven
+//! IDWT tweaks a fixture where the lifting cost is the dominant
+//! per-frame work rather than co-dominant with the entropy-coder path.
+//!
 //! Each scenario synthesises a deterministic YUV input plane via an
 //! xorshift32 PRNG, encodes it **once** in a Criterion setup step with
 //! the production `oxideav_dirac::encoder::encode_single_*_intra_stream`
@@ -43,6 +54,11 @@
 //!     regardless of energy so this row's timing is the most stable
 //!     of the three under PRNG-seed variation — useful as the
 //!     comparison baseline when adding new LD-specific work.
+//!   - **decode_hq_intra_64x64_q0_dd9_7** (round-195): 64x64 4:2:0 HQ
+//!     intra at qindex 0 using the **DD9/7** wavelet
+//!     (`wavelet_index = 0`, Dirac's default). Same fixture as the
+//!     `qindex=0` row above but with a heavier lifting kernel — the
+//!     IDWT inner-loop cost is the differentiator.
 //!
 //! Run with:
 //!     cargo bench -p oxideav-dirac --bench decode
@@ -93,11 +109,25 @@ fn synth_yuv420(width: usize, height: usize, seed: u32) -> (Vec<u8>, Vec<u8>, Ve
 }
 
 /// Construct a HQ intra stream for `(width, height)` 4:2:0 at the
-/// given qindex. Encoder work happens here — *outside* the bench
-/// closure.
+/// given qindex with the LeGall 5/3 wavelet. Encoder work happens here
+/// — *outside* the bench closure.
 fn build_hq_stream(width: u32, height: u32, qindex: u32, seed: u32) -> Vec<u8> {
+    build_hq_stream_with_wavelet(width, height, qindex, seed, WaveletFilter::LeGall5_3)
+}
+
+/// Construct a HQ intra stream for `(width, height)` 4:2:0 at the
+/// given qindex with `wavelet`. Round 195 adds the wavelet parameter so
+/// the `decode_hq_intra_64x64_q0_dd9_7` row can swap in DD9/7 without
+/// duplicating the rest of the encode harness.
+fn build_hq_stream_with_wavelet(
+    width: u32,
+    height: u32,
+    qindex: u32,
+    seed: u32,
+    wavelet: WaveletFilter,
+) -> Vec<u8> {
     let seq = make_minimal_sequence(width, height, ChromaFormat::Yuv420);
-    let mut params = EncoderParams::default_hq(WaveletFilter::LeGall5_3, 3);
+    let mut params = EncoderParams::default_hq(wavelet, 3);
     params.qindex = qindex;
     let (y, u, v) = synth_yuv420(width as usize, height as usize, seed);
     encode_single_hq_intra_stream(&seq, &params, 0, &y, &u, &v)
@@ -167,6 +197,17 @@ fn bench_decode(c: &mut Criterion) {
     g.bench_with_input(
         BenchmarkId::new("ld_intra_64x64", "qindex=16"),
         &ld_q16,
+        |b, s| b.iter(|| decode_one_iteration(s)),
+    );
+
+    // HQ q=0 with the DD9/7 wavelet (Dirac default; `wavelet_index = 0`).
+    // Heavier lifting kernel than LeGall (4-tap second step vs. 2-tap)
+    // makes the IDWT inner loop the dominant per-frame cost.
+    let hq_q0_dd9_7 =
+        build_hq_stream_with_wavelet(64, 64, 0, 0xDEAD_BEEF, WaveletFilter::DeslauriersDubuc9_7);
+    g.bench_with_input(
+        BenchmarkId::new("hq_intra_64x64", "qindex=0/wavelet=dd9_7"),
+        &hq_q0_dd9_7,
         |b, s| b.iter(|| decode_one_iteration(s)),
     );
 

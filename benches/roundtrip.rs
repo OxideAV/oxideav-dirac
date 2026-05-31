@@ -19,6 +19,13 @@
 //! iteration). One roundtrip == one input frame encoded and decoded
 //! end-to-end.
 //!
+//! Round 195 (depth-mode benchmarks, follow-up): adds the
+//! `roundtrip_hq_intra_64x64_q0_dd9_7` row so the joint encode +
+//! decode cost of the DD9/7 wavelet — Dirac's *default* — has the
+//! same first-class roundtrip coverage the LeGall 5/3 path already
+//! has. Any IDWT-shared optimisation moves both `encode.rs`'s and
+//! `decode.rs`'s matching rows; this row exposes the sum.
+//!
 //! Scenarios:
 //!
 //!   - **roundtrip_hq_intra_64x64_q0**: 64x64 4:2:0 HQ intra at qindex
@@ -33,6 +40,10 @@
 //!     qindex 16, 4x4 slices, 64 B/slice. LD's fixed-rate budget
 //!     makes the roundtrip timing the most stable of the three under
 //!     PRNG-seed variation.
+//!   - **roundtrip_hq_intra_64x64_q0_dd9_7** (round-195): 64x64 4:2:0
+//!     HQ intra at qindex 0 using the **DD9/7** wavelet
+//!     (`wavelet_index = 0`, Dirac's default). Joint encode + decode
+//!     cost of the heavier lifting kernel.
 //!
 //! Run with:
 //!     cargo bench -p oxideav-dirac --bench roundtrip
@@ -154,7 +165,7 @@ fn bench_roundtrip(c: &mut Criterion) {
     params_ld_q16.qindex = 16;
     g.bench_with_input(
         BenchmarkId::new("ld_intra_64x64", "qindex=16"),
-        &(seq_ld, params_ld_q16, y, u, v),
+        &(seq_ld, params_ld_q16, y.clone(), u.clone(), v.clone()),
         |b,
          (seq, params, y, u, v): &(
             SequenceHeader,
@@ -163,6 +174,17 @@ fn bench_roundtrip(c: &mut Criterion) {
             Vec<u8>,
             Vec<u8>,
         )| { b.iter(|| roundtrip_ld_once(seq, params, y, u, v)) },
+    );
+
+    // Round 195: HQ q=0 with DD9/7 wavelet (Dirac default).
+    let mut params_hq_q0_dd = EncoderParams::default_hq(WaveletFilter::DeslauriersDubuc9_7, 3);
+    params_hq_q0_dd.qindex = 0;
+    g.bench_with_input(
+        BenchmarkId::new("hq_intra_64x64", "qindex=0/wavelet=dd9_7"),
+        &(seq_hq.clone(), params_hq_q0_dd, y, u, v),
+        |b, (seq, params, y, u, v): &(SequenceHeader, EncoderParams, Vec<u8>, Vec<u8>, Vec<u8>)| {
+            b.iter(|| roundtrip_hq_once(seq, params, y, u, v))
+        },
     );
 
     g.finish();
