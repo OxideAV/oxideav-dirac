@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **VC-2 v3 `extended_transform_parameters()` parser** (round-201).
+  `picture::parse_transform_parameters` previously aborted with
+  `PictureError::ExtendedTransformParams` as soon as it saw a
+  `major_version >= 3` sequence header, regardless of whether the v3
+  stream actually used any v3-only feature. The new
+  `parse_extended_transform_parameters` helper implements the SMPTE ST
+  2042-1:2022 §12.4.4 pseudocode bit-for-bit: two boolean flags
+  (`asym_transform_index_flag`, `asym_transform_flag`), each gating an
+  interleaved-exp-Golomb field (`wavelet_index_ho`, `dwt_depth_ho`)
+  with defaults inherited from the enclosing `transform_parameters`
+  (§12.4.4.2: defaults to `wavelet_index`; §12.4.4.3: defaults to 0).
+  v3 streams that reduce to the symmetric default — per the §12.4.4
+  NOTE, "If `state[dwt_depth_ho]` is 0 and `state[wavelet_index_ho]`
+  is `state[wavelet_index]` then the inverse wavelet transform
+  process (see 13.2) is identical to that defined in earlier versions
+  of this specification" — now decode cleanly. Genuinely asymmetric
+  v3 streams are rejected with the new, more specific
+  `PictureError::AsymmetricTransformUnsupported { wavelet_index_ho,
+  dwt_depth_ho }` carrying the parsed values for diagnostics. The
+  `dwt_depth_ho > 6` ceiling is also enforced (same IDWT-pyramid
+  bound as `dwt_depth`). 5 new unit tests pin each bit-level pattern
+  (both-flags-off / index-only / depth-only / both-on / over-cap).
+  Crate-wide test count: 160 → 165 (+5) in `picture::tests`.
+
 - **DD9/7 wavelet bench coverage** (round-195). All three Criterion bench
   harnesses (`decode`, `encode`, `roundtrip`) grow a fourth scenario,
   `hq_intra_64x64/qindex=0/wavelet=dd9_7`, covering the

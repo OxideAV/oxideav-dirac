@@ -21,7 +21,7 @@ the goal here is to land the bitstream framing and primitives first.
 |                                     | Intra / inter / reference / AC / low-delay predicates         |
 | Bit reader (MSB-first)              | Implemented — `read_bit`, `read_nbits`, `read_uint_lit`. **Round-165**: `read_uint` EOF + 31-iteration cap so a post-EOF interleaved exp-Golomb (all-zero `read_bit`) returns the partial value instead of live-locking — caught by the new fuzz-oracle truncation walk on the sequence-header / core-transform-parameters parsers. |
 | Exp-Golomb (interleaved)            | Unsigned + signed decoders (`read_uint` / `read_sint`)        |
-| Sequence header                     | Parse parameters + base video format + source overrides       |
+| Sequence header                     | Parse parameters + base video format + source overrides. **Round-201**: SMPTE ST 2042-1:2022 §12.4.4 `extended_transform_parameters()` parser — `asym_transform_index_flag` / `wavelet_index_ho` + `asym_transform_flag` / `dwt_depth_ho`, defaults per §12.4.4.2 / .3 (`wavelet_index_ho = wavelet_index`, `dwt_depth_ho = 0`). v3 streams that reduce to the symmetric default (per the §12.4.4 NOTE: IDWT is identical to v2 when both stay at their defaults) now decode; genuinely asymmetric v3 streams surface the new `AsymmetricTransformUnsupported { wavelet_index_ho, dwt_depth_ho }` instead of the old blanket `ExtendedTransformParams`. |
 | Predefined video formats            | Full table (indices 0-20) with frame size, chroma, range etc. |
 | Arithmetic decoder                  | Binary multi-context engine + probability LUT (Annex B)       |
 | Wavelet transforms                  | Inverse DWT (all 7 filters) + §13.3 intra DC prediction wired |

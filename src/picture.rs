@@ -100,9 +100,17 @@ pub enum PictureError {
     UnknownWaveletIndex(u32),
     UnsupportedDwtDepth(u32),
     ZeroSliceBytes,
-    /// Extended transform parameters (version 3) aren't implemented —
-    /// the fixture uses v2 so this never trips in practice.
-    ExtendedTransformParams,
+    /// Stream declares `major_version >= 3` and the
+    /// `extended_transform_parameters()` block (§12.4.4) selects an
+    /// asymmetric (horizontal-only) wavelet transform that this
+    /// decoder does not yet implement. `wavelet_index_ho` is the
+    /// horizontal-only filter index and `dwt_depth_ho` the extra
+    /// horizontal-only depth (at least one of which must be
+    /// non-default for the rejection to fire — see §12.4.4.2 / .3).
+    AsymmetricTransformUnsupported {
+        wavelet_index_ho: u32,
+        dwt_depth_ho: u32,
+    },
     /// Slice data wider than its declared byte length.
     SliceOverflow,
     /// Inter picture referenced a picture number not in the reference
@@ -123,9 +131,13 @@ impl core::fmt::Display for PictureError {
             Self::UnknownWaveletIndex(i) => write!(f, "unknown wavelet index {i}"),
             Self::UnsupportedDwtDepth(d) => write!(f, "DWT depth {d} not supported"),
             Self::ZeroSliceBytes => write!(f, "slice byte size evaluates to zero"),
-            Self::ExtendedTransformParams => {
-                write!(f, "extended transform parameters (v3) not implemented")
-            }
+            Self::AsymmetricTransformUnsupported {
+                wavelet_index_ho,
+                dwt_depth_ho,
+            } => write!(
+                f,
+                "v3 asymmetric transform unsupported (wavelet_index_ho={wavelet_index_ho}, dwt_depth_ho={dwt_depth_ho})"
+            ),
             Self::SliceOverflow => write!(f, "slice data overflows declared length"),
             Self::MissingReference(n) => {
                 write!(f, "inter picture references missing picture number {n}")
@@ -726,6 +738,53 @@ fn mc_one(
     crate::obmc::motion_compensate(pic, &params, motion, Some(ref1), ref2);
 }
 
+/// Parsed §12.4.4 `extended_transform_parameters()` result. Defaults
+/// (set by §12.4 just before the call) are `wavelet_index_ho =
+/// wavelet_index` and `dwt_depth_ho = 0`; only the flag-gated reads
+/// may override them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExtendedTransformParameters {
+    pub wavelet_index_ho: u32,
+    pub dwt_depth_ho: u32,
+}
+
+/// §12.4.4 `extended_transform_parameters()`. Reads two boolean
+/// flags, each gating an `interleaved exp-Golomb` field. Defaults
+/// per §12.4.4.2 / §12.4.4.3 are inherited from the enclosing
+/// `transform_parameters` call (`wavelet_index_ho` defaults to the
+/// already-decoded `wavelet_index`; `dwt_depth_ho` defaults to 0).
+///
+/// Only the syntax is implemented here — the caller decides whether
+/// the (possibly non-default) values are usable. The parser must
+/// always run on a v3 stream so that subsequent bits (slice
+/// parameters, quant matrix) are correctly aligned.
+pub(crate) fn parse_extended_transform_parameters(
+    r: &mut BitReader<'_>,
+    wavelet_index_default: u32,
+) -> Result<ExtendedTransformParameters, PictureError> {
+    let mut wavelet_index_ho = wavelet_index_default;
+    let mut dwt_depth_ho: u32 = 0;
+    let asym_transform_index_flag = r.read_bool();
+    if asym_transform_index_flag {
+        wavelet_index_ho = r.read_uint();
+    }
+    let asym_transform_flag = r.read_bool();
+    if asym_transform_flag {
+        dwt_depth_ho = r.read_uint();
+        // §12.4.4.3 bounds: `dwt_depth_ho` shares the same physical
+        // ceiling as `dwt_depth` (the IDWT pyramid cannot exceed six
+        // total levels in our implementation). Reject anything that
+        // would walk us off the array of subbands.
+        if dwt_depth_ho > 6 {
+            return Err(PictureError::UnsupportedDwtDepth(dwt_depth_ho));
+        }
+    }
+    Ok(ExtendedTransformParameters {
+        wavelet_index_ho,
+        dwt_depth_ho,
+    })
+}
+
 /// §12.4 `transform_parameters`.
 fn parse_transform_parameters(
     r: &mut BitReader<'_>,
@@ -740,8 +799,25 @@ fn parse_transform_parameters(
         return Err(PictureError::UnsupportedDwtDepth(dwt_depth));
     }
     if major_version >= 3 {
-        // §12.4.4 extended_transform_parameters. Not used by our fixture.
-        return Err(PictureError::ExtendedTransformParams);
+        // §12.4.4 `extended_transform_parameters()`. The block can
+        // optionally select a horizontal-only wavelet filter and an
+        // extra horizontal-only DWT depth. We parse the syntax
+        // unconditionally so that subsequent fields are bit-aligned,
+        // but only accept v3 streams whose extended parameters reduce
+        // to the symmetric default (§12.4.4 NOTE: "If
+        // state[dwt_depth_ho] is 0 and state[wavelet_index_ho] is
+        // state[wavelet_index] then the inverse wavelet transform
+        // process (see 13.2) is identical to that defined in earlier
+        // versions of this specification"). A genuinely asymmetric
+        // transform is rejected with `AsymmetricTransformUnsupported`
+        // carrying the parsed values for diagnostics.
+        let ext = parse_extended_transform_parameters(r, w_idx)?;
+        if ext.wavelet_index_ho != w_idx || ext.dwt_depth_ho != 0 {
+            return Err(PictureError::AsymmetricTransformUnsupported {
+                wavelet_index_ho: ext.wavelet_index_ho,
+                dwt_depth_ho: ext.dwt_depth_ho,
+            });
+        }
     }
 
     // §12.4.5.2 slice_parameters.
@@ -1228,5 +1304,107 @@ mod tests {
         sd.set(0, 3, 300);
         let out = trim_clip_offset(&sd, 4, 1, 8);
         assert_eq!(&out, &[0, 128, 228, 255]);
+    }
+
+    // ---------------------------------------------------------------
+    // §12.4.4 extended_transform_parameters tests
+    //
+    // Bit stream layout per the VC-2 pseudocode (one `read_bool` per
+    // flag, one interleaved-exp-Golomb `read_uint` per gated field).
+    // Bits are packed MSB-first within a byte; we wrap the byte
+    // payload in a fresh BitReader for each case.
+    // ---------------------------------------------------------------
+
+    fn parse_ext(
+        default_widx: u32,
+        bytes: &[u8],
+    ) -> Result<ExtendedTransformParameters, PictureError> {
+        let mut r = BitReader::new(bytes);
+        parse_extended_transform_parameters(&mut r, default_widx)
+    }
+
+    /// Both flags zero → defaults survive: `wavelet_index_ho` =
+    /// `wavelet_index`, `dwt_depth_ho` = 0. Exactly two flag bits are
+    /// consumed.
+    #[test]
+    fn extended_transform_parameters_both_flags_off() {
+        // Byte 0b00xxxxxx — two leading 0 bits, rest is padding the
+        // caller never looks at.
+        let parsed = parse_ext(2, &[0b0000_0000]).unwrap();
+        assert_eq!(
+            parsed,
+            ExtendedTransformParameters {
+                wavelet_index_ho: 2,
+                dwt_depth_ho: 0,
+            }
+        );
+    }
+
+    /// `asym_transform_index_flag = 1` overrides `wavelet_index_ho`.
+    /// The follow `read_uint()` of value 5 is the five-bit interleaved
+    /// exp-Golomb code `0 1 0 0 1` (follow/data/follow/data/term);
+    /// then `asym_transform_flag = 0`.
+    #[test]
+    fn extended_transform_parameters_only_index_flag() {
+        // Bit pattern (MSB first):
+        //   1                          asym_transform_index_flag = 1
+        //   0 1 0 0 1                  read_uint() = 5
+        //   0                          asym_transform_flag = 0
+        // 7 bits + 1 pad = 0b1010_0100 = 0xA4
+        let parsed = parse_ext(0, &[0xA4]).unwrap();
+        assert_eq!(
+            parsed,
+            ExtendedTransformParameters {
+                wavelet_index_ho: 5,
+                dwt_depth_ho: 0,
+            }
+        );
+    }
+
+    /// `asym_transform_flag = 1` overrides `dwt_depth_ho`. Pattern:
+    /// flag1=0, flag2=1, then `read_uint() = 0` (one bit `1`).
+    #[test]
+    fn extended_transform_parameters_only_depth_flag() {
+        // Bit pattern (MSB first):
+        //   0                          asym_transform_index_flag = 0
+        //   1                          asym_transform_flag = 1
+        //   1                          read_uint() = 0
+        // = 0b0110_0000 = 0x60
+        let parsed = parse_ext(4, &[0x60]).unwrap();
+        assert_eq!(
+            parsed,
+            ExtendedTransformParameters {
+                wavelet_index_ho: 4,
+                dwt_depth_ho: 0,
+            }
+        );
+    }
+
+    /// Both flags set. Bits: flag1=1, `read_uint()`=3 (`00001`,
+    /// 5 bits), flag2=1, `read_uint()`=1 (`001`, 3 bits). Total
+    /// 10 bits = 2 bytes (6 trailing pad bits at zero are unread).
+    #[test]
+    fn extended_transform_parameters_both_flags_on() {
+        // 1 00001 1 001 = byte0 `1000_0110` = 0x86, byte1 `01xx_xxxx` = 0x40.
+        let parsed = parse_ext(0, &[0x86, 0x40]).unwrap();
+        assert_eq!(
+            parsed,
+            ExtendedTransformParameters {
+                wavelet_index_ho: 3,
+                dwt_depth_ho: 1,
+            }
+        );
+    }
+
+    /// `dwt_depth_ho > 6` is rejected (the IDWT pyramid cannot grow
+    /// that deep — same ceiling as `dwt_depth`).
+    #[test]
+    fn extended_transform_parameters_dwt_depth_ho_over_cap_rejected() {
+        // flag1=0, flag2=1, then read_uint()=7 = 7-bit code
+        // `0000001` (six follow-zeros then the terminator). Bits:
+        // 0 1 0000001 = 9 bits → byte0 `0100_0000` = 0x40,
+        // byte1 `1xxx_xxxx` = 0x80.
+        let err = parse_ext(0, &[0x40, 0x80]).unwrap_err();
+        assert!(matches!(err, PictureError::UnsupportedDwtDepth(7)));
     }
 }
