@@ -12,7 +12,7 @@ use oxideav_core::CodecRegistry;
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
 use oxideav_dirac::encoder::{
     encode_single_hq_intra_stream, encode_single_ld_intra_stream, make_minimal_sequence,
-    synthetic_testsrc_64_yuv420, EncoderParams, LdEncoderParams,
+    make_minimal_sequence_ld, synthetic_testsrc_64_yuv420, EncoderParams, LdEncoderParams,
 };
 use oxideav_dirac::video_format::ChromaFormat;
 use oxideav_dirac::wavelet::WaveletFilter;
@@ -163,4 +163,162 @@ fn encode_then_decode_ld_qindex0_psnr_over_35() {
         psnr_v >= 35.0,
         "LD V PSNR {psnr_v:.2} dB below the 35 dB round-trip target"
     );
+}
+
+// ---------------------------------------------------------------------
+// VC-2 v3 (SMPTE ST 2042-1:2022 §12.4.4) self-roundtrip coverage.
+//
+// Round-201 added the decoder-side `parse_extended_transform_parameters`
+// helper plus the new `PictureError::AsymmetricTransformUnsupported`
+// rejection path. The two tests below close the loop on the *encoder*
+// side: with `EncoderParams::major_version = 3` /
+// `LdEncoderParams::major_version = 3` and a matching sequence-header
+// `version_major = 3`, the encoder emits the symmetric-default
+// `extended_transform_parameters()` flag pair (per the §12.4.4 NOTE)
+// and the resulting bitstream decodes back through our own decoder to
+// bit-exact pixels (HQ at qindex=0) / above-threshold PSNR (LD at
+// qindex=0). v2 (default) and v3 (symmetric) streams must produce
+// pixel-identical reconstructions because the §12.4.4 NOTE guarantees
+// the IDWT is the same in both cases.
+// ---------------------------------------------------------------------
+
+/// HQ intra, `major_version = 3` (symmetric `extended_transform_parameters`
+/// defaults), qindex=0: bit-exact roundtrip AND pixel-identical to the
+/// equivalent v2 stream.
+#[test]
+fn encode_then_decode_hq_v3_symmetric_default_lossless_q0() {
+    let mut seq_v3 = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    seq_v3.parse_parameters.version_major = 3;
+    let params_v3 = EncoderParams::default_hq(WaveletFilter::LeGall5_3, 3).with_major_version_3();
+
+    let seq_v2 = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let params_v2 = EncoderParams::default_hq(WaveletFilter::LeGall5_3, 3);
+
+    let (y, u, v) = synthetic_testsrc_64_yuv420();
+    let stream_v3 = encode_single_hq_intra_stream(&seq_v3, &params_v3, 0, &y, &u, &v);
+    let stream_v2 = encode_single_hq_intra_stream(&seq_v2, &params_v2, 0, &y, &u, &v);
+
+    // The v3 stream MUST differ from v2 byte-wise (two extra `False`
+    // flag bits inside `transform_parameters()` + the bumped
+    // `version_major` exp-Golomb code in the sequence header), but
+    // both must decode to the identical reconstruction.
+    assert_ne!(
+        stream_v3, stream_v2,
+        "v3 stream should not be byte-identical to v2 — the two flag bits + bumped version exp-Golomb must change the bitstream"
+    );
+
+    let mut reg = CodecRegistry::new();
+    oxideav_dirac::register_codecs(&mut reg);
+    let cp = CodecParameters::video(CodecId::new("dirac"));
+
+    let mut dec_v3 = reg.first_decoder(&cp).expect("decoder");
+    dec_v3
+        .send_packet(&Packet::new(0, TimeBase::new(1, 25), stream_v3))
+        .expect("send v3");
+    let frame_v3 = match dec_v3.receive_frame().expect("recv v3") {
+        Frame::Video(vf) => vf,
+        other => panic!("expected video, got {other:?}"),
+    };
+    let mut dec_v2 = reg.first_decoder(&cp).expect("decoder");
+    dec_v2
+        .send_packet(&Packet::new(0, TimeBase::new(1, 25), stream_v2))
+        .expect("send v2");
+    let frame_v2 = match dec_v2.receive_frame().expect("recv v2") {
+        Frame::Video(vf) => vf,
+        other => panic!("expected video, got {other:?}"),
+    };
+
+    // Bit-exact against the input at qindex=0 on the v3 path.
+    assert_eq!(frame_v3.planes[0].data, y.to_vec(), "v3 Y mismatch");
+    assert_eq!(frame_v3.planes[1].data, u.to_vec(), "v3 U mismatch");
+    assert_eq!(frame_v3.planes[2].data, v.to_vec(), "v3 V mismatch");
+
+    // And byte-identical to the v2 reconstruction (per the §12.4.4
+    // NOTE, the IDWT is identical when ho-defaults are in force).
+    assert_eq!(
+        frame_v3.planes[0].data, frame_v2.planes[0].data,
+        "v3/v2 Y reconstructions diverge despite symmetric-default ho params"
+    );
+    assert_eq!(frame_v3.planes[1].data, frame_v2.planes[1].data);
+    assert_eq!(frame_v3.planes[2].data, frame_v2.planes[2].data);
+}
+
+/// LD intra, `major_version = 3` (symmetric `extended_transform_parameters`
+/// defaults), qindex=0: PSNR above the 35 dB round-trip threshold AND
+/// pixel-identical to the equivalent v2 stream.
+#[test]
+fn encode_then_decode_ld_v3_symmetric_default_qindex0_psnr_over_35() {
+    let mut seq_v3 = make_minimal_sequence_ld(64, 64, ChromaFormat::Yuv420);
+    seq_v3.parse_parameters.version_major = 3;
+    let params_v3 =
+        LdEncoderParams::default_ld(WaveletFilter::LeGall5_3, 3, 4, 4, 128).with_major_version_3();
+
+    let seq_v2 = make_minimal_sequence_ld(64, 64, ChromaFormat::Yuv420);
+    let params_v2 = LdEncoderParams::default_ld(WaveletFilter::LeGall5_3, 3, 4, 4, 128);
+
+    // Smooth gradient — the LD slice budget fits comfortably at q=0.
+    let mut y_flat = [0u8; 64 * 64];
+    let mut u_flat = [128u8; 32 * 32];
+    let mut v_flat = [128u8; 32 * 32];
+    for row in 0..64 {
+        for col in 0..64 {
+            y_flat[row * 64 + col] = ((row + col) * 2) as u8;
+        }
+    }
+    for row in 0..32 {
+        for col in 0..32 {
+            u_flat[row * 32 + col] = 128u8.wrapping_add((col as i8 / 2) as u8);
+            v_flat[row * 32 + col] = 128u8.wrapping_add((row as i8 / 2) as u8);
+        }
+    }
+
+    let stream_v3 =
+        encode_single_ld_intra_stream(&seq_v3, &params_v3, 0, &y_flat, &u_flat, &v_flat);
+    let stream_v2 =
+        encode_single_ld_intra_stream(&seq_v2, &params_v2, 0, &y_flat, &u_flat, &v_flat);
+
+    assert_ne!(
+        stream_v3, stream_v2,
+        "v3 LD stream should not be byte-identical to v2 — flag bits + version differ"
+    );
+
+    let mut reg = CodecRegistry::new();
+    oxideav_dirac::register_codecs(&mut reg);
+    let cp = CodecParameters::video(CodecId::new("dirac"));
+
+    let mut dec_v3 = reg.first_decoder(&cp).expect("decoder");
+    dec_v3
+        .send_packet(&Packet::new(0, TimeBase::new(1, 25), stream_v3))
+        .expect("send v3");
+    let frame_v3 = match dec_v3.receive_frame().expect("recv v3") {
+        Frame::Video(vf) => vf,
+        other => panic!("expected video, got {other:?}"),
+    };
+    let mut dec_v2 = reg.first_decoder(&cp).expect("decoder");
+    dec_v2
+        .send_packet(&Packet::new(0, TimeBase::new(1, 25), stream_v2))
+        .expect("send v2");
+    let frame_v2 = match dec_v2.receive_frame().expect("recv v2") {
+        Frame::Video(vf) => vf,
+        other => panic!("expected video, got {other:?}"),
+    };
+
+    let psnr_y = psnr(&frame_v3.planes[0].data, &y_flat);
+    let psnr_u = psnr(&frame_v3.planes[1].data, &u_flat);
+    let psnr_v = psnr(&frame_v3.planes[2].data, &v_flat);
+    eprintln!("LD v3 q0 PSNR:  Y={psnr_y:.2} dB  U={psnr_u:.2} dB  V={psnr_v:.2} dB");
+    assert!(
+        psnr_y >= 35.0,
+        "LD v3 Y PSNR {psnr_y:.2} dB below the 35 dB round-trip target"
+    );
+    assert!(psnr_u >= 35.0, "LD v3 U PSNR {psnr_u:.2} dB below 35 dB");
+    assert!(psnr_v >= 35.0, "LD v3 V PSNR {psnr_v:.2} dB below 35 dB");
+
+    // Pixel-identical to the v2 reconstruction.
+    assert_eq!(
+        frame_v3.planes[0].data, frame_v2.planes[0].data,
+        "LD v3 / v2 Y reconstructions diverge despite symmetric-default ho params"
+    );
+    assert_eq!(frame_v3.planes[1].data, frame_v2.planes[1].data);
+    assert_eq!(frame_v3.planes[2].data, frame_v2.planes[2].data);
 }

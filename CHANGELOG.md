@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **VC-2 v3 `extended_transform_parameters()` encoder emission** (round-206).
+  Encoder-side companion to round-201's decoder-side parser. Both
+  `EncoderParams` (HQ) and `LdEncoderParams` (LD) gain a new
+  `major_version: u32` field (default `2`) plus a `with_major_version_3()`
+  builder. When the field is `>= 3`, `write_transform_parameters()` /
+  `write_ld_transform_parameters()` emit the two
+  `extended_transform_parameters()` `read_bool()` flag bits
+  (`asym_transform_index_flag` then `asym_transform_flag`) at their
+  `False` symmetric default right after `dwt_depth`, per SMPTE ST
+  2042-1:2022 §12.4.4. The §12.4.4 NOTE — "If `state[dwt_depth_ho]` is
+  0 and `state[wavelet_index_ho]` is `state[wavelet_index]` then the
+  inverse wavelet transform process (see 13.2) is identical to that
+  defined in earlier versions of this specification" — guarantees the
+  v3 path's reconstruction is pixel-identical to v2. Callers MUST also
+  set `sequence.parse_parameters.version_major = 3` so the decoder
+  dispatches into the v3 parsing branch. Asymmetric (non-default)
+  emission is intentionally not exposed — the decoder rejects those
+  streams with `PictureError::AsymmetricTransformUnsupported`.
+  - Two new integration tests in `tests/encoder_roundtrip.rs`:
+    - `encode_then_decode_hq_v3_symmetric_default_lossless_q0` — HQ
+      qindex=0, 64x64 4:2:0 testsrc. Asserts the v3 stream is **not**
+      byte-identical to the v2 stream (the two flag bits + bumped
+      `version_major` exp-Golomb code must change the layout) AND that
+      both streams decode to (a) bit-exact reproduction of the source
+      pixels and (b) pixel-identical reconstructions to each other.
+    - `encode_then_decode_ld_v3_symmetric_default_qindex0_psnr_over_35`
+      — LD qindex=0, 4x4 slices × 128 bytes/slice, smooth gradient.
+      Same v3/v2 stream-divergence + reconstruction-identity assertion
+      plus the existing LD-side ≥ 35 dB Y/U/V PSNR threshold.
+  - Crate-wide test count: 338 → 345 (+7) — five picture-module unit
+    tests from round-201 (counted in the previous round's report) plus
+    the two new integration tests added this round.
+
+### Added
+
 - **VC-2 v3 `extended_transform_parameters()` parser** (round-201).
   `picture::parse_transform_parameters` previously aborted with
   `PictureError::ExtendedTransformParams` as soon as it saw a

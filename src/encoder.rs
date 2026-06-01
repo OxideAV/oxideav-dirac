@@ -88,6 +88,22 @@ pub struct EncoderParams {
     /// target the search keeps 127 (the length byte is still bounded by
     /// the 255 cap the `debug_assert!` in [`encode_hq_slice`] guards).
     pub slice_size_target: Option<u32>,
+    /// Bitstream major version selector for the `transform_parameters()`
+    /// block. `2` (default) writes the v2 syntax — no
+    /// `extended_transform_parameters()` block follows the
+    /// `wavelet_index` / `dwt_depth` pair. `3` writes the v3 syntax
+    /// (SMPTE ST 2042-1:2022 §12.4.4): after `dwt_depth` we emit two
+    /// `read_bool()` flag bits at their `False` default plus the
+    /// resulting (empty) gated fields — i.e. the §12.4.4 NOTE
+    /// "symmetric-default" form, where `wavelet_index_ho =
+    /// wavelet_index` and `dwt_depth_ho = 0` and the IDWT therefore
+    /// matches the v2 process verbatim. Callers MUST also set the
+    /// sequence header's `parse_parameters.version_major` to `3` so the
+    /// decoder dispatches into [`crate::picture::parse_extended_transform_parameters`].
+    /// Encoder emission of asymmetric (non-default) parameters is
+    /// intentionally not exposed — the decoder rejects those streams
+    /// with [`crate::picture::PictureError::AsymmetricTransformUnsupported`].
+    pub major_version: u32,
 }
 
 impl EncoderParams {
@@ -108,7 +124,22 @@ impl EncoderParams {
             custom_quant_matrix: false,
             qindex: 0,
             slice_size_target: None,
+            major_version: 2,
         }
+    }
+
+    /// Select the v3 `transform_parameters()` syntax (SMPTE ST
+    /// 2042-1:2022 §12.4.4). The emitted block adds the two
+    /// `extended_transform_parameters()` flag bits at their `False`
+    /// default — i.e. the §12.4.4 NOTE "symmetric-default" form — so
+    /// the IDWT remains identical to the v2 process. The caller must
+    /// also set the sequence header's
+    /// `parse_parameters.version_major` to `3` for the decoder to
+    /// dispatch into the v3 parsing branch. See
+    /// [`Self::major_version`] for the full semantics.
+    pub fn with_major_version_3(mut self) -> Self {
+        self.major_version = 3;
+        self
     }
 
     /// Replace the quantisation matrix with `matrix` and set
@@ -555,9 +586,21 @@ pub fn encode_single_hq_intra_stream_with_size_target(
 }
 
 fn write_transform_parameters(w: &mut BitWriter, params: &EncoderParams) {
-    // wavelet_index, dwt_depth, slice parameters, quant matrix flag.
+    // wavelet_index, dwt_depth, [extended_transform_parameters], slice
+    // parameters, quant matrix flag.
     w.write_uint(wavelet_index(params.wavelet));
     w.write_uint(params.dwt_depth);
+    // §12.4.4 `extended_transform_parameters()` — v3 only. Emit the two
+    // `False` flag bits at their symmetric default so the §12.4.4 NOTE
+    // applies: with `state[wavelet_index_ho] == state[wavelet_index]`
+    // and `state[dwt_depth_ho] == 0` the IDWT is identical to v2.
+    // Asymmetric (non-default) emission is deliberately not exposed —
+    // the decoder rejects those streams with
+    // `AsymmetricTransformUnsupported`.
+    if params.major_version >= 3 {
+        w.write_bool(false); // asym_transform_index_flag
+        w.write_bool(false); // asym_transform_flag
+    }
     // §12.4.5.2 slice_parameters — HQ branch.
     w.write_uint(params.slices_x);
     w.write_uint(params.slices_y);
@@ -1153,6 +1196,15 @@ pub struct LdEncoderParams {
     /// in the range where the dead-zone quantiser's forward rounding is
     /// exact.
     pub qindex: u32,
+    /// Bitstream major version selector for the `transform_parameters()`
+    /// block. `2` (default) writes the v2 syntax. `3` writes the v3
+    /// syntax (SMPTE ST 2042-1:2022 §12.4.4) — the
+    /// `extended_transform_parameters()` flag pair both at `False`
+    /// (symmetric-default form per the §12.4.4 NOTE). See
+    /// [`EncoderParams::major_version`] for the full semantics; the LD
+    /// path emits the same two flag bits in the same position relative
+    /// to `dwt_depth`.
+    pub major_version: u32,
 }
 
 impl LdEncoderParams {
@@ -1180,6 +1232,7 @@ impl LdEncoderParams {
             quant_matrix,
             custom_quant_matrix: false,
             qindex: 0,
+            major_version: 2,
         }
     }
 
@@ -1188,6 +1241,16 @@ impl LdEncoderParams {
     pub fn with_custom_quant_matrix(mut self, matrix: QuantMatrix) -> Self {
         self.quant_matrix = matrix;
         self.custom_quant_matrix = true;
+        self
+    }
+
+    /// Select the v3 `transform_parameters()` syntax (SMPTE ST
+    /// 2042-1:2022 §12.4.4). The LD path emits the same two
+    /// `extended_transform_parameters()` `False` flag bits as the HQ
+    /// counterpart; see [`EncoderParams::with_major_version_3`] for
+    /// the full description.
+    pub fn with_major_version_3(mut self) -> Self {
+        self.major_version = 3;
         self
     }
 }
@@ -2116,6 +2179,13 @@ pub fn encode_ld_sequence_with_size_target_report(
 fn write_ld_transform_parameters(w: &mut BitWriter, params: &LdEncoderParams) {
     w.write_uint(wavelet_index(params.wavelet));
     w.write_uint(params.dwt_depth);
+    // §12.4.4 `extended_transform_parameters()` — v3 only, emitted at
+    // the symmetric-default value. See `write_transform_parameters`
+    // for the HQ-side rationale; the LD path is identical.
+    if params.major_version >= 3 {
+        w.write_bool(false); // asym_transform_index_flag
+        w.write_bool(false); // asym_transform_flag
+    }
     // §12.4.5.2 slice_parameters — LD branch.
     w.write_uint(params.slices_x);
     w.write_uint(params.slices_y);
