@@ -9,6 +9,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **VC-2 v3 fragment-header parser** (round-223, SMPTE ST 2042-1:2022
+  §14.2). New `src/fragment.rs` carries `FragmentHeader::parse` for
+  the byte-aligned fragment header that immediately follows a v3
+  fragment parse-info unit. Layout:
+  - 4-byte `picture_number` (big-endian; must match across a setup
+    fragment and its associated data fragments per §14.2),
+  - 2-byte `fragment_data_length` (the spec marks this "undefined
+    data for the purposes of this standard" — preserved for stream
+    layout tooling),
+  - 2-byte `fragment_slice_count` (0 = setup fragment carrying
+    transform parameters, non-zero = data fragment carrying that
+    many consecutive slices in raster order),
+  - 2-byte `fragment_x_offset` + 2-byte `fragment_y_offset` (data
+    fragments only — first slice's raster coordinates).
+  A setup fragment is therefore 8 bytes, a data fragment 12 bytes,
+  matching Annex A.3.4's definition of `read_uint_lit(state, n)` as
+  `read_nbits(state, 8 * n)`.
+- **`ParseInfo::is_fragment_parse_code()`** — VC-2 v3 §10.5.2 Table 5
+  bit predicate `(parse_code & 0x0C) == 0x0C`. Matches the v3
+  picture-fragment codes `0xCC` (LD) and `0xEC` (HQ). Doc-noted
+  caveat: the same bit pattern is reused by the BBC Dirac v2.2.3
+  Table 9.1 for core-syntax reference picture codes (`0x0C`, `0x0D`,
+  `0x0E`, `0x4C`) and for the v2 LD intra reference `0xCC`, so the
+  predicate is *necessary but not sufficient* for fragment
+  recognition — the dispatcher must combine it with a
+  `major_version == 3` check from the sequence header. The predicate
+  is the syntactic foundation for fragment reassembly in a follow-up
+  round (the `fragment_data(state)` slice-routing logic of §14.4
+  and the `if (fragmented_picture_done) dc_prediction(...)` kick at
+  the end).
+- **10 fragment-module unit tests** (setup + data parsing,
+  `Truncated { needed, available }` differentiation between the
+  8-byte and 12-byte header widths, `u32::MAX` picture-number
+  round-trip, the §14.2 "undefined data" tolerance on
+  `fragment_data_length`, `header_size()` agreement with the
+  variant, the §10.5.2 Table 5 bit predicate firing on `0xCC` /
+  `0xEC` and *not* firing on `0x00` / `0x10` / `0x20` / `0x30` /
+  `0xC8` / `0xE8`, and a separate test pinning the spec ambiguity
+  where the same predicate also fires on the BBC Dirac reference
+  picture codes).
+- **3 integration tests in `tests/fragment_parser.rs`** that build a
+  synthetic VC-2 stream `[seq_hdr][0xEC setup][EOS]` /
+  `[seq_hdr][0xCC data][EOS]` / `[seq_hdr][0xCC setup][0xCC data]
+  [EOS]`, walk it with `DataUnitIter`, and confirm the fragment
+  unit's `payload` (the bytes strictly between two consecutive
+  parse-info headers) decodes cleanly via
+  `FragmentHeader::parse`. Pins that the parser's input contract
+  matches the stream walker's output.
+- Crate-wide test count: 356 → 369 (+13).
+- All material consulted: `docs/video/vc2/vc2-specification.pdf`
+  (§10.5.2, §14.2, Annex A.3.4) and
+  `docs/video/dirac/dirac-spec-latest.pdf` (Table 9.1 for the
+  ambiguity note). No external library source, no web search.
+
 - **VC-2 HQ + LD encoder/decoder roundtrip `dwt_depth` axis coverage**
   (round-218). The project's own
   `docs/video/dirac/dirac-fixtures-and-traces.md` "Gaps" section calls

@@ -120,6 +120,7 @@ pub mod decoder;
 pub mod encoder;
 pub mod encoder_inter;
 pub mod encoder_intra_core;
+pub mod fragment;
 pub mod obmc;
 pub mod parse_info;
 pub mod picture;
