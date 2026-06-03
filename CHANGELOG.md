@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **VC-2 HQ + LD encoder/decoder roundtrip `dwt_depth` axis coverage**
+  (round-218). The project's own
+  `docs/video/dirac/dirac-fixtures-and-traces.md` "Gaps" section calls
+  out **wavelet depths other than 3 and 4** (the spec-allowed range
+  is `1..=5` per §11.3) as a feature surface that no upstream-slice
+  fixture exercises. Pre-r218, the self-roundtrip test surface lined
+  up with that gap: `tests/encoder_*` drove `dwt_depth = 3` almost
+  exclusively, with one HQ `depth = 2` spot-check in
+  `tests/encoder_matrix.rs::hq_q0_lossless_at_dwt_depth_two` and the
+  asymmetric `dwt_depth_ho` v3 negative paths in
+  `tests/encoder_roundtrip.rs`. New `tests/encoder_dwt_depth_coverage.rs`
+  (7 tests) self-roundtrips the HQ and LD encoders against the
+  decoder at the previously-uncovered depths:
+  - HQ at depth 1, 4, 5 bit-exact reconstruction at qindex=0
+    (`hq_q0_bit_exact_at_dwt_depth_{one,four,five_custom_matrix}`),
+    plus LD at depth 1 and 4 above the 35 dB roundtrip threshold
+    (`ld_q0_psnr_over_35_at_dwt_depth_{one,four}`).
+  - Depth 5 takes the §11.3.5 *custom* quantisation matrix path
+    (the Annex E.1 default tables only cover depth `<= 4`); the test
+    constructs an all-zero matrix sized `dwt_depth + 1` levels and
+    sets `custom_quant_matrix = true` so it travels in-band via
+    §12.4.5.3. At qindex=0 every per-subband effective quantiser
+    collapses to 0 (dead-zone identity), so the reconstruction is
+    still bit-exact.
+  - Depth 4 and 5 loosen the slice grid to `(2, 2)` (slice luma dim
+    32 = `2^5`) so the bottom of the pyramid still owns at least one
+    LL sample per slice.
+  - Two helper-shape tests (`slice_grid_helper_shape`,
+    `zero_custom_quant_matrix_shape_is_correct`) pin the test-local
+    slice-grid picker and the all-zero matrix builder so a future
+    tightening keeps the depth-coverage tests aimed at the right
+    geometry. Crate-wide test count: 349 → 356 (+7).
+  Sourced exclusively from `docs/video/dirac/dirac-spec-latest.pdf`
+  + `docs/video/dirac/dirac-fixtures-and-traces.md` (the documented
+  Gaps list). No external implementation source consulted.
 - **VC-2 v3 asymmetric `extended_transform_parameters()` encoder
   emission + decoder-rejection coverage** (round-212). Extends the
   round-206 symmetric-default emitter with an `extended_transform_override:
