@@ -9,6 +9,107 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **VC-2 v3 fragmented-picture state machine** (round-229, SMPTE ST
+  2042-1:2022 §14.3 / §14.4). Builds on r223's fragment-header parser
+  by adding the *reassembly* layer:
+  - `FragmentAssembler` — a per-picture state machine that ingests
+    parsed fragment headers in sequence. The driver calls
+    `on_setup_fragment(&FragmentHeader, parse_code: u8)` for a setup
+    fragment, then `on_transform_parameters(slices_x, slices_y,
+    dwt_depth_ho)` once it has parsed the §12.4 `transform_parameters`
+    that follow the setup-fragment header, then
+    `on_data_fragment(&FragmentHeader, parse_code: u8)` for each
+    data fragment in turn. Each call returns a `FragmentEvent`
+    enum: `SetupAccepted` for setup fragments, `DataSlices { coords,
+    picture_done }` for data fragments. `coords` is the §14.4 list
+    of raster `(slice_x, slice_y)` coordinates for the slices
+    carried by that fragment; `picture_done` flips to `true` on the
+    fragment that completes the picture (matches §14.4
+    `state[fragmented_picture_done] = True`).
+  - The §14.4 raster-scan formula is exposed as a pure free
+    function `slice_coords(s, x_offset, y_offset, slices_x) ->
+    Option<(u32, u32)>` (`raster = y_offset * slices_x + x_offset +
+    s`; coordinates are `(raster % slices_x, raster / slices_x)`;
+    `None` on `slices_x == 0`). Computed in `u64` so a `u16::MAX`
+    `y_offset` on a wide picture grid does not overflow.
+  - §14.1 sequencing constraints enforced as `AssemblerError`
+    variants: `UnexpectedDataFragment` (data fragment before setup
+    or before transform parameters arrive), `PictureNumberMismatch
+    { setup, data }` (data fragment's §14.2 picture_number doesn't
+    match the setup's), `InconsistentParseCode { setup, data }` (LD
+    setup followed by an HQ data fragment or vice versa; the §14.4
+    `using_dc_prediction` predicate is captured from the setup's
+    parse code and must hold for every fragment in the picture),
+    `SliceOverflow { expected_total, slices_received, slice_count }`
+    (a data fragment would push the cumulative slice count past
+    `slices_x * slices_y` — §14.4 explicitly forbids omitted /
+    repeated slices), `SetupBeforePreviousPictureComplete` (§14.1
+    forbids consecutive setup fragments while a picture is still
+    incomplete), `InvalidSliceGrid { slices_x, slices_y }`
+    (transform parameters with a zero slice dimension).
+  - Observability accessors on the assembler:
+    `slices_x()`, `slices_y()`, `dwt_depth_ho()`,
+    `using_dc_prediction()`, `picture_number()`,
+    `slices_received()`, `fragmented_picture_done()`. The last
+    matches the §14.4 `state[fragmented_picture_done]` flag that
+    keys the trailing `dc_prediction(...)` kick on the LL (or L,
+    when `dwt_depth_ho > 0`) subbands.
+- **VC-2 v3 strict §10.5.2 Table 5 predicates on `ParseInfo`**:
+  - `is_ld_v3()`: `(parse_code & 0xF8) == 0xC8`. Matches `0xC8`
+    (LD picture) and `0xCC` (LD picture fragment).
+  - `is_hq_v3()`: `(parse_code & 0xF8) == 0xE8`. Matches `0xE8`
+    (HQ picture) and `0xEC` (HQ picture fragment).
+  - `is_picture_v3()`: `(parse_code & 0x8C) == 0x88`. Matches only
+    the *non-fragment* picture codes `0xC8` / `0xE8`; the v3
+    dispatcher routes fragments via the pre-existing
+    `is_fragment_parse_code()` predicate so the two predicates
+    partition the picture-or-fragment space cleanly.
+  - `using_dc_prediction()`: `(parse_code & 0x28) == 0x08`. True
+    for the LD path (`0xC8` / `0xCC`); false for the HQ path
+    (`0xE8` / `0xEC`). This is the §14.4 predicate that gates the
+    trailing per-component `dc_prediction(...)` kick after a
+    fragmented picture completes.
+  The pre-existing BBC Dirac v2.2.3 predicates `is_picture` /
+  `is_low_delay` use slightly different bit masks (broader, because
+  Dirac's parse-code table assigns several codes that VC-2 has
+  reserved). Both sets are kept side-by-side so a v3 dispatcher
+  and a Dirac-spec dispatcher can each query the appropriate one
+  for the active stream's `major_version`.
+- **10 new fragment-module unit tests** covering: the v3 strict
+  predicates (`is_ld_v3` / `is_hq_v3` / `is_picture_v3` /
+  `using_dc_prediction`), the §14.4 `slice_coords` happy path,
+  mid-row-straddling, the `slices_x == 0` rejection, the
+  `u16::MAX` `y_offset` non-overflow, the `FragmentAssembler`
+  setup-fragment acceptance (LD + HQ), the
+  `UnexpectedDataFragment` rejection (no setup), the
+  `UnexpectedDataFragment` rejection (no transform parameters),
+  the `InvalidSliceGrid` rejection on zero slice dimensions, the
+  single-data-fragment-completes-picture happy path, the
+  multi-data-fragment progressive completion (§14.4 cumulative
+  `slices_received`), the `PictureNumberMismatch` rejection, the
+  `InconsistentParseCode` rejection (LD setup + HQ data), the
+  `SliceOverflow` rejection, the
+  `SetupBeforePreviousPictureComplete` rejection + recovery once
+  the in-flight picture completes, and the `dwt_depth_ho`
+  preservation across data-fragment ingestion.
+- **2 new `tests/fragment_parser.rs` integration tests** that
+  drive the assembler through the real `DataUnitIter` byte
+  walker: one walks a synthetic
+  `[seq_hdr][0xCC setup][0xCC data 2 slices @ (0, 0)][0xCC data 2
+  slices @ (2, 0)][EOS]` stream (`slices_x = 4`, `slices_y = 1`)
+  and pins the per-fragment `(slice_x, slice_y)` raster output +
+  `picture_done` firing on the second data fragment + the §14.4
+  `using_dc_prediction` flag holding for the trailing DC-pred
+  kick; the second walks
+  `[seq_hdr][0xCC setup pic=0][0xCC setup pic=1][EOS]` and pins
+  the §14.1 `SetupBeforePreviousPictureComplete` rejection on the
+  second setup.
+- Crate-wide test count: 369 → 391 (+22).
+- All material consulted: `docs/video/vc2/vc2-specification.pdf`
+  (§10.5.2 Table 4 / Table 5, §14.1 / §14.2 / §14.3 / §14.4,
+  §12.4.4.3 `dwt_depth_ho`, §13.5.6 slice grid; Annex A.3.4
+  `read_uint_lit`). No external library source, no web search.
+
 - **VC-2 v3 fragment-header parser** (round-223, SMPTE ST 2042-1:2022
   §14.2). New `src/fragment.rs` carries `FragmentHeader::parse` for
   the byte-aligned fragment header that immediately follows a v3

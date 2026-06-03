@@ -20,7 +20,9 @@
 //! No external library source was consulted, no web search, no
 //! third-party crate.
 
-use oxideav_dirac::fragment::{FragmentHeader, FragmentKind};
+use oxideav_dirac::fragment::{
+    AssemblerError, FragmentAssembler, FragmentEvent, FragmentHeader, FragmentKind,
+};
 use oxideav_dirac::parse_info::ParseInfo;
 use oxideav_dirac::stream::DataUnitIter;
 
@@ -176,4 +178,130 @@ fn setup_then_data_fragments_share_picture_number() {
     assert!(matches!(data_hdr.kind, FragmentKind::Data { .. }));
     assert_eq!(setup_hdr.picture_number, pic_num);
     assert_eq!(data_hdr.picture_number, pic_num);
+}
+
+/// Round-229 §14.3 / §14.4 driver: walk a synthetic stream
+/// `[seq_hdr][0xCC setup][0xCC data 2 slices @(0,0)][0xCC data 2
+/// slices @(2,0)][EOS]` through `DataUnitIter`, feed each fragment
+/// header to a `FragmentAssembler`, and confirm:
+/// * the setup event fires `FragmentEvent::SetupAccepted`,
+/// * each data event emits the raster `(slice_x, slice_y)` per
+///   §14.4,
+/// * the final data event fires `picture_done == true`,
+/// * the assembler's `fragmented_picture_done()` flips to true
+///   after the final ingest.
+///
+/// Picture geometry: `slices_x = 4`, `slices_y = 1`, so all 4
+/// slices live on row 0 in raster order.
+#[test]
+fn assembler_drives_through_stream_walker_setup_plus_two_data() {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&parse_info(0x00, 13, 0));
+
+    let pic_num = 11;
+    let setup = setup_payload(pic_num, 0);
+    let setup_unit_len = (ParseInfo::SIZE + setup.len()) as u32;
+    buf.extend_from_slice(&parse_info(0xCC, setup_unit_len, 13));
+    buf.extend_from_slice(&setup);
+
+    let data1 = data_payload(pic_num, 0, 2, 0, 0);
+    let data1_unit_len = (ParseInfo::SIZE + data1.len()) as u32;
+    buf.extend_from_slice(&parse_info(0xCC, data1_unit_len, setup_unit_len));
+    buf.extend_from_slice(&data1);
+
+    let data2 = data_payload(pic_num, 0, 2, 2, 0);
+    let data2_unit_len = (ParseInfo::SIZE + data2.len()) as u32;
+    buf.extend_from_slice(&parse_info(0xCC, data2_unit_len, data1_unit_len));
+    buf.extend_from_slice(&data2);
+
+    buf.extend_from_slice(&parse_info(0x10, 0, data2_unit_len));
+
+    let units: Vec<_> = DataUnitIter::new(&buf).collect();
+    assert_eq!(units.len(), 5, "seq_hdr + setup + 2 data + EOS");
+
+    let mut asm = FragmentAssembler::new();
+    let setup_event = {
+        let hdr = FragmentHeader::parse(units[1].payload).expect("setup");
+        asm.on_setup_fragment(&hdr, units[1].parse_info.parse_code)
+            .expect("setup accepted")
+    };
+    assert_eq!(setup_event, FragmentEvent::SetupAccepted);
+    asm.on_transform_parameters(4, 1, 0)
+        .expect("4x1 slice grid accepted");
+
+    let data1_event = {
+        let hdr = FragmentHeader::parse(units[2].payload).expect("data1");
+        asm.on_data_fragment(&hdr, units[2].parse_info.parse_code)
+            .expect("data1 accepted")
+    };
+    match data1_event {
+        FragmentEvent::DataSlices {
+            coords,
+            picture_done,
+        } => {
+            assert_eq!(coords, vec![(0, 0), (1, 0)]);
+            assert!(!picture_done, "still 2 slices to go");
+        }
+        _ => panic!("expected DataSlices"),
+    }
+    assert!(!asm.fragmented_picture_done());
+
+    let data2_event = {
+        let hdr = FragmentHeader::parse(units[3].payload).expect("data2");
+        asm.on_data_fragment(&hdr, units[3].parse_info.parse_code)
+            .expect("data2 accepted")
+    };
+    match data2_event {
+        FragmentEvent::DataSlices {
+            coords,
+            picture_done,
+        } => {
+            assert_eq!(coords, vec![(2, 0), (3, 0)]);
+            assert!(picture_done, "final data fragment completes picture");
+        }
+        _ => panic!("expected DataSlices"),
+    }
+    assert!(asm.fragmented_picture_done());
+    assert!(asm.using_dc_prediction(), "0xCC LD path → DC pred kick");
+    assert_eq!(asm.dwt_depth_ho(), 0, "symmetric transform default");
+    assert_eq!(asm.picture_number(), pic_num);
+
+    assert!(units[4].parse_info.is_end_of_sequence());
+}
+
+/// §14.1 sequencing constraint: a second setup fragment arriving
+/// before the previous fragmented picture completes is rejected.
+/// Drive a stream `[seq_hdr][0xCC setup pic=0][0xCC setup pic=1]
+/// [EOS]` through the assembler — the second setup transition must
+/// surface `SetupBeforePreviousPictureComplete`. Pinned via the
+/// stream walker so this matches the real ingest path.
+#[test]
+fn assembler_rejects_consecutive_setup_fragments_through_stream() {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&parse_info(0x00, 13, 0));
+
+    let setup0 = setup_payload(0, 0);
+    let setup0_unit_len = (ParseInfo::SIZE + setup0.len()) as u32;
+    buf.extend_from_slice(&parse_info(0xCC, setup0_unit_len, 13));
+    buf.extend_from_slice(&setup0);
+
+    let setup1 = setup_payload(1, 0);
+    let setup1_unit_len = (ParseInfo::SIZE + setup1.len()) as u32;
+    buf.extend_from_slice(&parse_info(0xCC, setup1_unit_len, setup0_unit_len));
+    buf.extend_from_slice(&setup1);
+
+    buf.extend_from_slice(&parse_info(0x10, 0, setup1_unit_len));
+
+    let units: Vec<_> = DataUnitIter::new(&buf).collect();
+    let mut asm = FragmentAssembler::new();
+    let h0 = FragmentHeader::parse(units[1].payload).unwrap();
+    asm.on_setup_fragment(&h0, units[1].parse_info.parse_code)
+        .unwrap();
+    asm.on_transform_parameters(2, 1, 0).unwrap();
+    // Second setup before any data fragment → §14.1 violation.
+    let h1 = FragmentHeader::parse(units[2].payload).unwrap();
+    let err = asm
+        .on_setup_fragment(&h1, units[2].parse_info.parse_code)
+        .unwrap_err();
+    assert_eq!(err, AssemblerError::SetupBeforePreviousPictureComplete);
 }

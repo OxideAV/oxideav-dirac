@@ -199,6 +199,412 @@ impl FragmentHeader {
     }
 }
 
+/// VC-2 v3 §14.4 raster-scan slice coordinate computation.
+///
+/// Given a data fragment's `(x_offset, y_offset)` (the §14.2 raster
+/// coordinate of the fragment's first slice) and the picture's
+/// `slices_x` (slice columns), return the `(slice_x, slice_y)` of the
+/// `s`-th slice carried by this fragment (`s = 0..slice_count`).
+///
+/// The §14.4 pseudocode is:
+///
+/// ```text
+/// slice_x = (state[fragment_y_offset] * state[slices_x] +
+///            state[fragment_x_offset] + s) % state[slices_x]
+/// slice_y = (state[fragment_y_offset] * state[slices_x] +
+///            state[fragment_x_offset] + s) // state[slices_x]
+/// ```
+///
+/// That is, the raster index of the s-th slice is
+/// `y_offset * slices_x + x_offset + s`, then split back into
+/// `(col, row)` modulo `slices_x`. Slices are emitted in raster scan
+/// starting at slice (0, 0) per §14.2; a data fragment may straddle a
+/// row boundary so the modulo / integer-division pair is what handles
+/// the wrap.
+///
+/// Returns `None` if `slices_x == 0` (an out-of-spec picture geometry —
+/// the picture would carry no slices at all).
+pub fn slice_coords(s: u32, x_offset: u16, y_offset: u16, slices_x: u32) -> Option<(u32, u32)> {
+    if slices_x == 0 {
+        return None;
+    }
+    let raster = u64::from(y_offset) * u64::from(slices_x) + u64::from(x_offset) + u64::from(s);
+    let slice_x = (raster % u64::from(slices_x)) as u32;
+    let slice_y = (raster / u64::from(slices_x)) as u32;
+    Some((slice_x, slice_y))
+}
+
+/// VC-2 v3 §14.3 / §14.4 fragmented-picture assembler.
+///
+/// One [`FragmentAssembler`] tracks the reconstruction state of a
+/// single fragmented picture. The driver feeds it a sequence of
+/// `(parsed) FragmentHeader`s and the assembler returns either:
+///
+/// * `FragmentEvent::SetupAccepted` — the setup fragment for a new
+///   picture; the caller now parses `transform_parameters` (§12.4)
+///   from the bytes after the fragment header and calls
+///   [`FragmentAssembler::on_transform_parameters`].
+/// * `FragmentEvent::DataSlices { coords, picture_done }` — the data
+///   fragment's slices, each at a raster `(slice_x, slice_y)` per
+///   §14.4. When `picture_done` is `true`, the caller is responsible
+///   for the §14.4 trailing `dc_prediction` kick on the LL (or L)
+///   subbands per [`FragmentAssembler::using_dc_prediction`] /
+///   [`FragmentAssembler::dwt_depth_ho`].
+///
+/// The assembler enforces the §14.1 sequencing constraint that data
+/// fragments must follow a setup fragment, all share the setup's
+/// picture number, no further setup fragments arrive until the
+/// picture is complete, and exactly `slices_x * slices_y` slices are
+/// received in total.
+#[derive(Debug, Clone)]
+pub struct FragmentAssembler {
+    /// `slices_x` from §13.5.6 (transform parameters → slices). Set
+    /// after the setup fragment's `transform_parameters` parse.
+    slices_x: u32,
+    /// `slices_y` from §13.5.6.
+    slices_y: u32,
+    /// `dwt_depth_ho` from §12.4.4.3 (defaults to 0 on a symmetric
+    /// transform). Captured at setup-fragment time for the §14.4
+    /// trailing `dc_prediction` LL-vs-L subband selection.
+    dwt_depth_ho: u32,
+    /// `using_dc_prediction(state)` cache (§10.5.2 Table 5;
+    /// `(parse_code & 0x28) == 0x08`). Captured from the setup
+    /// fragment's parse code.
+    using_dc_prediction: bool,
+    /// Setup-fragment picture number — every data fragment for this
+    /// picture must carry the same value (§14.2).
+    picture_number: u32,
+    /// `state[fragment_slices_received]` (§14.3) — count of slices
+    /// fed in across all data fragments for this picture so far.
+    slices_received: u32,
+    /// Internal phase tracker — has the setup fragment's transform
+    /// parameters been ingested yet?
+    setup_state: SetupState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetupState {
+    /// `FragmentAssembler` exists but no fragment has been ingested
+    /// yet (the assembler's `slices_x` / `slices_y` are placeholder
+    /// zeros; the driver is expected to call
+    /// [`FragmentAssembler::on_setup_fragment`] first).
+    AwaitingSetup,
+    /// Setup fragment was accepted but its transform parameters have
+    /// not yet been ingested via
+    /// [`FragmentAssembler::on_transform_parameters`]. Data fragments
+    /// arriving in this phase are a §14.1 violation.
+    AwaitingTransformParameters,
+    /// Setup is complete (`slices_x` / `slices_y` known); data
+    /// fragments may now be ingested.
+    ReceivingData,
+}
+
+/// Driver-visible result of feeding one fragment header into the
+/// assembler.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FragmentEvent {
+    /// The setup fragment was accepted; the driver now parses the
+    /// `transform_parameters` (§12.4) immediately following the
+    /// fragment header and feeds the resulting
+    /// `(slices_x, slices_y, dwt_depth_ho)` triple back via
+    /// [`FragmentAssembler::on_transform_parameters`].
+    SetupAccepted,
+    /// The data fragment delivered `coords.len()` slices, each at
+    /// the listed raster `(slice_x, slice_y)` coordinate.
+    /// `picture_done` is `true` when the cumulative
+    /// `state[fragment_slices_received]` has reached
+    /// `slices_x * slices_y` (§14.4) — the caller then runs the
+    /// trailing DC-prediction kick on the LL (or L) subbands per
+    /// §14.4.
+    DataSlices {
+        /// Per-slice raster coordinates in the order they appear in
+        /// this fragment.
+        coords: Vec<(u32, u32)>,
+        /// Picture completion flag (§14.4
+        /// `state[fragmented_picture_done] = True`).
+        picture_done: bool,
+    },
+}
+
+/// Errors raised by the fragmented-picture state machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AssemblerError {
+    /// A data fragment arrived without a preceding setup fragment, or
+    /// arrived after the setup fragment but before its transform
+    /// parameters were ingested. Either is a §14.1 sequencing
+    /// violation.
+    UnexpectedDataFragment,
+    /// A setup fragment arrived while a previous fragmented picture
+    /// was still incomplete (§14.1 forbids this).
+    SetupBeforePreviousPictureComplete,
+    /// A data fragment's `picture_number` did not match the active
+    /// setup fragment's (§14.2 requires equality).
+    PictureNumberMismatch { setup: u32, data: u32 },
+    /// `using_dc_prediction(parse_code)` returned `true` on a setup
+    /// fragment but later returned `false` on its associated data
+    /// fragment, or vice versa. The §14.4 DC-prediction kick is keyed
+    /// off the picture's parse code, so the parse code must be
+    /// consistent across all fragments of the same picture.
+    InconsistentParseCode { setup: u8, data: u8 },
+    /// The data fragment would push the cumulative slice count past
+    /// the picture's `slices_x * slices_y` total. §14.4 explicitly
+    /// forbids this ("Slices shall not be omitted or repeated").
+    SliceOverflow {
+        expected_total: u32,
+        slices_received: u32,
+        slice_count: u32,
+    },
+    /// `slices_x == 0` — an out-of-spec transform parameter set.
+    /// §13.5.6 requires at least one slice column.
+    InvalidSliceGrid { slices_x: u32, slices_y: u32 },
+}
+
+impl core::fmt::Display for AssemblerError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::UnexpectedDataFragment => write!(
+                f,
+                "data fragment received before its setup fragment / \
+                 transform parameters"
+            ),
+            Self::SetupBeforePreviousPictureComplete => write!(
+                f,
+                "setup fragment received while the previous \
+                 fragmented picture was still incomplete"
+            ),
+            Self::PictureNumberMismatch { setup, data } => write!(
+                f,
+                "fragment picture_number mismatch: setup {setup}, \
+                 data {data}"
+            ),
+            Self::InconsistentParseCode { setup, data } => write!(
+                f,
+                "fragment parse code mismatch within one picture: \
+                 setup 0x{setup:02X}, data 0x{data:02X}"
+            ),
+            Self::SliceOverflow {
+                expected_total,
+                slices_received,
+                slice_count,
+            } => write!(
+                f,
+                "fragment slice count {slice_count} would push the \
+                 cumulative slice count past the picture total \
+                 ({slices_received} received, {expected_total} \
+                 expected)"
+            ),
+            Self::InvalidSliceGrid { slices_x, slices_y } => write!(
+                f,
+                "invalid slice grid: slices_x={slices_x}, \
+                 slices_y={slices_y}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AssemblerError {}
+
+impl Default for FragmentAssembler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FragmentAssembler {
+    /// Build an empty assembler, awaiting its first setup fragment.
+    pub fn new() -> Self {
+        Self {
+            slices_x: 0,
+            slices_y: 0,
+            dwt_depth_ho: 0,
+            using_dc_prediction: false,
+            picture_number: 0,
+            slices_received: 0,
+            setup_state: SetupState::AwaitingSetup,
+        }
+    }
+
+    /// `state[slices_x]` (§13.5.6) as captured at setup-fragment time.
+    /// Zero before the first setup fragment is ingested.
+    pub fn slices_x(&self) -> u32 {
+        self.slices_x
+    }
+
+    /// `state[slices_y]` (§13.5.6).
+    pub fn slices_y(&self) -> u32 {
+        self.slices_y
+    }
+
+    /// `state[dwt_depth_ho]` (§12.4.4.3) as captured at setup-fragment
+    /// time; used by the §14.4 trailing DC-prediction kick to choose
+    /// between the LL and L subbands.
+    pub fn dwt_depth_ho(&self) -> u32 {
+        self.dwt_depth_ho
+    }
+
+    /// `using_dc_prediction(state)` per §10.5.2 Table 5; captured
+    /// from the setup fragment's parse code.
+    pub fn using_dc_prediction(&self) -> bool {
+        self.using_dc_prediction
+    }
+
+    /// Active picture's `picture_number` per §14.2 — zero before the
+    /// first setup fragment is ingested.
+    pub fn picture_number(&self) -> u32 {
+        self.picture_number
+    }
+
+    /// Cumulative `state[fragment_slices_received]` per §14.3.
+    pub fn slices_received(&self) -> u32 {
+        self.slices_received
+    }
+
+    /// `state[fragmented_picture_done]` per §14.4 — `true` once
+    /// `slices_received == slices_x * slices_y` for the active
+    /// picture, ready for the trailing `dc_prediction` kick.
+    pub fn fragmented_picture_done(&self) -> bool {
+        self.slices_x != 0
+            && self.slices_received == self.slices_x.saturating_mul(self.slices_y)
+            && self.setup_state == SetupState::ReceivingData
+    }
+
+    /// Ingest a setup fragment header (§14.1 "fragment_slice_count
+    /// == 0"). The driver passes the setup fragment's parse code so
+    /// the §10.5.2 Table 5 `using_dc_prediction` predicate can be
+    /// captured for the §14.4 trailing kick.
+    ///
+    /// Returns [`FragmentEvent::SetupAccepted`] on success. The
+    /// caller then parses the immediately-following
+    /// `transform_parameters` payload and calls
+    /// [`Self::on_transform_parameters`].
+    ///
+    /// Errors:
+    /// * `SetupBeforePreviousPictureComplete` if the previous
+    ///   picture's `fragmented_picture_done` had not yet fired.
+    pub fn on_setup_fragment(
+        &mut self,
+        header: &FragmentHeader,
+        parse_code: u8,
+    ) -> Result<FragmentEvent, AssemblerError> {
+        debug_assert!(matches!(header.kind, FragmentKind::Setup));
+        // §14.1: "A setup fragment shall not be followed by any
+        // further setup fragments ... until the fragmented picture is
+        // complete." Allow a setup only if we are at AwaitingSetup
+        // (first picture) or the previous picture completed.
+        match self.setup_state {
+            SetupState::AwaitingSetup => {}
+            SetupState::ReceivingData if self.fragmented_picture_done() => {}
+            _ => return Err(AssemblerError::SetupBeforePreviousPictureComplete),
+        }
+        // Reset picture-scope state. `slices_x` / `slices_y` /
+        // `dwt_depth_ho` carry over from the previous setup fragment
+        // and stay placeholder until the transform parameters arrive
+        // for the new one.
+        self.picture_number = header.picture_number;
+        self.using_dc_prediction = (parse_code & 0x28) == 0x08;
+        self.slices_received = 0;
+        self.slices_x = 0;
+        self.slices_y = 0;
+        self.dwt_depth_ho = 0;
+        self.setup_state = SetupState::AwaitingTransformParameters;
+        Ok(FragmentEvent::SetupAccepted)
+    }
+
+    /// Ingest the transform parameters parsed from the bytes
+    /// immediately after the setup fragment header (§12.4). The
+    /// caller passes the resulting `(slices_x, slices_y,
+    /// dwt_depth_ho)` triple; the assembler stores them on
+    /// `state[slices_x]` / `state[slices_y]` / `state[dwt_depth_ho]`
+    /// and transitions to the `ReceivingData` phase ready to accept
+    /// data fragments.
+    pub fn on_transform_parameters(
+        &mut self,
+        slices_x: u32,
+        slices_y: u32,
+        dwt_depth_ho: u32,
+    ) -> Result<(), AssemblerError> {
+        if slices_x == 0 || slices_y == 0 {
+            return Err(AssemblerError::InvalidSliceGrid { slices_x, slices_y });
+        }
+        self.slices_x = slices_x;
+        self.slices_y = slices_y;
+        self.dwt_depth_ho = dwt_depth_ho;
+        self.setup_state = SetupState::ReceivingData;
+        Ok(())
+    }
+
+    /// Ingest a data fragment header (§14.1 "fragment_slice_count
+    /// greater than zero") and emit its per-slice raster
+    /// `(slice_x, slice_y)` coordinates per §14.4. The driver passes
+    /// the data fragment's parse code so the assembler can pin
+    /// parse-code consistency against the active setup fragment.
+    pub fn on_data_fragment(
+        &mut self,
+        header: &FragmentHeader,
+        parse_code: u8,
+    ) -> Result<FragmentEvent, AssemblerError> {
+        let (slice_count, x_offset, y_offset) = match header.kind {
+            FragmentKind::Data {
+                slice_count,
+                x_offset,
+                y_offset,
+            } => (slice_count, x_offset, y_offset),
+            FragmentKind::Setup => {
+                debug_assert!(false, "data fragment expected, got setup");
+                return Err(AssemblerError::UnexpectedDataFragment);
+            }
+        };
+        if self.setup_state != SetupState::ReceivingData {
+            return Err(AssemblerError::UnexpectedDataFragment);
+        }
+        if header.picture_number != self.picture_number {
+            return Err(AssemblerError::PictureNumberMismatch {
+                setup: self.picture_number,
+                data: header.picture_number,
+            });
+        }
+        let data_using_dc = (parse_code & 0x28) == 0x08;
+        if data_using_dc != self.using_dc_prediction {
+            // Reconstruct an indicative setup-code byte for the error
+            // payload (the assembler only stores the predicate
+            // outcome, not the original byte). Use a canonical
+            // representative: 0x88 == LD picture, 0xE8 == HQ picture.
+            let setup_indicative = if self.using_dc_prediction { 0x88 } else { 0xE8 };
+            return Err(AssemblerError::InconsistentParseCode {
+                setup: setup_indicative,
+                data: parse_code,
+            });
+        }
+        // §14.4 picture total — guard against overflow.
+        let expected_total = self.slices_x.saturating_mul(self.slices_y);
+        let new_total = self.slices_received.saturating_add(u32::from(slice_count));
+        if new_total > expected_total {
+            return Err(AssemblerError::SliceOverflow {
+                expected_total,
+                slices_received: self.slices_received,
+                slice_count: u32::from(slice_count),
+            });
+        }
+        // §14.4 raster coordinate sweep.
+        let mut coords = Vec::with_capacity(usize::from(slice_count));
+        for s in 0..u32::from(slice_count) {
+            let (sx, sy) = slice_coords(s, x_offset, y_offset, self.slices_x).ok_or(
+                AssemblerError::InvalidSliceGrid {
+                    slices_x: self.slices_x,
+                    slices_y: self.slices_y,
+                },
+            )?;
+            coords.push((sx, sy));
+        }
+        self.slices_received = new_total;
+        let picture_done = self.slices_received == expected_total;
+        Ok(FragmentEvent::DataSlices {
+            coords,
+            picture_done,
+        })
+    }
+}
+
 impl ParseInfo {
     /// VC-2 v3 §10.5.2 Table 5 `is_fragment` predicate:
     /// `(parse_code & 0x0C) == 0x0C`.
@@ -219,6 +625,54 @@ impl ParseInfo {
     /// `major_version` field; see [`crate::sequence`]).
     pub fn is_fragment_parse_code(&self) -> bool {
         (self.parse_code & 0x0C) == 0x0C
+    }
+
+    /// VC-2 v3 §10.5.2 Table 5 `is_ld(state) := (parse_code & 0xF8)
+    /// == 0xC8`. Matches both `0xC8` (LD picture) and `0xCC` (LD
+    /// picture fragment).
+    ///
+    /// This is the strict VC-2 v3 LD predicate. The pre-existing
+    /// [`ParseInfo::is_low_delay`] uses the broader BBC Dirac
+    /// v2.2.3 bit mask (`(parse_code & 0x88) == 0x88`); both are
+    /// kept so a v3 dispatcher and a Dirac-spec dispatcher can
+    /// query the appropriate one for the active stream version.
+    pub fn is_ld_v3(&self) -> bool {
+        (self.parse_code & 0xF8) == 0xC8
+    }
+
+    /// VC-2 v3 §10.5.2 Table 5 `is_hq(state) := (parse_code & 0xF8)
+    /// == 0xE8`. Matches both `0xE8` (HQ picture) and `0xEC` (HQ
+    /// picture fragment).
+    pub fn is_hq_v3(&self) -> bool {
+        (self.parse_code & 0xF8) == 0xE8
+    }
+
+    /// VC-2 v3 §10.5.2 Table 5 `is_picture(state) := (parse_code &
+    /// 0x8C) == 0x88`. Matches the two non-fragment picture codes
+    /// `0xC8` (LD) and `0xE8` (HQ); does NOT match the picture
+    /// fragment codes `0xCC` / `0xEC` (those are routed via
+    /// [`ParseInfo::is_fragment_parse_code`]).
+    ///
+    /// The pre-existing [`ParseInfo::is_picture`] uses the broader
+    /// BBC Dirac v2.2.3 bit mask `(parse_code & 0x08) == 0x08`,
+    /// which intentionally subsumes both pictures and fragments.
+    /// Keep both: the v3 dispatcher wants the narrower
+    /// "picture-only" version so fragment routing stays exclusive.
+    pub fn is_picture_v3(&self) -> bool {
+        (self.parse_code & 0x8C) == 0x88
+    }
+
+    /// VC-2 v3 §10.5.2 Table 5 `using_dc_prediction(state) :=
+    /// (parse_code & 0x28) == 0x08`. True for LD pictures and LD
+    /// fragments (`0xC8` / `0xCC`); false for HQ pictures and HQ
+    /// fragments (`0xE8` / `0xEC`).
+    ///
+    /// This is the key §14.4 predicate: after a fragmented
+    /// picture's slices are all received, the LD path runs a
+    /// trailing `dc_prediction(...)` on the LL (or L) subbands;
+    /// the HQ path does not.
+    pub fn using_dc_prediction(&self) -> bool {
+        (self.parse_code & 0x28) == 0x08
     }
 }
 
@@ -433,5 +887,398 @@ mod tests {
                 "0x{code:02X} matches v3 (parse_code & 0x0C) == 0x0C predicate"
             );
         }
+    }
+
+    fn pi(parse_code: u8) -> ParseInfo {
+        ParseInfo {
+            parse_code,
+            next_parse_offset: 0,
+            previous_parse_offset: 0,
+        }
+    }
+
+    /// VC-2 v3 §10.5.2 Table 5 `is_ld(state) := (parse_code & 0xF8)
+    /// == 0xC8`. Fires on `0xC8` (LD picture) and `0xCC` (LD picture
+    /// fragment); does not fire on `0xE8` / `0xEC` / non-picture
+    /// codes.
+    #[test]
+    fn is_ld_v3_predicate_matches_only_ld_codes() {
+        assert!(pi(0xC8).is_ld_v3());
+        assert!(pi(0xCC).is_ld_v3());
+        for code in [0x00u8, 0x10, 0x20, 0x30, 0xE8, 0xEC] {
+            assert!(
+                !pi(code).is_ld_v3(),
+                "0x{code:02X} should NOT match v3 is_ld predicate"
+            );
+        }
+    }
+
+    /// VC-2 v3 §10.5.2 Table 5 `is_hq(state) := (parse_code & 0xF8)
+    /// == 0xE8`. Fires on `0xE8` (HQ picture) and `0xEC` (HQ picture
+    /// fragment).
+    #[test]
+    fn is_hq_v3_predicate_matches_only_hq_codes() {
+        assert!(pi(0xE8).is_hq_v3());
+        assert!(pi(0xEC).is_hq_v3());
+        for code in [0x00u8, 0x10, 0x20, 0x30, 0xC8, 0xCC] {
+            assert!(
+                !pi(code).is_hq_v3(),
+                "0x{code:02X} should NOT match v3 is_hq predicate"
+            );
+        }
+    }
+
+    /// VC-2 v3 §10.5.2 Table 5 `is_picture(state) := (parse_code &
+    /// 0x8C) == 0x88`. Pure VC-2 v3: only `0xC8` and `0xE8`. The two
+    /// fragment codes `0xCC` / `0xEC` deliberately fail this
+    /// predicate so the v3 dispatcher routes them via
+    /// `is_fragment_parse_code` instead.
+    #[test]
+    fn is_picture_v3_predicate_excludes_fragments() {
+        assert!(pi(0xC8).is_picture_v3());
+        assert!(pi(0xE8).is_picture_v3());
+        assert!(
+            !pi(0xCC).is_picture_v3(),
+            "0xCC is a fragment, not a picture, under v3 routing"
+        );
+        assert!(
+            !pi(0xEC).is_picture_v3(),
+            "0xEC is a fragment, not a picture, under v3 routing"
+        );
+        for code in [0x00u8, 0x10, 0x20, 0x30] {
+            assert!(!pi(code).is_picture_v3());
+        }
+    }
+
+    /// VC-2 v3 §10.5.2 Table 5 `using_dc_prediction(state) :=
+    /// (parse_code & 0x28) == 0x08`. True for both the LD picture
+    /// (`0xC8`) and LD fragment (`0xCC`) codes; false for the HQ
+    /// equivalents (`0xE8` / `0xEC`).
+    #[test]
+    fn using_dc_prediction_predicate_matches_only_ld_path() {
+        assert!(pi(0xC8).using_dc_prediction(), "0xC8 = LD picture");
+        assert!(pi(0xCC).using_dc_prediction(), "0xCC = LD fragment");
+        assert!(!pi(0xE8).using_dc_prediction(), "0xE8 = HQ picture");
+        assert!(!pi(0xEC).using_dc_prediction(), "0xEC = HQ fragment");
+    }
+
+    /// §14.4: `slice_coords(s, x_offset, y_offset, slices_x)` is the
+    /// raster-scan slice index split into `(col, row)`. Single
+    /// fragment carrying the whole picture from `(0, 0)`.
+    #[test]
+    fn slice_coords_top_left_walk_raster_order() {
+        // 3-col, 2-row picture (slices_x = 3): raster indices 0..5
+        // map to (0,0) (1,0) (2,0) (0,1) (1,1) (2,1).
+        assert_eq!(slice_coords(0, 0, 0, 3), Some((0, 0)));
+        assert_eq!(slice_coords(1, 0, 0, 3), Some((1, 0)));
+        assert_eq!(slice_coords(2, 0, 0, 3), Some((2, 0)));
+        assert_eq!(slice_coords(3, 0, 0, 3), Some((0, 1)));
+        assert_eq!(slice_coords(4, 0, 0, 3), Some((1, 1)));
+        assert_eq!(slice_coords(5, 0, 0, 3), Some((2, 1)));
+    }
+
+    /// §14.4: a data fragment that starts mid-row (`x_offset != 0`)
+    /// can straddle the row boundary; the modulo / integer-division
+    /// pair wraps `slice_x` back to 0 and increments `slice_y`.
+    #[test]
+    fn slice_coords_fragment_straddling_row_boundary() {
+        // slices_x = 4; fragment starts at (3, 0) and carries 3
+        // slices. Raster indices 3, 4, 5 → (3, 0), (0, 1), (1, 1).
+        assert_eq!(slice_coords(0, 3, 0, 4), Some((3, 0)));
+        assert_eq!(slice_coords(1, 3, 0, 4), Some((0, 1)));
+        assert_eq!(slice_coords(2, 3, 0, 4), Some((1, 1)));
+    }
+
+    /// §14.4: `slices_x == 0` is rejected — a 0-column picture is
+    /// out of spec (§13.5.6 requires ≥ 1 slice per dimension).
+    #[test]
+    fn slice_coords_rejects_zero_slices_x() {
+        assert_eq!(slice_coords(0, 0, 0, 0), None);
+        assert_eq!(slice_coords(10, 5, 7, 0), None);
+    }
+
+    /// §14.4: high-resolution stream stress — 256 slice columns,
+    /// fragment starting at the bottom-right of the picture. Verify
+    /// the `u64` arithmetic doesn't overflow on `u16::MAX` offsets.
+    #[test]
+    fn slice_coords_extreme_offsets_no_overflow() {
+        // slices_x = 256, y_offset = u16::MAX → first raster index =
+        // 65535 * 256 = 16776960. No overflow expected from
+        // `u32::MAX` either: the formula upcasts via `u64`.
+        let (sx, sy) = slice_coords(0, 0, u16::MAX, 256).unwrap();
+        assert_eq!((sx, sy), (0, u32::from(u16::MAX)));
+    }
+
+    fn setup_hdr(picture_number: u32) -> FragmentHeader {
+        FragmentHeader {
+            picture_number,
+            fragment_data_length: 0,
+            kind: FragmentKind::Setup,
+        }
+    }
+
+    fn data_hdr(
+        picture_number: u32,
+        slice_count: u16,
+        x_offset: u16,
+        y_offset: u16,
+    ) -> FragmentHeader {
+        FragmentHeader {
+            picture_number,
+            fragment_data_length: 0,
+            kind: FragmentKind::Data {
+                slice_count,
+                x_offset,
+                y_offset,
+            },
+        }
+    }
+
+    /// §14.1 / §14.3: a brand-new assembler accepts a setup fragment.
+    /// The first transition stores the parse-code-derived
+    /// `using_dc_prediction` flag and primes the assembler to await
+    /// the transform parameters.
+    #[test]
+    fn assembler_accepts_first_setup_fragment_ld() {
+        let mut asm = FragmentAssembler::new();
+        let ev = asm.on_setup_fragment(&setup_hdr(7), 0xCC).unwrap();
+        assert_eq!(ev, FragmentEvent::SetupAccepted);
+        assert_eq!(asm.picture_number(), 7);
+        assert!(asm.using_dc_prediction(), "0xCC LD fragment → DC pred");
+        assert!(!asm.fragmented_picture_done());
+        assert_eq!(asm.slices_received(), 0);
+    }
+
+    /// HQ counterpart — `0xEC` parse code yields
+    /// `using_dc_prediction == false` so the §14.4 trailing kick is
+    /// skipped on the HQ path.
+    #[test]
+    fn assembler_accepts_first_setup_fragment_hq() {
+        let mut asm = FragmentAssembler::new();
+        asm.on_setup_fragment(&setup_hdr(0), 0xEC).unwrap();
+        assert!(!asm.using_dc_prediction(), "0xEC HQ fragment → no DC pred");
+    }
+
+    /// §14.1: data fragment before any setup is rejected as
+    /// `UnexpectedDataFragment`.
+    #[test]
+    fn assembler_rejects_data_fragment_without_setup() {
+        let mut asm = FragmentAssembler::new();
+        let err = asm
+            .on_data_fragment(&data_hdr(0, 1, 0, 0), 0xCC)
+            .unwrap_err();
+        assert_eq!(err, AssemblerError::UnexpectedDataFragment);
+    }
+
+    /// §14.1: data fragment after setup but before transform
+    /// parameters is rejected — the assembler can't compute raster
+    /// coordinates without `slices_x`.
+    #[test]
+    fn assembler_rejects_data_fragment_before_transform_parameters() {
+        let mut asm = FragmentAssembler::new();
+        asm.on_setup_fragment(&setup_hdr(0), 0xCC).unwrap();
+        // No on_transform_parameters() call here.
+        let err = asm
+            .on_data_fragment(&data_hdr(0, 1, 0, 0), 0xCC)
+            .unwrap_err();
+        assert_eq!(err, AssemblerError::UnexpectedDataFragment);
+    }
+
+    /// §13.5.6: `slices_x == 0` from transform parameters is
+    /// rejected.
+    #[test]
+    fn assembler_rejects_zero_slices_x_transform_parameters() {
+        let mut asm = FragmentAssembler::new();
+        asm.on_setup_fragment(&setup_hdr(0), 0xCC).unwrap();
+        let err = asm.on_transform_parameters(0, 4, 0).unwrap_err();
+        assert_eq!(
+            err,
+            AssemblerError::InvalidSliceGrid {
+                slices_x: 0,
+                slices_y: 4,
+            }
+        );
+    }
+
+    /// §14.4 happy path: a single data fragment carrying the whole
+    /// 2x2 picture starting at (0, 0). The assembler emits the four
+    /// raster coordinates in order, fires `picture_done` on the
+    /// final slice, and `fragmented_picture_done()` then returns
+    /// true.
+    #[test]
+    fn assembler_single_data_fragment_completes_picture() {
+        let mut asm = FragmentAssembler::new();
+        asm.on_setup_fragment(&setup_hdr(0), 0xCC).unwrap();
+        asm.on_transform_parameters(2, 2, 0).unwrap();
+        let ev = asm.on_data_fragment(&data_hdr(0, 4, 0, 0), 0xCC).unwrap();
+        match ev {
+            FragmentEvent::DataSlices {
+                coords,
+                picture_done,
+            } => {
+                assert_eq!(coords, vec![(0, 0), (1, 0), (0, 1), (1, 1)]);
+                assert!(picture_done);
+            }
+            _ => panic!("expected DataSlices event"),
+        }
+        assert!(asm.fragmented_picture_done());
+        assert_eq!(asm.slices_received(), 4);
+    }
+
+    /// §14.4: data fragments may be split arbitrarily. Drive a 3x2
+    /// picture with three data fragments: 2 slices from (0, 0),
+    /// 2 slices from (2, 0), 2 slices from (1, 1). Each fragment
+    /// advances `slices_received`; only the final fragment fires
+    /// `picture_done`.
+    #[test]
+    fn assembler_multiple_data_fragments_advance_progressively() {
+        let mut asm = FragmentAssembler::new();
+        asm.on_setup_fragment(&setup_hdr(5), 0xCC).unwrap();
+        asm.on_transform_parameters(3, 2, 0).unwrap();
+
+        let ev1 = asm.on_data_fragment(&data_hdr(5, 2, 0, 0), 0xCC).unwrap();
+        match ev1 {
+            FragmentEvent::DataSlices {
+                coords,
+                picture_done,
+            } => {
+                assert_eq!(coords, vec![(0, 0), (1, 0)]);
+                assert!(!picture_done);
+            }
+            _ => panic!("expected DataSlices"),
+        }
+        assert_eq!(asm.slices_received(), 2);
+
+        let ev2 = asm.on_data_fragment(&data_hdr(5, 2, 2, 0), 0xCC).unwrap();
+        match ev2 {
+            FragmentEvent::DataSlices {
+                coords,
+                picture_done,
+            } => {
+                // Raster start = 0*3 + 2 = 2, then 3 → (2,0) (0,1).
+                assert_eq!(coords, vec![(2, 0), (0, 1)]);
+                assert!(!picture_done);
+            }
+            _ => panic!("expected DataSlices"),
+        }
+        assert_eq!(asm.slices_received(), 4);
+
+        let ev3 = asm.on_data_fragment(&data_hdr(5, 2, 1, 1), 0xCC).unwrap();
+        match ev3 {
+            FragmentEvent::DataSlices {
+                coords,
+                picture_done,
+            } => {
+                // Raster start = 1*3 + 1 = 4, then 5 → (1,1) (2,1).
+                assert_eq!(coords, vec![(1, 1), (2, 1)]);
+                assert!(picture_done);
+            }
+            _ => panic!("expected DataSlices"),
+        }
+        assert!(asm.fragmented_picture_done());
+    }
+
+    /// §14.2: data-fragment picture_number must match the setup
+    /// fragment's. A mismatch is rejected with the setup vs data
+    /// values surfaced in the error payload.
+    #[test]
+    fn assembler_rejects_mismatched_picture_number_on_data_fragment() {
+        let mut asm = FragmentAssembler::new();
+        asm.on_setup_fragment(&setup_hdr(42), 0xCC).unwrap();
+        asm.on_transform_parameters(2, 1, 0).unwrap();
+        let err = asm
+            .on_data_fragment(&data_hdr(43, 1, 0, 0), 0xCC)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            AssemblerError::PictureNumberMismatch {
+                setup: 42,
+                data: 43,
+            }
+        );
+    }
+
+    /// The §14.4 `using_dc_prediction` outcome is captured from the
+    /// setup-fragment parse code; a data fragment whose parse code
+    /// would flip the predicate is rejected (the §14.4 trailing
+    /// kick is keyed off the captured predicate). Setup `0xCC` (LD,
+    /// dc=true) + data `0xEC` (HQ, dc=false) is the regression
+    /// fixture.
+    #[test]
+    fn assembler_rejects_inconsistent_parse_code_within_picture() {
+        let mut asm = FragmentAssembler::new();
+        asm.on_setup_fragment(&setup_hdr(1), 0xCC).unwrap();
+        asm.on_transform_parameters(2, 1, 0).unwrap();
+        let err = asm
+            .on_data_fragment(&data_hdr(1, 1, 0, 0), 0xEC)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            AssemblerError::InconsistentParseCode {
+                setup: _,
+                data: 0xEC
+            }
+        ));
+    }
+
+    /// §14.4 ("Slices shall not be omitted or repeated") — a data
+    /// fragment whose slice count would push the cumulative total
+    /// past `slices_x * slices_y` is rejected with the deficit
+    /// surfaced.
+    #[test]
+    fn assembler_rejects_slice_overflow() {
+        let mut asm = FragmentAssembler::new();
+        asm.on_setup_fragment(&setup_hdr(0), 0xCC).unwrap();
+        asm.on_transform_parameters(2, 1, 0).unwrap();
+        // 2 slices total; first fragment consumes 1, second tries 2.
+        asm.on_data_fragment(&data_hdr(0, 1, 0, 0), 0xCC).unwrap();
+        let err = asm
+            .on_data_fragment(&data_hdr(0, 2, 1, 0), 0xCC)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            AssemblerError::SliceOverflow {
+                expected_total: 2,
+                slices_received: 1,
+                slice_count: 2,
+            }
+        );
+    }
+
+    /// §14.1: a setup fragment while a previous fragmented picture
+    /// is still incomplete is rejected. Once the previous picture
+    /// completes, the next setup is accepted (starts a new picture).
+    #[test]
+    fn assembler_rejects_setup_before_previous_picture_complete() {
+        let mut asm = FragmentAssembler::new();
+        asm.on_setup_fragment(&setup_hdr(0), 0xCC).unwrap();
+        asm.on_transform_parameters(2, 1, 0).unwrap();
+        // Receive only 1 of the 2 slices.
+        asm.on_data_fragment(&data_hdr(0, 1, 0, 0), 0xCC).unwrap();
+        assert!(!asm.fragmented_picture_done());
+        let err = asm.on_setup_fragment(&setup_hdr(1), 0xCC).unwrap_err();
+        assert_eq!(err, AssemblerError::SetupBeforePreviousPictureComplete);
+        // Finish the picture; next setup is now accepted.
+        asm.on_data_fragment(&data_hdr(0, 1, 1, 0), 0xCC).unwrap();
+        assert!(asm.fragmented_picture_done());
+        let ev = asm.on_setup_fragment(&setup_hdr(1), 0xCC).unwrap();
+        assert_eq!(ev, FragmentEvent::SetupAccepted);
+        assert_eq!(asm.picture_number(), 1);
+        assert_eq!(asm.slices_received(), 0, "new picture resets slice counter");
+    }
+
+    /// §12.4.4.3 `dwt_depth_ho` carries through the assembler from
+    /// transform parameters to the §14.4 trailing kick (it picks LL
+    /// vs L subbands for the DC prediction). Pin that the value is
+    /// preserved across the data-fragment ingest sequence.
+    #[test]
+    fn assembler_preserves_dwt_depth_ho_across_data_fragments() {
+        let mut asm = FragmentAssembler::new();
+        asm.on_setup_fragment(&setup_hdr(0), 0xCC).unwrap();
+        asm.on_transform_parameters(2, 2, 3).unwrap();
+        assert_eq!(asm.dwt_depth_ho(), 3);
+        asm.on_data_fragment(&data_hdr(0, 4, 0, 0), 0xCC).unwrap();
+        assert_eq!(asm.dwt_depth_ho(), 3);
+        assert!(asm.fragmented_picture_done());
     }
 }
