@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **VC-2 v3 asymmetric `extended_transform_parameters()` encoder
+  emission + decoder-rejection coverage** (round-212). Extends the
+  round-206 symmetric-default emitter with an `extended_transform_override:
+  Option<ExtendedTransformOverride>` field on both `EncoderParams` and
+  `LdEncoderParams` (with matching `with_extended_transform_override()`
+  builders). When set and `major_version >= 3`, the encoder writes
+  `asym_transform_index_flag = (wavelet_index_ho != wavelet_index)`
+  followed by the gated `wavelet_index_ho` as an interleaved exp-Golomb
+  code per SMPTE ST 2042-1:2022 §12.4.4.2, then
+  `asym_transform_flag = (dwt_depth_ho != 0)` and the gated
+  `dwt_depth_ho` per §12.4.4.3. The override is **negative-testing-only**:
+  the §13.5.5 horizontal-only IDWT is not yet implemented, so any
+  non-default emission is rejected by our own decoder with
+  `PictureError::AsymmetricTransformUnsupported`. Bitstream layout is
+  spec-conformant, so a future asymmetric-IDWT decoder would consume
+  the same bytes unchanged. Also makes `encoder::wavelet_index` public
+  so the override callers can write `wavelet_index_ho` in terms of a
+  `WaveletFilter` value rather than a raw integer constant. Four new
+  integration tests in `tests/encoder_roundtrip.rs` cover the HQ × LD
+  axis crossed with the two override axes:
+  `encode_hq_v3_asym_wavelet_index_ho_rejected_by_decoder`,
+  `encode_hq_v3_asym_dwt_depth_ho_rejected_by_decoder`,
+  `encode_ld_v3_asym_wavelet_index_ho_rejected_by_decoder`,
+  `encode_ld_v3_asym_dwt_depth_ho_rejected_by_decoder` — each asserts
+  the override changes the bitstream relative to the symmetric-default
+  v3 emission AND the decoder surfaces the
+  `"v3 asymmetric transform unsupported"` substring through
+  `core::Error::invalid`.
 - **VC-2 v3 `extended_transform_parameters()` encoder emission** (round-206).
   Encoder-side companion to round-201's decoder-side parser. Both
   `EncoderParams` (HQ) and `LdEncoderParams` (LD) gain a new

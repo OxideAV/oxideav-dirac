@@ -101,9 +101,49 @@ pub struct EncoderParams {
     /// sequence header's `parse_parameters.version_major` to `3` so the
     /// decoder dispatches into [`crate::picture::parse_extended_transform_parameters`].
     /// Encoder emission of asymmetric (non-default) parameters is
-    /// intentionally not exposed — the decoder rejects those streams
-    /// with [`crate::picture::PictureError::AsymmetricTransformUnsupported`].
+    /// exposed via [`Self::extended_transform_override`] for negative
+    /// testing only — our decoder does not yet implement the
+    /// horizontal-only IDWT and will reject the resulting stream with
+    /// [`crate::picture::PictureError::AsymmetricTransformUnsupported`].
     pub major_version: u32,
+    /// Optional override for the `extended_transform_parameters()`
+    /// block (SMPTE ST 2042-1:2022 §12.4.4). `None` (default) keeps the
+    /// symmetric default per the §12.4.4 NOTE: both `read_bool()` flag
+    /// bits are emitted as `False` and the gated `wavelet_index_ho` /
+    /// `dwt_depth_ho` fields are omitted, so the IDWT is identical to
+    /// the v2 process. `Some(_)` instead emits the asymmetric form:
+    /// `asym_transform_index_flag = (wavelet_index_ho != wavelet_index)`
+    /// and `asym_transform_flag = (dwt_depth_ho != 0)`, with each
+    /// non-default value written as an interleaved exp-Golomb code.
+    ///
+    /// Only consulted when [`Self::major_version`] is `>= 3`. The
+    /// override is **negative-testing-only**: our decoder does not yet
+    /// implement the §13.5.5 horizontal-only IDWT, so any non-default
+    /// emission surfaces as
+    /// [`crate::picture::PictureError::AsymmetricTransformUnsupported`]
+    /// at the parse boundary. The override is still spec-conformantly
+    /// written, so a future decoder gaining asymmetric support would
+    /// consume the same bitstream without change.
+    pub extended_transform_override: Option<ExtendedTransformOverride>,
+}
+
+/// Override values for the §12.4.4 `extended_transform_parameters()`
+/// block, used only when [`EncoderParams::extended_transform_override`]
+/// or [`LdEncoderParams::extended_transform_override`] is `Some`.
+/// See those fields for the emission semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExtendedTransformOverride {
+    /// `wavelet_index_ho` (§12.4.4.2). Set equal to the primary
+    /// `wavelet_index` to leave `asym_transform_index_flag` at `False`
+    /// (the gated field is then omitted from the stream); set to a
+    /// different valid wavelet index to emit `asym_transform_index_flag
+    /// = True` followed by this value as an interleaved exp-Golomb code.
+    pub wavelet_index_ho: u32,
+    /// `dwt_depth_ho` (§12.4.4.3). Set to `0` to leave
+    /// `asym_transform_flag` at `False` (the gated field is then
+    /// omitted); set to a positive value to emit `asym_transform_flag =
+    /// True` followed by this value as an interleaved exp-Golomb code.
+    pub dwt_depth_ho: u32,
 }
 
 impl EncoderParams {
@@ -125,6 +165,7 @@ impl EncoderParams {
             qindex: 0,
             slice_size_target: None,
             major_version: 2,
+            extended_transform_override: None,
         }
     }
 
@@ -139,6 +180,20 @@ impl EncoderParams {
     /// [`Self::major_version`] for the full semantics.
     pub fn with_major_version_3(mut self) -> Self {
         self.major_version = 3;
+        self
+    }
+
+    /// Override the §12.4.4 `extended_transform_parameters()` emission
+    /// with explicit asymmetric values. Only takes effect when
+    /// [`Self::major_version`] is `>= 3`. See
+    /// [`Self::extended_transform_override`] for the full semantics.
+    /// Intended for negative testing of the decoder's
+    /// `AsymmetricTransformUnsupported` rejection path.
+    pub fn with_extended_transform_override(
+        mut self,
+        override_: ExtendedTransformOverride,
+    ) -> Self {
+        self.extended_transform_override = Some(override_);
         self
     }
 
@@ -588,18 +643,38 @@ pub fn encode_single_hq_intra_stream_with_size_target(
 fn write_transform_parameters(w: &mut BitWriter, params: &EncoderParams) {
     // wavelet_index, dwt_depth, [extended_transform_parameters], slice
     // parameters, quant matrix flag.
-    w.write_uint(wavelet_index(params.wavelet));
+    let w_idx = wavelet_index(params.wavelet);
+    w.write_uint(w_idx);
     w.write_uint(params.dwt_depth);
-    // §12.4.4 `extended_transform_parameters()` — v3 only. Emit the two
-    // `False` flag bits at their symmetric default so the §12.4.4 NOTE
-    // applies: with `state[wavelet_index_ho] == state[wavelet_index]`
-    // and `state[dwt_depth_ho] == 0` the IDWT is identical to v2.
-    // Asymmetric (non-default) emission is deliberately not exposed —
-    // the decoder rejects those streams with
-    // `AsymmetricTransformUnsupported`.
+    // §12.4.4 `extended_transform_parameters()` — v3 only.
+    //   - Default (`extended_transform_override == None`): emit the two
+    //     `False` flag bits so the §12.4.4 NOTE applies and the IDWT is
+    //     identical to v2.
+    //   - Override `Some({wavelet_index_ho, dwt_depth_ho})`: emit
+    //     `asym_transform_index_flag = (wavelet_index_ho != w_idx)` and
+    //     `asym_transform_flag = (dwt_depth_ho != 0)`, each followed by
+    //     the corresponding interleaved exp-Golomb value when the flag
+    //     is `True`. Negative-testing-only — see
+    //     `EncoderParams::extended_transform_override`.
     if params.major_version >= 3 {
-        w.write_bool(false); // asym_transform_index_flag
-        w.write_bool(false); // asym_transform_flag
+        match params.extended_transform_override {
+            None => {
+                w.write_bool(false); // asym_transform_index_flag
+                w.write_bool(false); // asym_transform_flag
+            }
+            Some(ext) => {
+                let asym_idx = ext.wavelet_index_ho != w_idx;
+                w.write_bool(asym_idx);
+                if asym_idx {
+                    w.write_uint(ext.wavelet_index_ho);
+                }
+                let asym_depth = ext.dwt_depth_ho != 0;
+                w.write_bool(asym_depth);
+                if asym_depth {
+                    w.write_uint(ext.dwt_depth_ho);
+                }
+            }
+        }
     }
     // §12.4.5.2 slice_parameters — HQ branch.
     w.write_uint(params.slices_x);
@@ -649,7 +724,11 @@ fn write_quant_matrix(w: &mut BitWriter, custom: bool, matrix: &QuantMatrix) {
     }
 }
 
-fn wavelet_index(filter: WaveletFilter) -> u32 {
+/// VC-2 §12.4.2 wavelet filter index. Public so that test code building
+/// `extended_transform_parameters()` overrides can specify
+/// `wavelet_index_ho` in terms of a `WaveletFilter` rather than a raw
+/// integer constant.
+pub fn wavelet_index(filter: WaveletFilter) -> u32 {
     match filter {
         WaveletFilter::DeslauriersDubuc9_7 => 0,
         WaveletFilter::LeGall5_3 => 1,
@@ -1205,6 +1284,13 @@ pub struct LdEncoderParams {
     /// path emits the same two flag bits in the same position relative
     /// to `dwt_depth`.
     pub major_version: u32,
+    /// LD counterpart to [`EncoderParams::extended_transform_override`].
+    /// Only consulted when [`Self::major_version`] is `>= 3`. See
+    /// [`EncoderParams::extended_transform_override`] for the full
+    /// semantics — the LD path emits exactly the same bit-level
+    /// `extended_transform_parameters()` block in the same position
+    /// relative to `dwt_depth`.
+    pub extended_transform_override: Option<ExtendedTransformOverride>,
 }
 
 impl LdEncoderParams {
@@ -1233,6 +1319,7 @@ impl LdEncoderParams {
             custom_quant_matrix: false,
             qindex: 0,
             major_version: 2,
+            extended_transform_override: None,
         }
     }
 
@@ -1251,6 +1338,19 @@ impl LdEncoderParams {
     /// the full description.
     pub fn with_major_version_3(mut self) -> Self {
         self.major_version = 3;
+        self
+    }
+
+    /// Override the §12.4.4 `extended_transform_parameters()` emission
+    /// with explicit asymmetric values. Only takes effect when
+    /// [`Self::major_version`] is `>= 3`. LD counterpart to
+    /// [`EncoderParams::with_extended_transform_override`] — see that
+    /// method for the full semantics. Negative-testing-only.
+    pub fn with_extended_transform_override(
+        mut self,
+        override_: ExtendedTransformOverride,
+    ) -> Self {
+        self.extended_transform_override = Some(override_);
         self
     }
 }
@@ -2177,14 +2277,32 @@ pub fn encode_ld_sequence_with_size_target_report(
 }
 
 fn write_ld_transform_parameters(w: &mut BitWriter, params: &LdEncoderParams) {
-    w.write_uint(wavelet_index(params.wavelet));
+    let w_idx = wavelet_index(params.wavelet);
+    w.write_uint(w_idx);
     w.write_uint(params.dwt_depth);
-    // §12.4.4 `extended_transform_parameters()` — v3 only, emitted at
-    // the symmetric-default value. See `write_transform_parameters`
-    // for the HQ-side rationale; the LD path is identical.
+    // §12.4.4 `extended_transform_parameters()` — v3 only. See
+    // `write_transform_parameters` for the HQ-side rationale; the LD
+    // path emits the same two flag bits (and gated values when the
+    // override is set) in the same position relative to `dwt_depth`.
     if params.major_version >= 3 {
-        w.write_bool(false); // asym_transform_index_flag
-        w.write_bool(false); // asym_transform_flag
+        match params.extended_transform_override {
+            None => {
+                w.write_bool(false); // asym_transform_index_flag
+                w.write_bool(false); // asym_transform_flag
+            }
+            Some(ext) => {
+                let asym_idx = ext.wavelet_index_ho != w_idx;
+                w.write_bool(asym_idx);
+                if asym_idx {
+                    w.write_uint(ext.wavelet_index_ho);
+                }
+                let asym_depth = ext.dwt_depth_ho != 0;
+                w.write_bool(asym_depth);
+                if asym_depth {
+                    w.write_uint(ext.dwt_depth_ho);
+                }
+            }
+        }
     }
     // §12.4.5.2 slice_parameters — LD branch.
     w.write_uint(params.slices_x);

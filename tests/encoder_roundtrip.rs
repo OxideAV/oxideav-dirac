@@ -12,7 +12,8 @@ use oxideav_core::CodecRegistry;
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
 use oxideav_dirac::encoder::{
     encode_single_hq_intra_stream, encode_single_ld_intra_stream, make_minimal_sequence,
-    make_minimal_sequence_ld, synthetic_testsrc_64_yuv420, EncoderParams, LdEncoderParams,
+    make_minimal_sequence_ld, synthetic_testsrc_64_yuv420, EncoderParams,
+    ExtendedTransformOverride, LdEncoderParams,
 };
 use oxideav_dirac::video_format::ChromaFormat;
 use oxideav_dirac::wavelet::WaveletFilter;
@@ -321,4 +322,221 @@ fn encode_then_decode_ld_v3_symmetric_default_qindex0_psnr_over_35() {
     );
     assert_eq!(frame_v3.planes[1].data, frame_v2.planes[1].data);
     assert_eq!(frame_v3.planes[2].data, frame_v2.planes[2].data);
+}
+
+// ---------------------------------------------------------------------
+// §12.4.4 asymmetric (non-default) extended_transform_parameters —
+// encoder-side emission, decoder-side rejection.
+//
+// SMPTE ST 2042-1:2022 §12.4.4.2 lets a v3 stream set
+// `wavelet_index_ho != wavelet_index` (raising asym_transform_index_flag)
+// and §12.4.4.3 lets it set `dwt_depth_ho != 0` (raising
+// asym_transform_flag). Either case takes the IDWT off the §12.4.4 NOTE
+// shortcut and into the §13.5.5 horizontal-only path that this decoder
+// does not yet implement.
+//
+// The encoder's `extended_transform_override` field exists so the test
+// suite can exercise both rejection arms without hand-rolling raw VC-2
+// bitstreams. Each test below confirms (a) the override actually
+// changes the bitstream relative to the symmetric-default v3 emission
+// and (b) the decoder surfaces the `AsymmetricTransformUnsupported`
+// rejection through `Error::invalid` — keeping the error message
+// substring as the contract since the codec layer collapses the typed
+// `PictureError` into the generic `core::Error::invalid` family.
+// ---------------------------------------------------------------------
+
+const ASYM_ERR_SUBSTR: &str = "v3 asymmetric transform unsupported";
+
+/// HQ v3 with `asym_transform_index_flag = 1` (wavelet_index_ho != wavelet_index)
+/// must (a) differ from the symmetric-default v3 stream and (b) be rejected
+/// by the decoder with `AsymmetricTransformUnsupported`.
+#[test]
+fn encode_hq_v3_asym_wavelet_index_ho_rejected_by_decoder() {
+    let mut seq_v3 = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    seq_v3.parse_parameters.version_major = 3;
+    let params_sym = EncoderParams::default_hq(WaveletFilter::LeGall5_3, 3).with_major_version_3();
+    // `wavelet_index_ho = 0` (DD9_7 differs from LeGall5_3 = 1) flips
+    // `asym_transform_index_flag` to True and emits the override value
+    // as an interleaved exp-Golomb code. `dwt_depth_ho = 0` keeps the
+    // second flag at its default. Either non-default value is enough
+    // to trip the §12.4.4-NOTE shortcut.
+    let params_asym =
+        params_sym
+            .clone()
+            .with_extended_transform_override(ExtendedTransformOverride {
+                wavelet_index_ho: 0,
+                dwt_depth_ho: 0,
+            });
+
+    let (y, u, v) = synthetic_testsrc_64_yuv420();
+    let stream_sym = encode_single_hq_intra_stream(&seq_v3, &params_sym, 0, &y, &u, &v);
+    let stream_asym = encode_single_hq_intra_stream(&seq_v3, &params_asym, 0, &y, &u, &v);
+
+    assert_ne!(
+        stream_sym, stream_asym,
+        "asymmetric override should change the v3 bitstream (asym_transform_index_flag + exp-Golomb wavelet_index_ho)"
+    );
+
+    let mut reg = CodecRegistry::new();
+    oxideav_dirac::register_codecs(&mut reg);
+    let cp = CodecParameters::video(CodecId::new("dirac"));
+    let mut dec = reg.first_decoder(&cp).expect("decoder");
+    dec.send_packet(&Packet::new(0, TimeBase::new(1, 25), stream_asym))
+        .expect("send asym stream");
+    let err = dec
+        .receive_frame()
+        .expect_err("asymmetric v3 stream must be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains(ASYM_ERR_SUBSTR),
+        "expected `{ASYM_ERR_SUBSTR}` in error, got: {msg}"
+    );
+}
+
+/// HQ v3 with `asym_transform_flag = 1` (dwt_depth_ho > 0) must (a)
+/// differ from the symmetric-default v3 stream and (b) be rejected by
+/// the decoder.
+#[test]
+fn encode_hq_v3_asym_dwt_depth_ho_rejected_by_decoder() {
+    let mut seq_v3 = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    seq_v3.parse_parameters.version_major = 3;
+    let params_sym = EncoderParams::default_hq(WaveletFilter::LeGall5_3, 3).with_major_version_3();
+    let widx = oxideav_dirac::encoder::wavelet_index(params_sym.wavelet);
+    // Keep `wavelet_index_ho == wavelet_index` (no first-flag flip) and
+    // raise `dwt_depth_ho = 1` to flip only the second flag.
+    let params_asym =
+        params_sym
+            .clone()
+            .with_extended_transform_override(ExtendedTransformOverride {
+                wavelet_index_ho: widx,
+                dwt_depth_ho: 1,
+            });
+
+    let (y, u, v) = synthetic_testsrc_64_yuv420();
+    let stream_sym = encode_single_hq_intra_stream(&seq_v3, &params_sym, 0, &y, &u, &v);
+    let stream_asym = encode_single_hq_intra_stream(&seq_v3, &params_asym, 0, &y, &u, &v);
+
+    assert_ne!(
+        stream_sym, stream_asym,
+        "asymmetric override should change the v3 bitstream (asym_transform_flag + exp-Golomb dwt_depth_ho)"
+    );
+
+    let mut reg = CodecRegistry::new();
+    oxideav_dirac::register_codecs(&mut reg);
+    let cp = CodecParameters::video(CodecId::new("dirac"));
+    let mut dec = reg.first_decoder(&cp).expect("decoder");
+    dec.send_packet(&Packet::new(0, TimeBase::new(1, 25), stream_asym))
+        .expect("send asym stream");
+    let err = dec
+        .receive_frame()
+        .expect_err("asymmetric v3 stream must be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains(ASYM_ERR_SUBSTR),
+        "expected `{ASYM_ERR_SUBSTR}` in error, got: {msg}"
+    );
+}
+
+/// LD v3 mirror of the HQ wavelet-index-ho override test: the LD
+/// `write_ld_transform_parameters` path emits the identical
+/// `extended_transform_parameters()` block, so the same rejection arm
+/// fires when decoded.
+#[test]
+fn encode_ld_v3_asym_wavelet_index_ho_rejected_by_decoder() {
+    let mut seq_v3 = make_minimal_sequence_ld(64, 64, ChromaFormat::Yuv420);
+    seq_v3.parse_parameters.version_major = 3;
+    let params_sym =
+        LdEncoderParams::default_ld(WaveletFilter::LeGall5_3, 3, 4, 4, 128).with_major_version_3();
+    let params_asym =
+        params_sym
+            .clone()
+            .with_extended_transform_override(ExtendedTransformOverride {
+                wavelet_index_ho: 0, // DD9_7 != LeGall5_3
+                dwt_depth_ho: 0,
+            });
+
+    let mut y_flat = [0u8; 64 * 64];
+    let u_flat = [128u8; 32 * 32];
+    let v_flat = [128u8; 32 * 32];
+    for row in 0..64 {
+        for col in 0..64 {
+            y_flat[row * 64 + col] = ((row + col) * 2) as u8;
+        }
+    }
+
+    let stream_sym =
+        encode_single_ld_intra_stream(&seq_v3, &params_sym, 0, &y_flat, &u_flat, &v_flat);
+    let stream_asym =
+        encode_single_ld_intra_stream(&seq_v3, &params_asym, 0, &y_flat, &u_flat, &v_flat);
+
+    assert_ne!(
+        stream_sym, stream_asym,
+        "LD asymmetric override should change the v3 bitstream"
+    );
+
+    let mut reg = CodecRegistry::new();
+    oxideav_dirac::register_codecs(&mut reg);
+    let cp = CodecParameters::video(CodecId::new("dirac"));
+    let mut dec = reg.first_decoder(&cp).expect("decoder");
+    dec.send_packet(&Packet::new(0, TimeBase::new(1, 25), stream_asym))
+        .expect("send asym LD stream");
+    let err = dec
+        .receive_frame()
+        .expect_err("asymmetric LD v3 stream must be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains(ASYM_ERR_SUBSTR),
+        "expected `{ASYM_ERR_SUBSTR}` in error, got: {msg}"
+    );
+}
+
+/// LD v3 mirror of the HQ dwt-depth-ho override test.
+#[test]
+fn encode_ld_v3_asym_dwt_depth_ho_rejected_by_decoder() {
+    let mut seq_v3 = make_minimal_sequence_ld(64, 64, ChromaFormat::Yuv420);
+    seq_v3.parse_parameters.version_major = 3;
+    let params_sym =
+        LdEncoderParams::default_ld(WaveletFilter::LeGall5_3, 3, 4, 4, 128).with_major_version_3();
+    let widx = oxideav_dirac::encoder::wavelet_index(params_sym.wavelet);
+    let params_asym =
+        params_sym
+            .clone()
+            .with_extended_transform_override(ExtendedTransformOverride {
+                wavelet_index_ho: widx,
+                dwt_depth_ho: 1,
+            });
+
+    let mut y_flat = [0u8; 64 * 64];
+    let u_flat = [128u8; 32 * 32];
+    let v_flat = [128u8; 32 * 32];
+    for row in 0..64 {
+        for col in 0..64 {
+            y_flat[row * 64 + col] = ((row + col) * 2) as u8;
+        }
+    }
+
+    let stream_sym =
+        encode_single_ld_intra_stream(&seq_v3, &params_sym, 0, &y_flat, &u_flat, &v_flat);
+    let stream_asym =
+        encode_single_ld_intra_stream(&seq_v3, &params_asym, 0, &y_flat, &u_flat, &v_flat);
+
+    assert_ne!(
+        stream_sym, stream_asym,
+        "LD asymmetric override should change the v3 bitstream"
+    );
+
+    let mut reg = CodecRegistry::new();
+    oxideav_dirac::register_codecs(&mut reg);
+    let cp = CodecParameters::video(CodecId::new("dirac"));
+    let mut dec = reg.first_decoder(&cp).expect("decoder");
+    dec.send_packet(&Packet::new(0, TimeBase::new(1, 25), stream_asym))
+        .expect("send asym LD stream");
+    let err = dec
+        .receive_frame()
+        .expect_err("asymmetric LD v3 stream must be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains(ASYM_ERR_SUBSTR),
+        "expected `{ASYM_ERR_SUBSTR}` in error, got: {msg}"
+    );
 }
