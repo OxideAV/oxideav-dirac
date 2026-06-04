@@ -68,6 +68,8 @@
 //! header parser; sequencing belongs to the dispatcher.
 
 use crate::parse_info::ParseInfo;
+use crate::picture::intra_dc_prediction;
+use crate::subband::SubbandData;
 
 /// A picture fragment header, parsed per §14.2.
 ///
@@ -357,6 +359,24 @@ pub enum AssemblerError {
     /// `slices_x == 0` — an out-of-spec transform parameter set.
     /// §13.5.6 requires at least one slice column.
     InvalidSliceGrid { slices_x: u32, slices_y: u32 },
+    /// The §14.5 trailing `dc_prediction(...)` kick was requested
+    /// before every fragment for the active picture had been
+    /// ingested (i.e. before `fragmented_picture_done()` would
+    /// return `true`). §14.5 keys the kick off the §14.4
+    /// `state[fragmented_picture_done]` flag so a partial picture
+    /// must not invoke the trailing prediction step.
+    DcPredictionBeforePictureComplete,
+    /// The §14.5 trailing kick was requested with a `dwt_depth_ho >
+    /// 0` — the picture used the asymmetric (horizontal-only)
+    /// transform from §12.4.4.3, which routes the trailing
+    /// prediction to a level-`dwt_depth_ho` L (low-pass-only)
+    /// subband instead of the level-0 LL subband. The asymmetric
+    /// IDWT path is not implemented in this crate yet (see
+    /// [`crate::picture::PictureError::AsymmetricTransformUnsupported`]);
+    /// the error variant is here so the §14.5 entry point fails
+    /// consistently with the rest of the v3 asymmetric surface
+    /// until that work lands.
+    AsymmetricDcPredictionUnsupported { dwt_depth_ho: u32 },
 }
 
 impl core::fmt::Display for AssemblerError {
@@ -397,6 +417,17 @@ impl core::fmt::Display for AssemblerError {
                 f,
                 "invalid slice grid: slices_x={slices_x}, \
                  slices_y={slices_y}"
+            ),
+            Self::DcPredictionBeforePictureComplete => write!(
+                f,
+                "§14.5 dc_prediction requested before \
+                 fragmented_picture_done"
+            ),
+            Self::AsymmetricDcPredictionUnsupported { dwt_depth_ho } => write!(
+                f,
+                "§14.5 trailing dc_prediction on asymmetric \
+                 transform (dwt_depth_ho={dwt_depth_ho}) not yet \
+                 implemented"
             ),
         }
     }
@@ -602,6 +633,79 @@ impl FragmentAssembler {
             coords,
             picture_done,
         })
+    }
+
+    /// VC-2 v3 §14.5 trailing `dc_prediction(...)` kick.
+    ///
+    /// Once `fragmented_picture_done()` returns `true` (i.e. all
+    /// `slices_x * slices_y` slices for the active picture have been
+    /// ingested via [`Self::on_data_fragment`]), the v3 §14.5
+    /// `fragmented_wavelet_transform()` step runs `dc_prediction(...)`
+    /// on **each component's** level-0 LL subband — but only when
+    /// `using_dc_prediction()` is true (the LD path, parse codes
+    /// `0xC8` / `0xCC`). For an HQ picture (`0xE8` / `0xEC`) the kick
+    /// is skipped entirely; the assembler returns `Ok(())` without
+    /// touching the subbands.
+    ///
+    /// The §13.4 raster prediction step is the exact same routine
+    /// the non-fragmented LD path (`0xC8`) runs after coefficient
+    /// unpack but before the IDWT — the v3 design choice for
+    /// fragmented pictures is to defer it to picture-completion
+    /// time because the prediction reads from already-reconstructed
+    /// neighbours in raster order, and that order is only fully
+    /// determined once every slice has been delivered.
+    ///
+    /// `components` is the per-component slice of mutable level-0 LL
+    /// subbands the caller has assembled from the fragmented slice
+    /// data. The §13.4 routine ([`intra_dc_prediction`]) runs
+    /// in-place on each. Order is irrelevant: each component's LL
+    /// subband is predicted independently (no inter-component
+    /// signalling in the §13.4 routine).
+    ///
+    /// Returns:
+    /// * `Ok(())` after a successful kick (LD path) or a successful
+    ///   no-op (HQ path).
+    /// * `Err(DcPredictionBeforePictureComplete)` if any data
+    ///   fragment for the active picture is still outstanding.
+    /// * `Err(AsymmetricDcPredictionUnsupported { dwt_depth_ho })`
+    ///   if the active picture's `extended_transform_parameters()`
+    ///   selected `dwt_depth_ho > 0` (§12.4.4.3): the §14.5 kick
+    ///   then targets the level-`dwt_depth_ho` L subband instead of
+    ///   the level-0 LL subband, and that path is not implemented
+    ///   in this crate yet — mirrors
+    ///   [`crate::picture::PictureError::AsymmetricTransformUnsupported`]
+    ///   raised by the non-fragmented v3 path.
+    ///
+    /// On success, the assembler does NOT auto-reset; the next setup
+    /// fragment is accepted because `fragmented_picture_done()`
+    /// continues to return `true` until [`Self::on_setup_fragment`]
+    /// is called for a new picture.
+    pub fn fragmented_wavelet_transform_dc_prediction(
+        &self,
+        components: &mut [&mut SubbandData],
+    ) -> Result<(), AssemblerError> {
+        if !self.fragmented_picture_done() {
+            return Err(AssemblerError::DcPredictionBeforePictureComplete);
+        }
+        if !self.using_dc_prediction {
+            // §14.5: the HQ path (`using_dc_prediction == false`)
+            // skips the trailing `dc_prediction(...)` kick entirely.
+            return Ok(());
+        }
+        if self.dwt_depth_ho != 0 {
+            // §14.5 / §12.4.4.3: a horizontal-only depth selects the
+            // level-`dwt_depth_ho` L (low-pass) subband instead of
+            // the level-0 LL subband for the trailing prediction.
+            // The L subband path is not implemented yet — surface
+            // the gap so callers can short-circuit cleanly.
+            return Err(AssemblerError::AsymmetricDcPredictionUnsupported {
+                dwt_depth_ho: self.dwt_depth_ho,
+            });
+        }
+        for ll in components.iter_mut() {
+            intra_dc_prediction(ll);
+        }
+        Ok(())
     }
 }
 
@@ -1280,5 +1384,162 @@ mod tests {
         asm.on_data_fragment(&data_hdr(0, 4, 0, 0), 0xCC).unwrap();
         assert_eq!(asm.dwt_depth_ho(), 3);
         assert!(asm.fragmented_picture_done());
+    }
+
+    /// Convenience: drive the assembler through setup → transform
+    /// parameters (symmetric, `dwt_depth_ho = 0`) → a single data
+    /// fragment that delivers the whole `slices_x * slices_y` picture,
+    /// using the supplied parse code (`0xCC` LD / `0xEC` HQ). Returns
+    /// the primed assembler ready for the §14.5 trailing kick.
+    fn drive_to_completion(parse_code: u8, slices_x: u32, slices_y: u32) -> FragmentAssembler {
+        let total = (slices_x * slices_y) as u16;
+        let mut asm = FragmentAssembler::new();
+        asm.on_setup_fragment(&setup_hdr(0), parse_code).unwrap();
+        asm.on_transform_parameters(slices_x, slices_y, 0).unwrap();
+        asm.on_data_fragment(&data_hdr(0, total, 0, 0), parse_code)
+            .unwrap();
+        assert!(asm.fragmented_picture_done());
+        asm
+    }
+
+    /// Build a 3x3 LL subband whose every coefficient is `1`. After
+    /// the §13.4 / §14.5 trailing `dc_prediction` kick on the LD
+    /// (`0xCC`) path, the reconstructed values walk diagonally per
+    /// the spec's neighbour-mean prediction (see the existing
+    /// `intra_dc_predict_first_row_col` test in `picture.rs`).
+    fn flat_ll_band(width: usize, height: usize, value: i32) -> SubbandData {
+        let mut b = SubbandData::new(width, height);
+        for y in 0..height {
+            for x in 0..width {
+                b.set(y, x, value);
+            }
+        }
+        b
+    }
+
+    /// §14.5 happy path on the LD (`0xCC`) path: after the picture
+    /// is complete, the trailing `dc_prediction(...)` kick runs and
+    /// applies §13.4 raster neighbour-mean prediction to every
+    /// component's level-0 LL subband. Compare against the
+    /// `intra_dc_predict_first_row_col` reference in `picture.rs`:
+    /// the first row walks linearly (each cell adds the value of
+    /// its left neighbour, which is also `1`), so the second cell
+    /// becomes 2, the third 3, and so on.
+    #[test]
+    fn fragmented_dc_prediction_runs_on_ld_path() {
+        let asm = drive_to_completion(0xCC, 2, 2);
+        let mut y_ll = flat_ll_band(3, 3, 1);
+        let mut u_ll = flat_ll_band(3, 3, 1);
+        let mut v_ll = flat_ll_band(3, 3, 1);
+        asm.fragmented_wavelet_transform_dc_prediction(&mut [&mut y_ll, &mut u_ll, &mut v_ll])
+            .unwrap();
+        // First row walks linearly from the seed `1`: 1, 2, 3 per
+        // §13.4 left-neighbour prediction on the topmost row.
+        for band in [&y_ll, &u_ll, &v_ll] {
+            assert_eq!(band.get(0, 0), 1, "(0,0) carries the seed");
+            assert_eq!(band.get(0, 1), 2, "(0,1) = seed + left");
+            assert_eq!(band.get(0, 2), 3, "(0,2) = prev row1 + left");
+        }
+    }
+
+    /// §14.5 / §10.5.2 Table 5: on the HQ (`0xEC`) path the
+    /// trailing `dc_prediction(...)` is skipped entirely — the LL
+    /// subbands survive the kick unchanged.
+    #[test]
+    fn fragmented_dc_prediction_skipped_on_hq_path() {
+        let asm = drive_to_completion(0xEC, 2, 2);
+        let mut y_ll = flat_ll_band(3, 3, 7);
+        let original = y_ll.data.clone();
+        asm.fragmented_wavelet_transform_dc_prediction(&mut [&mut y_ll])
+            .unwrap();
+        assert_eq!(
+            y_ll.data, original,
+            "HQ (0xEC) skips the §14.5 dc_prediction kick"
+        );
+    }
+
+    /// §14.5 keys off `state[fragmented_picture_done]` per §14.4 —
+    /// invoking the trailing kick before the picture is fully
+    /// assembled is rejected.
+    #[test]
+    fn fragmented_dc_prediction_rejects_incomplete_picture() {
+        let mut asm = FragmentAssembler::new();
+        asm.on_setup_fragment(&setup_hdr(0), 0xCC).unwrap();
+        asm.on_transform_parameters(2, 2, 0).unwrap();
+        // Deliver only 2 of the 4 slices.
+        asm.on_data_fragment(&data_hdr(0, 2, 0, 0), 0xCC).unwrap();
+        assert!(!asm.fragmented_picture_done());
+        let mut y_ll = flat_ll_band(3, 3, 1);
+        let err = asm
+            .fragmented_wavelet_transform_dc_prediction(&mut [&mut y_ll])
+            .unwrap_err();
+        assert_eq!(err, AssemblerError::DcPredictionBeforePictureComplete);
+    }
+
+    /// §14.5 / §12.4.4.3: when `dwt_depth_ho > 0`, the trailing
+    /// prediction targets the level-`dwt_depth_ho` L (low-pass-only)
+    /// subband instead of the level-0 LL subband. The L-subband path
+    /// is not implemented yet; the assembler returns
+    /// `AsymmetricDcPredictionUnsupported` with the offending depth
+    /// surfaced for diagnostics. Mirrors the v3 non-fragmented
+    /// `PictureError::AsymmetricTransformUnsupported` rejection.
+    #[test]
+    fn fragmented_dc_prediction_rejects_asymmetric_transform() {
+        let mut asm = FragmentAssembler::new();
+        asm.on_setup_fragment(&setup_hdr(0), 0xCC).unwrap();
+        asm.on_transform_parameters(2, 2, 2).unwrap();
+        asm.on_data_fragment(&data_hdr(0, 4, 0, 0), 0xCC).unwrap();
+        assert!(asm.fragmented_picture_done());
+        let mut y_ll = flat_ll_band(3, 3, 1);
+        let err = asm
+            .fragmented_wavelet_transform_dc_prediction(&mut [&mut y_ll])
+            .unwrap_err();
+        assert_eq!(
+            err,
+            AssemblerError::AsymmetricDcPredictionUnsupported { dwt_depth_ho: 2 }
+        );
+    }
+
+    /// §14.5 on a single-component (luma-only) call site: passing a
+    /// one-element slice runs the kick on just that LL subband.
+    /// Pinned so callers that drive YUV components one at a time do
+    /// not have to construct a 3-element slice.
+    #[test]
+    fn fragmented_dc_prediction_accepts_single_component() {
+        let asm = drive_to_completion(0xCC, 1, 1);
+        let mut y_ll = flat_ll_band(2, 2, 0);
+        // Pre-fill so the prediction has something to differentiate.
+        y_ll.set(0, 0, 4);
+        y_ll.set(0, 1, 1);
+        y_ll.set(1, 0, 1);
+        y_ll.set(1, 1, 1);
+        asm.fragmented_wavelet_transform_dc_prediction(&mut [&mut y_ll])
+            .unwrap();
+        // (0,0) keeps its seed; (0,1) = 1 + left(4) = 5; (1,0) = 1 +
+        // top(4) = 5; (1,1) = 1 + mean3(left=5, top-left=4, top=5) =
+        // 1 + (5+4+5+1)/3 = 1 + 5 = 6.
+        assert_eq!(y_ll.get(0, 0), 4);
+        assert_eq!(y_ll.get(0, 1), 5);
+        assert_eq!(y_ll.get(1, 0), 5);
+        assert_eq!(y_ll.get(1, 1), 6);
+    }
+
+    /// §14.5 on an HQ picture: the kick is a no-op, but an empty
+    /// `components` slice is still accepted — the caller may pass an
+    /// empty slice on the HQ path simply because the kick will be
+    /// skipped anyway. Pin that the empty-slice case does not panic
+    /// on either path.
+    #[test]
+    fn fragmented_dc_prediction_accepts_empty_components() {
+        let asm_hq = drive_to_completion(0xEC, 1, 1);
+        asm_hq
+            .fragmented_wavelet_transform_dc_prediction(&mut [])
+            .unwrap();
+        let asm_ld = drive_to_completion(0xCC, 1, 1);
+        // LD path with no components: kick fires but iterates over
+        // nothing, so still `Ok(())`.
+        asm_ld
+            .fragmented_wavelet_transform_dc_prediction(&mut [])
+            .unwrap();
     }
 }

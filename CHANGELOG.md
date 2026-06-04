@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **VC-2 v3 §14.5 fragmented_wavelet_transform trailing
+  `dc_prediction(...)` kick** (round-233, SMPTE ST 2042-1:2022
+  §14.5). Closes the picture-completion gap that r229's `FragmentAssembler`
+  left open: the assembler now exposes a single
+  `FragmentAssembler::fragmented_wavelet_transform_dc_prediction(components:
+  &mut [&mut SubbandData])` entry point that runs the §13.4 raster
+  neighbour-mean DC prediction in-place on each component's
+  level-0 LL subband once `fragmented_picture_done()` returns
+  true. The LD path (`0xC8` / `0xCC`, captured at setup time via
+  the §10.5.2 Table 5 `using_dc_prediction` predicate) executes
+  the kick; the HQ path (`0xE8` / `0xEC`) returns `Ok(())`
+  without touching the subbands — matching the §14.4 / §14.5
+  rule that the trailing kick is gated by
+  `state[using_dc_prediction]`. Three new `AssemblerError`
+  variants pin the precondition surface:
+  - `DcPredictionBeforePictureComplete` — invocation before
+    `state[fragmented_picture_done] = True` per §14.4 is rejected
+    (matches the §14.5 placement after `fragmented_picture_done`
+    transitions to true).
+  - `AsymmetricDcPredictionUnsupported { dwt_depth_ho }` —
+    `dwt_depth_ho > 0` selects the level-`dwt_depth_ho` L
+    (low-pass-only) subband per §12.4.4.3 instead of the level-0
+    LL subband; the L-subband path is not implemented yet, so the
+    assembler returns the v3-asymmetric gap with the offending
+    depth surfaced for diagnostics. Mirrors the non-fragmented v3
+    decoder's `PictureError::AsymmetricTransformUnsupported`
+    rejection so the v3 asymmetric surface is consistent across
+    fragmented and non-fragmented paths.
+- **6 new fragment-module unit tests** covering: the LD-path
+  happy path (`0xCC` 2x2 picture seeded with `1`s walks linearly
+  to `1,2,3` on the first row per §13.4); HQ-path no-op
+  (`0xEC`-completed picture passes through unchanged); incomplete
+  picture rejection; asymmetric `dwt_depth_ho > 0` rejection;
+  single-component (luma-only) call; empty-components slice
+  accepted on both LD and HQ paths. Crate-wide test count:
+  391 → 397 (+6).
 - **VC-2 v3 fragmented-picture state machine** (round-229, SMPTE ST
   2042-1:2022 §14.3 / §14.4). Builds on r223's fragment-header parser
   by adding the *reassembly* layer:
