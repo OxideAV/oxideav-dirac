@@ -9,6 +9,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **VC-2 v3 fragment-assembler robustness oracle**
+  (round-238) — `tests/fragment_assembler_fuzz_oracle.rs` (9
+  tests, +9 crate-wide tests 397 → 406). Drives a deterministic
+  xorshift-seeded random walk of `(Setup, Transform, Data,
+  DcKick)` operations across 5 000 steps × 8 seeds into a
+  `FragmentAssembler` running in parallel with a reference state
+  model that knows the SMPTE ST 2042-1:2022 §14.1 / §14.3 / §14.4
+  / §14.5 sequencing rules; asserts the assembler and model agree
+  on accept / reject for every transition, that on accept the
+  emitted `coords` length matches `slice_count`, that each
+  `(slice_x, slice_y)` matches the §14.4 pseudocode `raster =
+  y_offset * slices_x + x_offset + s; (raster % slices_x, raster
+  / slices_x)` computed in `u64`, and that
+  `slices_received` / `fragmented_picture_done()` stay in lockstep
+  with the model. Pathological-geometry sweep (`(slices_x,
+  slices_y)` at zero, `u32::MAX`, and the overflowing
+  `(0x1_0000, 0x1_0000)` product) pins the assembler's
+  `saturating_mul` invariant for `expected_total` so
+  `fragmented_picture_done()` stays deterministic and
+  `SliceOverflow` fires correctly. Parse-code-mixing sweep
+  exercises every cross-class pair (HQ setup → LD data and the
+  mirror, all four §10.5.2 Table 5 fragment codes
+  `0xC8`/`0xCC`/`0xE8`/`0xEC`) and confirms the
+  `using_dc_prediction(parse_code) := (parse_code & 0x28) ==
+  0x08` predicate is captured per class. §14.5 DC-kick edge
+  cases pin: rejection before picture completion
+  (`DcPredictionBeforePictureComplete`); HQ no-op even when
+  asymmetric; LD-path success on synthetic LL subbands of varied
+  shapes (1×1, 1×N, N×1, square, 8×8) including a seeded
+  non-zero pattern that would surface arithmetic-overflow bugs
+  in the §13.4 neighbour-mean prediction; LD-path rejection on
+  `dwt_depth_ho ∈ {1, 2, 3, 4}` with
+  `AsymmetricDcPredictionUnsupported`. `slice_coords` helper
+  cross-checked against the §14.4 pseudocode for a Cartesian
+  sweep including `slices_x = u32::MAX`, `x_offset = u16::MAX`,
+  `y_offset = u16::MAX`, `s = u32::MAX` — pins the `u64`-widened
+  arithmetic prevents `u32` overflow on pathological raster
+  indices. Determinism test pins the random walk to its seed so
+  any regression is reproducible by re-running the same seed.
+  Companion to r165's decoder fuzz oracle, r179's encoder
+  rate-control fuzz oracle, and r193's inter-encoder fuzz oracle
+  — the four oracles cover the four largest stateful surfaces in
+  the crate.
 - **VC-2 v3 §14.5 fragmented_wavelet_transform trailing
   `dc_prediction(...)` kick** (round-233, SMPTE ST 2042-1:2022
   §14.5). Closes the picture-completion gap that r229's `FragmentAssembler`
