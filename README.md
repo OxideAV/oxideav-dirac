@@ -48,7 +48,7 @@ the goal here is to land the bitstream framing and primitives first.
 
 ## Fuzz oracles
 
-The crate ships three encoder/decoder fuzz oracles:
+The crate ships four encoder/decoder/assembler fuzz oracles:
 
 - **`tests/decoder_fuzz_oracle.rs`** (round-165) — decoder robustness
   against malformed inputs (truncation walk, byte mutation,
@@ -64,6 +64,26 @@ The crate ships three encoder/decoder fuzz oracles:
   debug-assert / no integer overflow / no livelock + 2-frame round-trip
   on every accepted (`InterEncoderParams`, `InterInputPicture`,
   `InterInputPicture`) combination.
+- **`tests/fragment_assembler_fuzz_oracle.rs`** (round-238, 9 tests)
+  — VC-2 v3 §14.1 / §14.3 / §14.4 / §14.5 `FragmentAssembler` state
+  machine. Deterministic xorshift-seeded random walk (5 000 steps × 8
+  seeds) drives `(Setup, Transform, Data, DcKick)` operations into the
+  assembler in parallel with a reference state model that knows the
+  §14.1 sequencing rules; asserts both agree on accept/reject for every
+  transition, that on accept the emitted `coords.len() == slice_count`
+  and each `(slice_x, slice_y)` matches the §14.4 raster pseudocode
+  computed in `u64`, and that `slices_received` /
+  `fragmented_picture_done()` stay in lockstep with the model. Plus
+  pathological-geometry coverage (`(slices_x, slices_y)` at zero,
+  `u32::MAX`, and the overflowing `(0x1_0000, 0x1_0000)` product)
+  pinning the `saturating_mul` invariant; parse-code-mixing across
+  every §10.5.2 Table 5 cross-class pair (`0xC8`/`0xCC` LD vs
+  `0xE8`/`0xEC` HQ); §14.5 DC-kick edge cases (pre-completion
+  rejection, HQ no-op even when asymmetric, LD-path success on varied
+  LL shapes, LD-path rejection at `dwt_depth_ho ∈ {1, 2, 3, 4}`); and a
+  `slice_coords` Cartesian sweep at `u16::MAX` / `u32::MAX` corners
+  pinning the `u64`-widened arithmetic against `u32` overflow on
+  pathological raster indices.
 
 ## Axis coverage
 
