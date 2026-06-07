@@ -786,7 +786,7 @@ pub(crate) fn parse_extended_transform_parameters(
 }
 
 /// §12.4 `transform_parameters`.
-fn parse_transform_parameters(
+pub(crate) fn parse_transform_parameters(
     r: &mut BitReader<'_>,
     profile: LowDelayProfile,
     major_version: u32,
@@ -871,7 +871,7 @@ fn parse_transform_parameters(
 
 /// §13.5.3.1 LD slice decode.
 #[allow(clippy::too_many_arguments)]
-fn decode_ld_slice(
+pub(crate) fn decode_ld_slice(
     r: &mut BitReader<'_>,
     params: &TransformParameters,
     y_py: &mut [[SubbandData; 4]],
@@ -973,7 +973,7 @@ fn decode_ld_slice(
 
 /// §13.5.4 HQ slice decode.
 #[allow(clippy::too_many_arguments)]
-fn decode_hq_slice(
+pub(crate) fn decode_hq_slice(
     r: &mut BitReader<'_>,
     params: &TransformParameters,
     y_py: &mut [[SubbandData; 4]],
@@ -1157,7 +1157,12 @@ fn mean3(a: i32, b: i32, c: i32) -> i32 {
 /// Crop the IDWT output to the real component size (§15.7), clip to
 /// `[-2^(depth-1), 2^(depth-1) - 1]` (§15.9), and offset by
 /// `2^(depth-1)` for non-negative output (§15.10).
-fn trim_clip_offset(big: &SubbandData, out_w: usize, out_h: usize, depth: u32) -> Vec<i32> {
+pub(crate) fn trim_clip_offset(
+    big: &SubbandData,
+    out_w: usize,
+    out_h: usize,
+    depth: u32,
+) -> Vec<i32> {
     let half = if depth == 0 {
         1i32
     } else {

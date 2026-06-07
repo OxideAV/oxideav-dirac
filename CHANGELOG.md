@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **VC-2 v3 fragmented-picture decoder** (round-248) —
+  `FragmentedPictureDecoder<'s>` in `src/fragment.rs`, the
+  picture-level driver that ties the §14 `FragmentAssembler`
+  state machine to the §13.5 LD / HQ slice coefficient
+  decoders. `new(&SequenceHeader)` builds an empty driver;
+  `on_setup_fragment(&ParseInfo, payload)` parses the §14.2
+  setup header, runs the §12.4 transform-parameters block
+  (LD profile derived from `0xCC`, HQ from `0xEC`), allocates
+  the three component pyramids and pre-computes per-level
+  subband dims; `on_data_fragment(&ParseInfo, payload)`
+  parses the §14.2 12-byte data header, walks the §14.4
+  raster `(slice_x, slice_y)` coordinates and dispatches
+  each slice through the same `picture::decode_ld_slice` /
+  `picture::decode_hq_slice` primitives the non-fragmented
+  `decode_picture` path uses (now `pub(crate)` for the
+  driver); `finish()` runs the §14.5 trailing DC kick
+  (LD only, HQ skipped per spec), the §13.3 IDWT, and the
+  §13.6 trim / clip / output offset, returning a
+  `DecodedPicture` bit-exact-equivalent to running
+  `decode_picture` on a non-fragmented version of the same
+  picture. New `FragmentedPictureError` wraps the three
+  error sources distinctly: `Header(FragmentError)`,
+  `Assembler(AssemblerError)`, `Picture(PictureError)`;
+  plus `UnsupportedParseCode(u8)` (only `0xCC` / `0xEC`
+  accepted), `NoActivePicture` (data fragment or `finish`
+  before any setup), and `PictureIncomplete {
+  slices_received, slices_expected }` (`finish` before
+  §14.4 picture-done). The driver is reusable across
+  consecutive pictures. `tests/fragmented_picture_decoder.rs`
+  (9 new integration tests) pins HQ q=0 bit-exact vs the
+  non-fragmented reference for both the
+  all-slices-in-one-data-fragment shape and the
+  one-data-fragment-per-slice shape; the matching LD q=0
+  pair (which exercises the §14.5 DC kick); `finish` rejection
+  of an incomplete picture with the exact counters;
+  data-fragment-before-setup rejection; non-fragment parse-code
+  rejection; consecutive-pictures reuse on one driver.
+  Crate-wide tests grow 406 → 415 (+9).
 - **VC-2 v3 fragment-assembler robustness oracle**
   (round-238) — `tests/fragment_assembler_fuzz_oracle.rs` (9
   tests, +9 crate-wide tests 397 → 406). Drives a deterministic

@@ -67,9 +67,16 @@
 //! enforce that sequencing constraint — it is purely a per-unit
 //! header parser; sequencing belongs to the dispatcher.
 
+use crate::bits::BitReader;
 use crate::parse_info::ParseInfo;
-use crate::picture::intra_dc_prediction;
-use crate::subband::SubbandData;
+use crate::picture::{
+    decode_hq_slice, decode_ld_slice, intra_dc_prediction, low_delay_profile_for,
+    parse_transform_parameters, trim_clip_offset, DecodedPicture, LowDelayProfile, PictureError,
+    TransformParameters,
+};
+use crate::sequence::SequenceHeader;
+use crate::subband::{init_pyramid, subband_dims, SubbandData};
+use crate::wavelet::idwt;
 
 /// A picture fragment header, parsed per §14.2.
 ///
@@ -777,6 +784,433 @@ impl ParseInfo {
     /// the HQ path does not.
     pub fn using_dc_prediction(&self) -> bool {
         (self.parse_code & 0x28) == 0x08
+    }
+}
+
+/// Errors raised by [`FragmentedPictureDecoder`] when fragments are
+/// fed in.
+///
+/// Sequencing errors (data-fragment-before-setup, setup-before-prior-
+/// picture-complete, parse-code-flip, slice overflow, …) and the
+/// asymmetric-transform gap are routed through [`AssemblerError`]; the
+/// payload-level errors (truncated header bytes, malformed
+/// transform-parameters, slice-coefficient overflow) are routed through
+/// [`PictureError`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FragmentedPictureError {
+    /// The fragment header itself failed to parse (the per-fragment
+    /// parse-info-relative payload was shorter than the §14.2 minimum
+    /// 8- or 12-byte header layout).
+    Header(FragmentError),
+    /// The fragment assembler's §14.1 / §14.3 / §14.4 sequencing or
+    /// §14.5 trailing-kick contract was violated.
+    Assembler(AssemblerError),
+    /// The fragment payload (transform_parameters or slice bytes)
+    /// failed to parse — same error surface as the non-fragmented
+    /// [`crate::picture::decode_picture`] path.
+    Picture(PictureError),
+    /// A setup fragment arrived for a non-LD / non-HQ parse code. The
+    /// only valid fragment parse codes are `0xCC` (LD fragment) and
+    /// `0xEC` (HQ fragment); other §10.5.2 Table 4 codes are not
+    /// fragments and the dispatcher should not feed them here.
+    UnsupportedParseCode(u8),
+    /// A data fragment / `finish` arrived before any setup fragment
+    /// has been ingested — the decoder has no transform parameters
+    /// or pyramid state to operate on yet.
+    NoActivePicture,
+    /// `finish()` was called while at least one §14.4 data slice was
+    /// still outstanding for the active picture (i.e.
+    /// `fragmented_picture_done() == false`).
+    PictureIncomplete {
+        slices_received: u32,
+        slices_expected: u32,
+    },
+}
+
+impl core::fmt::Display for FragmentedPictureError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Header(e) => write!(f, "{e}"),
+            Self::Assembler(e) => write!(f, "{e}"),
+            Self::Picture(e) => write!(f, "{e}"),
+            Self::UnsupportedParseCode(c) => write!(
+                f,
+                "unsupported fragment parse code 0x{c:02X} (expected 0xCC LD or 0xEC HQ)"
+            ),
+            Self::NoActivePicture => write!(
+                f,
+                "fragment arrived before a setup fragment established a picture"
+            ),
+            Self::PictureIncomplete {
+                slices_received,
+                slices_expected,
+            } => write!(
+                f,
+                "finish() called with {slices_received}/{slices_expected} slices ingested"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for FragmentedPictureError {}
+
+impl From<FragmentError> for FragmentedPictureError {
+    fn from(e: FragmentError) -> Self {
+        Self::Header(e)
+    }
+}
+
+impl From<AssemblerError> for FragmentedPictureError {
+    fn from(e: AssemblerError) -> Self {
+        Self::Assembler(e)
+    }
+}
+
+impl From<PictureError> for FragmentedPictureError {
+    fn from(e: PictureError) -> Self {
+        Self::Picture(e)
+    }
+}
+
+/// VC-2 v3 fragmented-picture decoder.
+///
+/// `FragmentedPictureDecoder` is the §14 driver that wraps a
+/// [`FragmentAssembler`] together with the per-picture decoding state
+/// (`TransformParameters`, the three component pyramids, and the
+/// per-level dimension caches) and bridges the syntactic
+/// [`FragmentEvent`] stream to the coefficient-decode primitives in
+/// [`crate::picture`].
+///
+/// A driver feeds setup and data fragments in §14.1 order:
+///
+/// ```text
+/// dec = FragmentedPictureDecoder::new(&sequence);
+/// for each fragmented data-unit (parse_info, payload):
+///     if parse_info.is_setup_fragment():
+///         dec.on_setup_fragment(parse_info, payload)?;
+///     else if parse_info.is_data_fragment():
+///         dec.on_data_fragment(parse_info, payload)?;
+/// let picture = dec.finish()?;
+/// ```
+///
+/// `on_setup_fragment` parses the §14.2 fragment header (`Setup` kind)
+/// then immediately runs the §12.4 transform-parameters block on the
+/// bytes that follow, allocates a fresh per-component pyramid sized for
+/// the sequence header's frame geometry, and transitions the assembler
+/// to `ReceivingData`. `on_data_fragment` parses the §14.2 fragment
+/// header (`Data` kind), walks the §14.4 raster `(slice_x, slice_y)`
+/// coordinates, and per-slice calls the same `decode_ld_slice` /
+/// `decode_hq_slice` primitives the non-fragmented
+/// [`crate::picture::decode_picture`] path uses — the byte boundary
+/// between slices comes from the same §13.5.3 / §13.5.4 rate-control
+/// rules so a multi-slice data fragment is read as a contiguous bit
+/// stream straddling those boundaries.
+///
+/// On the LD path, `finish()` runs the §14.5 trailing
+/// `dc_prediction(...)` kick on each component's level-0 LL subband
+/// before the IDWT; the HQ path skips the kick (§14.5 explicitly).
+/// Both paths then run the §13.3 inverse wavelet transform, the §13.6
+/// trim / clip / output offset, and return the
+/// [`crate::picture::DecodedPicture`] — bit-exact-equivalent to running
+/// [`crate::picture::decode_picture`] on a non-fragmented version of
+/// the same picture.
+///
+/// The decoder is reusable: once `finish()` returns successfully its
+/// assembler is in `ReceivingData` with `fragmented_picture_done()`
+/// still true, so the next `on_setup_fragment` call is accepted per
+/// §14.1 and starts the next picture cleanly.
+#[derive(Debug, Clone)]
+pub struct FragmentedPictureDecoder<'s> {
+    sequence: &'s SequenceHeader,
+    assembler: FragmentAssembler,
+    /// Active picture's transform parameters (None before the first
+    /// `on_setup_fragment` call).
+    params: Option<TransformParameters>,
+    /// Active picture's profile cached from the setup parse code.
+    profile: Option<LowDelayProfile>,
+    /// Picture number from the latest setup fragment.
+    picture_number: u32,
+    /// Per-component pyramids holding the dequantised coefficients.
+    /// Sized by `init_pyramid` at setup-fragment time.
+    y_py: Vec<[SubbandData; 4]>,
+    u_py: Vec<[SubbandData; 4]>,
+    v_py: Vec<[SubbandData; 4]>,
+    /// Per-level `(width, height)` of every component's subband
+    /// pyramid. Computed once per setup fragment and reused on every
+    /// slice decode.
+    luma_dims: Vec<(usize, usize)>,
+    chroma_dims: Vec<(usize, usize)>,
+}
+
+impl<'s> FragmentedPictureDecoder<'s> {
+    /// Build an empty decoder rooted at the sequence header that
+    /// preceded the fragmented picture(s). The header carries the
+    /// luma / chroma resolution and bit depth needed by the per-slice
+    /// pyramid sizing and the §13.6 output-offset step.
+    pub fn new(sequence: &'s SequenceHeader) -> Self {
+        Self {
+            sequence,
+            assembler: FragmentAssembler::new(),
+            params: None,
+            profile: None,
+            picture_number: 0,
+            y_py: Vec::new(),
+            u_py: Vec::new(),
+            v_py: Vec::new(),
+            luma_dims: Vec::new(),
+            chroma_dims: Vec::new(),
+        }
+    }
+
+    /// Borrow the underlying §14.3 assembler — useful for tests / for
+    /// callers that want to introspect `fragmented_picture_done()` /
+    /// `slices_received()` mid-picture.
+    pub fn assembler(&self) -> &FragmentAssembler {
+        &self.assembler
+    }
+
+    /// Active picture's `(slices_x, slices_y, dwt_depth)` cached from
+    /// the latest setup-fragment transform parameters. Returns `None`
+    /// before the first setup fragment is ingested.
+    pub fn transform_parameters(&self) -> Option<&TransformParameters> {
+        self.params.as_ref()
+    }
+
+    /// Active picture's `picture_number` per §14.2. Zero before the
+    /// first setup fragment is ingested.
+    pub fn picture_number(&self) -> u32 {
+        self.picture_number
+    }
+
+    /// Ingest a §14.1 setup fragment.
+    ///
+    /// `payload` is the parse-info-relative byte slice — the bytes
+    /// immediately after the 13-byte parse-info header, exactly as
+    /// produced by [`crate::stream::DataUnitIter`]. The first 8 bytes
+    /// are the §14.2 setup fragment header (`fragment_slice_count ==
+    /// 0`); the remaining bytes carry the §12.4 transform-parameters
+    /// block (byte-aligned).
+    ///
+    /// On success the assembler is in `ReceivingData` phase and the
+    /// per-component pyramids are allocated; the next call must be
+    /// [`Self::on_data_fragment`].
+    pub fn on_setup_fragment(
+        &mut self,
+        parse_info: &ParseInfo,
+        payload: &[u8],
+    ) -> Result<(), FragmentedPictureError> {
+        // §10.5.2 Table 4: only 0xCC (LD fragment) and 0xEC (HQ
+        // fragment) are picture-fragment parse codes.
+        let profile = low_delay_profile_for(parse_info.parse_code).ok_or(
+            FragmentedPictureError::UnsupportedParseCode(parse_info.parse_code),
+        )?;
+        let header = FragmentHeader::parse(payload)?;
+        if !matches!(header.kind, FragmentKind::Setup) {
+            return Err(FragmentedPictureError::Assembler(
+                AssemblerError::UnexpectedDataFragment,
+            ));
+        }
+        self.assembler
+            .on_setup_fragment(&header, parse_info.parse_code)?;
+
+        // The transform_parameters block lives in the bytes after the
+        // 8-byte setup header.
+        let tp_bytes = &payload[FragmentHeader::MIN_SIZE..];
+        let mut r = BitReader::new(tp_bytes);
+        // Per §12.4 the block is byte-aligned at this entry; the
+        // setup header is itself byte-aligned (8 bytes) so we start
+        // at bit 0 of the trailing region — `byte_align` here is a
+        // no-op but keeps the call shape consistent with the
+        // non-fragmented path.
+        r.byte_align();
+        let params = parse_transform_parameters(
+            &mut r,
+            profile,
+            self.sequence.parse_parameters.version_major,
+        )?;
+        self.assembler.on_transform_parameters(
+            params.slices_x,
+            params.slices_y,
+            // §12.4.4.3 `dwt_depth_ho` defaulted to 0 for v2 streams
+            // and on v3 streams that landed in the symmetric default.
+            // The asymmetric path is rejected in
+            // `parse_transform_parameters` so we always pass 0 here.
+            0,
+        )?;
+
+        // Allocate the three component pyramids and pre-compute per-
+        // level subband dims (every slice call needs both).
+        let luma_w = self.sequence.luma_width;
+        let luma_h = self.sequence.luma_height;
+        let chroma_w = self.sequence.chroma_width;
+        let chroma_h = self.sequence.chroma_height;
+        self.y_py = init_pyramid(luma_w, luma_h, params.dwt_depth);
+        self.u_py = init_pyramid(chroma_w, chroma_h, params.dwt_depth);
+        self.v_py = init_pyramid(chroma_w, chroma_h, params.dwt_depth);
+        self.luma_dims = Vec::with_capacity(params.dwt_depth as usize + 1);
+        self.chroma_dims = Vec::with_capacity(params.dwt_depth as usize + 1);
+        for level in 0..=params.dwt_depth {
+            self.luma_dims
+                .push(subband_dims(luma_w, luma_h, params.dwt_depth, level));
+            self.chroma_dims
+                .push(subband_dims(chroma_w, chroma_h, params.dwt_depth, level));
+        }
+        self.picture_number = header.picture_number;
+        self.profile = Some(profile);
+        self.params = Some(params);
+        Ok(())
+    }
+
+    /// Ingest a §14.1 data fragment.
+    ///
+    /// `payload` is the parse-info-relative byte slice. The first
+    /// 12 bytes are the §14.2 data-fragment header
+    /// (`fragment_slice_count > 0` plus `(x_offset, y_offset)`); the
+    /// remaining bytes carry `slice_count` consecutive §13.5.3.2 LD
+    /// or §13.5.4 HQ slices, byte-aligned at the entry to slice 0 and
+    /// re-aligned at slice boundaries by the same rules as the
+    /// non-fragmented path.
+    pub fn on_data_fragment(
+        &mut self,
+        parse_info: &ParseInfo,
+        payload: &[u8],
+    ) -> Result<(), FragmentedPictureError> {
+        if self.params.is_none() || self.profile.is_none() {
+            return Err(FragmentedPictureError::NoActivePicture);
+        }
+        let header = FragmentHeader::parse(payload)?;
+        if !matches!(header.kind, FragmentKind::Data { .. }) {
+            return Err(FragmentedPictureError::Assembler(
+                AssemblerError::UnexpectedDataFragment,
+            ));
+        }
+        let event = self
+            .assembler
+            .on_data_fragment(&header, parse_info.parse_code)?;
+        let coords = match event {
+            FragmentEvent::DataSlices { coords, .. } => coords,
+            // `on_data_fragment` only ever returns `DataSlices`; this
+            // branch exists to keep the match exhaustive.
+            FragmentEvent::SetupAccepted => {
+                return Err(FragmentedPictureError::Assembler(
+                    AssemblerError::UnexpectedDataFragment,
+                ));
+            }
+        };
+
+        // The slice payload starts immediately after the 12-byte data
+        // fragment header.
+        let slice_bytes = &payload[FragmentHeader::DATA_SIZE..];
+        let mut r = BitReader::new(slice_bytes);
+        // §13.5.3 / §13.5.4 entry: byte-aligned at the start of slice 0.
+        r.byte_align();
+        let profile = self.profile.expect("profile set above");
+        let params = self.params.as_ref().expect("params set above");
+        for (slice_x, slice_y) in coords {
+            match profile {
+                LowDelayProfile::LD => {
+                    decode_ld_slice(
+                        &mut r,
+                        params,
+                        &mut self.y_py,
+                        &mut self.u_py,
+                        &mut self.v_py,
+                        slice_x,
+                        slice_y,
+                        &self.luma_dims,
+                        &self.chroma_dims,
+                    )?;
+                }
+                LowDelayProfile::HQ => {
+                    decode_hq_slice(
+                        &mut r,
+                        params,
+                        &mut self.y_py,
+                        &mut self.u_py,
+                        &mut self.v_py,
+                        slice_x,
+                        slice_y,
+                        &self.luma_dims,
+                        &self.chroma_dims,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Finalise the active picture once every §14.4 data slice has
+    /// been ingested.
+    ///
+    /// Runs:
+    /// 1. The §14.5 trailing `dc_prediction(...)` kick on each
+    ///    component's level-0 LL subband (LD path only; HQ is a no-op).
+    /// 2. The §13.3 inverse wavelet transform on every component.
+    /// 3. The §13.6 trim / clip / output-offset step that maps signed
+    ///    coefficients to the final `[0, 2^depth - 1]` sample range.
+    ///
+    /// Returns the resulting [`DecodedPicture`].
+    ///
+    /// Errors:
+    /// * [`FragmentedPictureError::NoActivePicture`] if no setup
+    ///   fragment has been ingested.
+    /// * [`FragmentedPictureError::PictureIncomplete`] if at least
+    ///   one §14.4 data slice is still outstanding.
+    pub fn finish(&mut self) -> Result<DecodedPicture, FragmentedPictureError> {
+        let params = self
+            .params
+            .as_ref()
+            .ok_or(FragmentedPictureError::NoActivePicture)?;
+        let profile = self
+            .profile
+            .ok_or(FragmentedPictureError::NoActivePicture)?;
+        if !self.assembler.fragmented_picture_done() {
+            return Err(FragmentedPictureError::PictureIncomplete {
+                slices_received: self.assembler.slices_received(),
+                slices_expected: self
+                    .assembler
+                    .slices_x()
+                    .saturating_mul(self.assembler.slices_y()),
+            });
+        }
+
+        // §14.5 trailing DC-prediction kick. The non-fragmented LD
+        // path (`decode_low_delay_picture`) runs this inline after the
+        // slice loop; the fragmented LD path defers it to picture
+        // completion per §14.5. HQ skips entirely.
+        if matches!(profile, LowDelayProfile::LD) {
+            self.assembler
+                .fragmented_wavelet_transform_dc_prediction(&mut [
+                    &mut self.y_py[0][0],
+                    &mut self.u_py[0][0],
+                    &mut self.v_py[0][0],
+                ])?;
+        }
+
+        let y_data = idwt(&self.y_py, params.wavelet);
+        let u_data = idwt(&self.u_py, params.wavelet);
+        let v_data = idwt(&self.v_py, params.wavelet);
+
+        let luma_w = self.sequence.luma_width as usize;
+        let luma_h = self.sequence.luma_height as usize;
+        let chroma_w = self.sequence.chroma_width as usize;
+        let chroma_h = self.sequence.chroma_height as usize;
+        let y = trim_clip_offset(&y_data, luma_w, luma_h, self.sequence.luma_depth);
+        let u = trim_clip_offset(&u_data, chroma_w, chroma_h, self.sequence.chroma_depth);
+        let v = trim_clip_offset(&v_data, chroma_w, chroma_h, self.sequence.chroma_depth);
+
+        Ok(DecodedPicture {
+            picture_number: self.picture_number,
+            luma_width: luma_w,
+            luma_height: luma_h,
+            chroma_width: chroma_w,
+            chroma_height: chroma_h,
+            y,
+            u,
+            v,
+            luma_depth: self.sequence.luma_depth,
+            chroma_depth: self.sequence.chroma_depth,
+        })
     }
 }
 
