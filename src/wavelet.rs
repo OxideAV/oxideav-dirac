@@ -425,6 +425,136 @@ pub fn idwt(pyramid: &[[SubbandData; 4]], filter: WaveletFilter) -> SubbandData 
     ll
 }
 
+/// One-dimensional **horizontal-only** synthesis stage — SMPTE ST
+/// 2042-1:2022 §15.4.2 `h_synthesis(state, L_data, H_data)`.
+///
+/// The horizontal-only IDWT step combines two equal-shape subbands — a
+/// low-pass `L` and a high-pass `H` — into an output array that is
+/// **twice as wide and the same height**. Both inputs must share the
+/// same `(width, height)`.
+///
+/// The pseudocode is:
+///
+/// 1. `synth = new_array(height(L_data), 2 * width(L_data))`
+///    (§15.4.2 step 1).
+/// 2. For each row `y` and column `x`:
+///    `synth[y][2*x]     = L_data[y][x]`
+///    `synth[y][2*x + 1] = H_data[y][x]`
+///    (§15.4.2 step 2 — horizontal interleave).
+/// 3. For each row `y`: `oned_synthesis(row(synth, y), state[wavelet_index_ho])`
+///    (§15.4.2 step 3 — one-dimensional synthesis along the rows only;
+///    columns are untouched).
+/// 4. If `filter_bit_shift(state[wavelet_index_ho]) > 0`, rounding
+///    right-shift every sample by that many bits (§15.4.2 step 4).
+///
+/// The `filter` argument carries the §12.4.4 horizontal-only filter
+/// (`state[wavelet_index_ho]` — Tables 16-22) — independent of the
+/// fully-2-D `state[wavelet_index]` consumed by [`vh_synth`]. Same
+/// seven-filter palette in either role.
+///
+/// This is the §15.4.2 building block needed to support the §12.4.4
+/// asymmetric (horizontal-only) transform path: when
+/// `state[dwt_depth_ho] > 0`, the §15.4.1 IDWT runs `dwt_depth_ho`
+/// invocations of `h_synthesis` (working from `coeff_data[0][L]` /
+/// `coeff_data[n][H]`) before switching to [`vh_synth`] for the
+/// remaining `state[dwt_depth]` levels.
+pub fn h_synth(l: &SubbandData, h: &SubbandData, filter: WaveletFilter) -> SubbandData {
+    debug_assert_eq!(l.width, h.width);
+    debug_assert_eq!(l.height, h.height);
+    let in_w = l.width;
+    let in_h = l.height;
+    let out_w = 2 * in_w;
+    let out_h = in_h;
+    let mut synth = SubbandData::new(out_w, out_h);
+    // Step 2: horizontal interleave — even columns from L, odd from H.
+    {
+        let dst = &mut synth.data[..];
+        let l_d = &l.data[..];
+        let h_d = &h.data[..];
+        for y in 0..in_h {
+            let in_off = y * in_w;
+            let out_off = y * out_w;
+            let l_row = &l_d[in_off..in_off + in_w];
+            let h_row = &h_d[in_off..in_off + in_w];
+            let dst_row = &mut dst[out_off..out_off + out_w];
+            for x in 0..in_w {
+                dst_row[2 * x] = l_row[x];
+                dst_row[2 * x + 1] = h_row[x];
+            }
+        }
+    }
+    // Step 3: 1-D synthesis along every row — already a contiguous slice.
+    // No vertical synthesis: that's the whole point of the horizontal-only
+    // path (§12.4.4.3).
+    for y in 0..out_h {
+        let row = synth.row_mut(y);
+        one_d_synthesis(row, filter);
+    }
+    // Step 4: accuracy-bit rounding shift.
+    let shift = filter.filter_shift();
+    if shift > 0 {
+        let round = 1i32 << (shift - 1);
+        for v in synth.data.iter_mut() {
+            *v = v.wrapping_add(round) >> shift;
+        }
+    }
+    synth
+}
+
+/// Forward horizontal-only analysis — exact inverse of [`h_synth`].
+///
+/// Splits a `2w × h` picture-shaped array into two equal-shape `w × h`
+/// subbands `(L, H)`. Used by encoder paths that want to produce a
+/// horizontal-only stage, and by round-trip tests that need to confirm
+/// [`h_synth`] is integer-reversible for every spec filter.
+///
+/// Mirrors the four-step structure of [`vh_analysis`] without the
+/// vertical pass:
+///
+/// 1. Left-shift every sample by `filter_shift()` (undo the accuracy-bit
+///    drop §15.4.2 step 4 inserted).
+/// 2. One-dimensional analysis along every row.
+/// 3. De-interleave: column `2x` → `L[y][x]`, column `2x + 1` → `H[y][x]`.
+pub fn h_analysis(picture: &SubbandData, filter: WaveletFilter) -> (SubbandData, SubbandData) {
+    debug_assert!(picture.width % 2 == 0);
+    let out_w = picture.width;
+    let out_h = picture.height;
+    let mut work = picture.clone();
+    // Step 1: undo the accuracy-bit shift.
+    let shift = filter.filter_shift();
+    if shift > 0 {
+        for v in work.data.iter_mut() {
+            *v = v.wrapping_shl(shift);
+        }
+    }
+    // Step 2: horizontal analysis per row.
+    for y in 0..out_h {
+        let row = work.row_mut(y);
+        one_d_analysis(row, filter);
+    }
+    // Step 3: de-interleave.
+    let half_w = out_w / 2;
+    let mut l = SubbandData::new(half_w, out_h);
+    let mut h = SubbandData::new(half_w, out_h);
+    {
+        let src = &work.data[..];
+        let l_d = &mut l.data[..];
+        let h_d = &mut h.data[..];
+        for y in 0..out_h {
+            let src_off = y * out_w;
+            let dst_off = y * half_w;
+            let src_row = &src[src_off..src_off + out_w];
+            let l_row = &mut l_d[dst_off..dst_off + half_w];
+            let h_row = &mut h_d[dst_off..dst_off + half_w];
+            for x in 0..half_w {
+                l_row[x] = src_row[2 * x];
+                h_row[x] = src_row[2 * x + 1];
+            }
+        }
+    }
+    (l, h)
+}
+
 // --------------------------------------------------------------------
 //   Forward (analysis) transform — the exact inverse of the synthesis
 //   path used by the decoder above. This is what the encoder runs on
@@ -914,5 +1044,150 @@ mod tests {
                 assert_eq!(back.get(y, x), pic.get(y, x), "({x},{y})");
             }
         }
+    }
+
+    // -----------------------------------------------------------------
+    //   §15.4.2 h_synthesis tests — horizontal-only IDWT step.
+    // -----------------------------------------------------------------
+
+    /// §15.4.2 sanity check: feeding `h_synth` a pure-DC L band (with
+    /// the accuracy-bit pre-shift) and a zero H band reproduces a
+    /// uniform output at the original DC value, exactly like the
+    /// symmetric DC test above. LeGall (5,3) `filter_shift() == 1`, so
+    /// the L coefficient is pre-shifted by 1.
+    #[test]
+    fn h_synth_from_dc_reconstructs_uniform_legall() {
+        let w = 6;
+        let h = 4;
+        let mut l = SubbandData::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                // Pre-shift the DC up by filter_shift = 1 so the step-4
+                // rounding right-shift restores the original value.
+                l.set(y, x, 23 << 1);
+            }
+        }
+        let zeros = SubbandData::new(w, h);
+        let out = h_synth(&l, &zeros, WaveletFilter::LeGall5_3);
+        assert_eq!(out.width, 2 * w);
+        assert_eq!(out.height, h);
+        for y in 0..out.height {
+            for x in 0..out.width {
+                assert_eq!(out.get(y, x), 23, "({x},{y}) got {}", out.get(y, x));
+            }
+        }
+    }
+
+    /// `h_synth` only touches rows: a row-pattern in L should land in
+    /// the even columns of the output regardless of `y`, and the H band
+    /// should not bleed into columns of a different row.
+    #[test]
+    fn h_synth_keeps_rows_independent_haar0() {
+        // Haar0 has filter_shift == 0 and a trivial lifting kernel — the
+        // post-synthesis even/odd interleaving recovery is the simplest
+        // to reason about, so a row-distinguishing pattern flows through
+        // cleanly.
+        let w = 4;
+        let h = 3;
+        let mut l = SubbandData::new(w, h);
+        let mut hh = SubbandData::new(w, h);
+        // Distinct row constants so any vertical leak is visible.
+        for y in 0..h {
+            for x in 0..w {
+                l.set(y, x, 100 + y as i32);
+                hh.set(y, x, 7 + y as i32 * 11);
+            }
+        }
+        let out = h_synth(&l, &hh, WaveletFilter::Haar0);
+        // Haar0 step 1 (Type 2, s=1, taps=[1], D=1):
+        //   A[2n] -= (A[2n+1] + 1) >> 1
+        // Haar0 step 2 (Type 3, s=0, taps=[1], D=0):
+        //   A[2n+1] += A[2n]
+        // filter_shift = 0, so no step-4 right-shift.
+        // For row y, interleaved input is [L_y, H_y, L_y, H_y, ...]
+        // After step 1: even[n] = L_y - ((H_y + 1) >> 1)
+        // After step 2: odd[n]  = H_y + (L_y - ((H_y + 1) >> 1))
+        for y in 0..h {
+            let lv = 100 + y as i32;
+            let hv = 7 + y as i32 * 11;
+            let even_expected = lv - ((hv + 1) >> 1);
+            let odd_expected = hv + even_expected;
+            for x in 0..2 * w {
+                let expected = if x % 2 == 0 {
+                    even_expected
+                } else {
+                    odd_expected
+                };
+                assert_eq!(
+                    out.get(y, x),
+                    expected,
+                    "row {y} col {x}: got {} want {}",
+                    out.get(y, x),
+                    expected
+                );
+            }
+        }
+    }
+
+    /// `h_analysis` ↔ `h_synth` integer round-trip across all seven
+    /// spec filters and a non-square shape. The §15.4.2 process is
+    /// integer-reversible by construction (Annex F lifting); a single
+    /// horizontal stage must reproduce the input exactly.
+    #[test]
+    fn h_synth_h_analysis_roundtrip_all_filters() {
+        // 12-wide is a multiple of 2 so de-interleave is exact; 5 rows
+        // so a square-symmetric bug would be visible.
+        let w = 12;
+        let h = 5;
+        let mut pic = SubbandData::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let mut v = x as i32 * 9 - y as i32 * 13;
+                if (x + 3 * y) % 4 == 0 {
+                    v += 50;
+                }
+                pic.set(y, x, v);
+            }
+        }
+        for filter in [
+            WaveletFilter::DeslauriersDubuc9_7,
+            WaveletFilter::LeGall5_3,
+            WaveletFilter::DeslauriersDubuc13_7,
+            WaveletFilter::Haar0,
+            WaveletFilter::Haar1,
+            WaveletFilter::Fidelity,
+            WaveletFilter::Daubechies9_7,
+        ] {
+            let (l, hh) = h_analysis(&pic, filter);
+            assert_eq!(l.width, w / 2);
+            assert_eq!(l.height, h);
+            assert_eq!(hh.width, w / 2);
+            assert_eq!(hh.height, h);
+            let back = h_synth(&l, &hh, filter);
+            assert_eq!(back.width, w);
+            assert_eq!(back.height, h);
+            for y in 0..h {
+                for x in 0..w {
+                    assert_eq!(
+                        back.get(y, x),
+                        pic.get(y, x),
+                        "filter {filter:?} mismatch at ({x},{y})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Output dimensions: §15.4.2 mandates `width(synth) == 2 *
+    /// width(L_data)` and `height(synth) == height(L_data)`. Pin this
+    /// invariant explicitly so a future refactor that drops the
+    /// vertical-untouched property fails loudly.
+    #[test]
+    fn h_synth_doubles_width_keeps_height() {
+        let l = SubbandData::new(7, 3);
+        let h = SubbandData::new(7, 3);
+        let out = h_synth(&l, &h, WaveletFilter::LeGall5_3);
+        assert_eq!(out.width, 14);
+        assert_eq!(out.height, 3);
     }
 }

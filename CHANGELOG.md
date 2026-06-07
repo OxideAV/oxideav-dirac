@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **VC-2 §15.4.2 horizontal-only synthesis** (round-249) —
+  `wavelet::h_synth(l, h, filter)` implements the SMPTE ST
+  2042-1:2022 §15.4.2 `h_synthesis(state, L_data, H_data)`
+  building block: horizontal interleave of equal-shape `L`
+  and `H` subbands into a `2*width × height` array, one
+  1-D synthesis per row using `state[wavelet_index_ho]`,
+  then the §15.4.2 step-4 accuracy-bit rounding right-shift.
+  Companion `wavelet::h_analysis` is the exact inverse used
+  by round-trip tests and any future encoder path. Four new
+  unit tests pin the step's invariants: a LeGall (5,3) pure-DC
+  `L` band reconstructs uniform output (the asymmetric mirror
+  of the existing `vh_synth` DC tests); a Haar0 row-independent
+  pattern flows through without vertical leak, with each
+  even/odd output sample matched against the spec's two
+  lifting stages by hand; an `h_analysis` → `h_synth`
+  integer round-trip across **all seven** spec filters
+  (Tables 16–22 — DD9/7, LeGall 5/3, DD13/7, Haar0, Haar1,
+  Fidelity, Daubechies 9/7) on a non-square 12×5 picture;
+  and an explicit width-doubling / height-preserving
+  dimension contract test. This is the §15 building block
+  needed to lift the §12.4.4 / §14.5 asymmetric-transform
+  rejection paths off `dwt_depth_ho > 0` streams once the
+  rest of the §15.4.1 IDWT driver (multi-stage h+vh
+  composition) and §14.5 horizontal-only `dc_prediction`
+  land. Crate-wide tests 415 → 419 (+4).
 - **VC-2 v3 fragmented-picture decoder** (round-248) —
   `FragmentedPictureDecoder<'s>` in `src/fragment.rs`, the
   picture-level driver that ties the §14 `FragmentAssembler`
