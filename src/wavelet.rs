@@ -425,6 +425,80 @@ pub fn idwt(pyramid: &[[SubbandData; 4]], filter: WaveletFilter) -> SubbandData 
     ll
 }
 
+/// Asymmetric / horizontal-only IDWT driver — SMPTE ST 2042-1:2022
+/// §15.4.1 `idwt(state, coeff_data)` for the
+/// `state[dwt_depth_ho] > 0` branch.
+///
+/// The v3 stream-syntax (`major_version >= 3`) allows the §12.4.4
+/// `extended_transform_parameters()` block to select a
+/// **horizontal-only** filter (`state[wavelet_index_ho]`) and an extra
+/// horizontal-only depth (`state[dwt_depth_ho]`) on top of the regular
+/// symmetric `state[dwt_depth]` 2-D levels. The §15.4.1 process then:
+///
+/// 1. Starts the DC band from `coeff_data[0][L]` (a 1-D low-pass band,
+///    not `[0][LL]`).
+/// 2. For `n = 1..=dwt_depth_ho`: invokes [`h_synth`] with
+///    `state[wavelet_index_ho]` against `coeff_data[n][H]` — each step
+///    doubles only the width.
+/// 3. For `n = dwt_depth_ho + 1..=dwt_depth_ho + dwt_depth`: invokes
+///    [`vh_synth`] with `state[wavelet_index]` against
+///    `coeff_data[n][HL/LH/HH]` — each step doubles both axes.
+///
+/// `pyramid` follows the §13.2.2 subband layout:
+///
+/// * `pyramid[0][0]` carries the level-0 **L** band (used as the
+///   horizontal-only DC seed).
+/// * `pyramid[n][3]` carries the **H** band at level `n` for
+///   `1 <= n <= dwt_depth_ho`. (Slot index 3 is reused to avoid
+///   reshaping the existing `[SubbandData; 4]` quartet — the other
+///   slots at horizontal-only levels are unused placeholders.)
+/// * `pyramid[n][1..=3]` carries HL / LH / HH at level `n` for
+///   `dwt_depth_ho + 1 <= n <= dwt_depth_ho + dwt_depth`.
+///
+/// When `dwt_depth_ho == 0` the function is byte-equivalent to
+/// [`idwt`] called with `filter_v` — `pyramid[0][0]` is then the
+/// classic LL band and `filter_ho` is unused (the §15.4.1 first
+/// `for` loop runs zero iterations).
+///
+/// `filter_v` corresponds to `state[wavelet_index]` (drives the 2-D
+/// `vh_synthesis`); `filter_ho` corresponds to
+/// `state[wavelet_index_ho]` (drives the 1-D horizontal-only
+/// `h_synthesis`). Per §12.4.4.2, the two indices can differ even when
+/// neither is the §12.4.4 NOTE "symmetric default".
+pub fn idwt_with_ho(
+    pyramid: &[[SubbandData; 4]],
+    filter_v: WaveletFilter,
+    filter_ho: WaveletFilter,
+    dwt_depth_ho: u32,
+) -> SubbandData {
+    debug_assert!(!pyramid.is_empty());
+    let ho = dwt_depth_ho as usize;
+    debug_assert!(
+        pyramid.len() > ho,
+        "pyramid is shorter than dwt_depth_ho asks for"
+    );
+    let mut dc = pyramid[0][0].clone();
+    // §15.4.1 horizontal-only loop: n = 1..=dwt_depth_ho. The level-n
+    // entry's H band lives in slot 3 (see doc-comment above for why we
+    // reuse that slot rather than changing the pyramid quartet shape).
+    for n in 1..=ho {
+        dc = h_synth(&dc, &pyramid[n][3], filter_ho);
+    }
+    // §15.4.1 vertical+horizontal loop: n = dwt_depth_ho + 1..=
+    // dwt_depth_ho + dwt_depth. Iterating over the remaining pyramid
+    // entries reaches exactly that range.
+    for level_bands in pyramid.iter().skip(ho + 1) {
+        dc = vh_synth(
+            &dc,
+            &level_bands[1],
+            &level_bands[2],
+            &level_bands[3],
+            filter_v,
+        );
+    }
+    dc
+}
+
 /// One-dimensional **horizontal-only** synthesis stage — SMPTE ST
 /// 2042-1:2022 §15.4.2 `h_synthesis(state, L_data, H_data)`.
 ///
@@ -750,6 +824,58 @@ pub fn dwt(picture: &SubbandData, filter: WaveletFilter, dwt_depth: u32) -> Vec<
         ll = new_ll;
     }
     pyramid[0][0] = ll;
+    pyramid
+}
+
+/// Forward analysis companion to [`idwt_with_ho`] — peels off
+/// `dwt_depth` symmetric levels first (matching the inverse order of
+/// the §15.4.1 synthesis driver) then `dwt_depth_ho` horizontal-only
+/// levels, producing a pyramid laid out exactly as
+/// [`idwt_with_ho`] expects.
+///
+/// `picture` must already be padded to width that's a multiple of
+/// `2^(dwt_depth + dwt_depth_ho)` and height that's a multiple of
+/// `2^dwt_depth` (per §13.2.3 — the horizontal-only levels do not
+/// shrink the height). Used by round-trip tests; the production
+/// encoder side of the asymmetric path is gated separately on
+/// `EncoderParams::extended_transform_override` (see r212).
+pub fn dwt_with_ho(
+    picture: &SubbandData,
+    filter_v: WaveletFilter,
+    filter_ho: WaveletFilter,
+    dwt_depth: u32,
+    dwt_depth_ho: u32,
+) -> Vec<[SubbandData; 4]> {
+    let total = (dwt_depth + dwt_depth_ho) as usize;
+    let mut pyramid: Vec<[SubbandData; 4]> = Vec::with_capacity(total + 1);
+    for _ in 0..=total {
+        pyramid.push([
+            SubbandData::new(0, 0),
+            SubbandData::new(0, 0),
+            SubbandData::new(0, 0),
+            SubbandData::new(0, 0),
+        ]);
+    }
+    // Inverse of §15.4.1: peel off the outer `vh_analysis` levels first
+    // (they are the last to be applied by the synthesis driver).
+    let mut dc = picture.clone();
+    for level in (1..=dwt_depth).rev() {
+        let abs_level = (dwt_depth_ho + level) as usize;
+        let (new_dc, hl, lh, hh) = vh_analysis(&dc, filter_v);
+        pyramid[abs_level][1] = hl;
+        pyramid[abs_level][2] = lh;
+        pyramid[abs_level][3] = hh;
+        dc = new_dc;
+    }
+    // Then peel off the horizontal-only levels. The level-n H band
+    // lands in slot 3 to keep the pyramid quartet shape unchanged
+    // (mirrors the slot assignment [`idwt_with_ho`] reads).
+    for level in (1..=dwt_depth_ho).rev() {
+        let (new_dc, h) = h_analysis(&dc, filter_ho);
+        pyramid[level as usize][3] = h;
+        dc = new_dc;
+    }
+    pyramid[0][0] = dc;
     pyramid
 }
 
@@ -1189,5 +1315,215 @@ mod tests {
         let out = h_synth(&l, &h, WaveletFilter::LeGall5_3);
         assert_eq!(out.width, 14);
         assert_eq!(out.height, 3);
+    }
+
+    // -----------------------------------------------------------------
+    //   §15.4.1 idwt_with_ho — asymmetric / horizontal-only driver.
+    // -----------------------------------------------------------------
+
+    /// With `dwt_depth_ho == 0` the §15.4.1 driver collapses to the
+    /// pre-v3 [`idwt`]. Build a symmetric pyramid via [`dwt`], run it
+    /// through both drivers, and confirm byte-identical pictures —
+    /// this pins the §12.4.4 NOTE invariant ("the inverse wavelet
+    /// transform process is identical to that defined in earlier
+    /// versions of this specification" when the asymmetric block is
+    /// at its symmetric default) at the wavelet layer.
+    #[test]
+    fn idwt_with_ho_equals_idwt_when_ho_depth_zero() {
+        let w = 16;
+        let h = 16;
+        let mut pic = SubbandData::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                pic.set(y, x, (x as i32 * 5 - y as i32 * 3 + 7) & 0x7f);
+            }
+        }
+        for filter in [
+            WaveletFilter::LeGall5_3,
+            WaveletFilter::Haar1,
+            WaveletFilter::DeslauriersDubuc9_7,
+        ] {
+            for depth in 1..=3u32 {
+                let pyramid = dwt(&pic, filter, depth);
+                let baseline = idwt(&pyramid, filter);
+                // filter_ho is unused at dwt_depth_ho = 0 — pick a
+                // deliberately different filter to prove that.
+                let ho_drive = idwt_with_ho(&pyramid, filter, WaveletFilter::Fidelity, 0);
+                assert_eq!(baseline.width, ho_drive.width);
+                assert_eq!(baseline.height, ho_drive.height);
+                for y in 0..h {
+                    for x in 0..w {
+                        assert_eq!(
+                            baseline.get(y, x),
+                            ho_drive.get(y, x),
+                            "filter {filter:?} depth {depth} at ({x},{y})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Pure horizontal-only path: `dwt_depth = 0`, `dwt_depth_ho > 0`.
+    /// Build a 16x4 picture, peel off two horizontal-only levels with
+    /// [`dwt_with_ho`], and confirm [`idwt_with_ho`] reconstructs it
+    /// bit-exactly. With no symmetric 2-D levels the second §15.4.1
+    /// loop runs zero iterations, so the test isolates the
+    /// `h_synth`-chain step.
+    #[test]
+    fn idwt_with_ho_roundtrip_pure_horizontal() {
+        let w = 16;
+        let h = 4;
+        let mut pic = SubbandData::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                pic.set(y, x, x as i32 * 11 + y as i32 * 23 - 50);
+            }
+        }
+        for filter_ho in [
+            WaveletFilter::LeGall5_3,
+            WaveletFilter::Haar0,
+            WaveletFilter::DeslauriersDubuc13_7,
+        ] {
+            let pyramid = dwt_with_ho(
+                &pic,
+                WaveletFilter::Haar0,
+                filter_ho,
+                /* dwt_depth */ 0,
+                /* dwt_depth_ho */ 2,
+            );
+            // Level-0 L should be 4 wide (16 / 2^2), height unchanged
+            // at 4 — confirms the §13.2.3 horizontal-only band
+            // dimensions before driving the synthesis.
+            assert_eq!(pyramid[0][0].width, 4);
+            assert_eq!(pyramid[0][0].height, 4);
+            assert_eq!(pyramid[1][3].width, 4);
+            assert_eq!(pyramid[2][3].width, 8);
+            let back = idwt_with_ho(&pyramid, WaveletFilter::Haar0, filter_ho, 2);
+            assert_eq!(back.width, w);
+            assert_eq!(back.height, h);
+            for y in 0..h {
+                for x in 0..w {
+                    assert_eq!(
+                        back.get(y, x),
+                        pic.get(y, x),
+                        "filter_ho {filter_ho:?} at ({x},{y})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Combined path: `dwt_depth_ho > 0` AND `dwt_depth > 0`, with
+    /// `wavelet_index_ho` deliberately different from `wavelet_index`.
+    /// Round-trips through `dwt_with_ho` / `idwt_with_ho` on a non-
+    /// square 32x8 picture across a representative selection of filter
+    /// pairs and depth pairs. The picture width must be divisible by
+    /// `2^(dwt_depth + dwt_depth_ho)` and the height by `2^dwt_depth`
+    /// (§13.2.3) — 32 = 2^5 and 8 = 2^3 cover every (depth, ho) up to
+    /// (3, 2).
+    #[test]
+    fn idwt_with_ho_roundtrip_mixed_asymmetric() {
+        let w = 32;
+        let h = 8;
+        let mut pic = SubbandData::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                pic.set(y, x, (x as i32 * 7 + y as i32 * 13) % 251 - 100);
+            }
+        }
+        // (filter_v, filter_ho, dwt_depth, dwt_depth_ho) tuples — pick
+        // pairs that exercise asym_transform_index_flag = True (v != ho)
+        // and asym_transform_flag = True (ho > 0) together, i.e. both
+        // §12.4.4.2 and §12.4.4.3 simultaneously.
+        let cases: &[(WaveletFilter, WaveletFilter, u32, u32)] = &[
+            (WaveletFilter::LeGall5_3, WaveletFilter::Haar1, 2, 1),
+            (
+                WaveletFilter::DeslauriersDubuc9_7,
+                WaveletFilter::LeGall5_3,
+                2,
+                2,
+            ),
+            (WaveletFilter::Haar1, WaveletFilter::Haar0, 1, 2),
+            (
+                WaveletFilter::Fidelity,
+                WaveletFilter::DeslauriersDubuc13_7,
+                1,
+                1,
+            ),
+            (WaveletFilter::Daubechies9_7, WaveletFilter::LeGall5_3, 3, 2),
+        ];
+        for &(fv, fho, dwt_depth, dwt_depth_ho) in cases {
+            let pyramid = dwt_with_ho(&pic, fv, fho, dwt_depth, dwt_depth_ho);
+            let back = idwt_with_ho(&pyramid, fv, fho, dwt_depth_ho);
+            assert_eq!(back.width, w);
+            assert_eq!(back.height, h);
+            for y in 0..h {
+                for x in 0..w {
+                    assert_eq!(
+                        back.get(y, x),
+                        pic.get(y, x),
+                        "fv {fv:?} fho {fho:?} depth {dwt_depth} ho {dwt_depth_ho} at ({x},{y})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The §15.4.1 driver returns a picture whose width is twice the
+    /// level-0 L band's width per `h_synth` step, then twice that per
+    /// `vh_synth` step. Pin the algebra: starting from an L band of
+    /// width `lw`, after `ho` horizontal-only stages + `d` symmetric
+    /// stages, the output width is `lw << (ho + d)`. Height grows by
+    /// `<< d` only.
+    #[test]
+    fn idwt_with_ho_output_dimensions_scale_correctly() {
+        // L band 3x5; ho=2, d=2 → width = 3 << 4 = 48, height = 5 << 2
+        // = 20.
+        let lw = 3;
+        let lh = 5;
+        let ho: u32 = 2;
+        let d: u32 = 2;
+        let total = (ho + d) as usize;
+        let mut pyramid: Vec<[SubbandData; 4]> = Vec::with_capacity(total + 1);
+        pyramid.push([
+            SubbandData::new(lw, lh),
+            SubbandData::new(0, 0),
+            SubbandData::new(0, 0),
+            SubbandData::new(0, 0),
+        ]);
+        // Horizontal-only levels: H slot doubles width each step,
+        // height stays at lh.
+        let mut cur_w = lw;
+        for _ in 1..=ho as usize {
+            pyramid.push([
+                SubbandData::new(0, 0),
+                SubbandData::new(0, 0),
+                SubbandData::new(0, 0),
+                SubbandData::new(cur_w, lh),
+            ]);
+            cur_w *= 2;
+        }
+        // Symmetric levels: HL/LH/HH all share the current shape,
+        // doubling both axes per step.
+        let mut cur_h = lh;
+        for _ in 1..=d as usize {
+            pyramid.push([
+                SubbandData::new(0, 0),
+                SubbandData::new(cur_w, cur_h),
+                SubbandData::new(cur_w, cur_h),
+                SubbandData::new(cur_w, cur_h),
+            ]);
+            cur_w *= 2;
+            cur_h *= 2;
+        }
+        let out = idwt_with_ho(
+            &pyramid,
+            WaveletFilter::LeGall5_3,
+            WaveletFilter::LeGall5_3,
+            ho,
+        );
+        assert_eq!(out.width, lw << (ho + d));
+        assert_eq!(out.height, lh << d);
     }
 }

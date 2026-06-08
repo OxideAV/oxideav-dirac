@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **VC-2 §15.4.1 asymmetric IDWT driver** (round-256) —
+  `wavelet::idwt_with_ho(pyramid, filter_v, filter_ho, dwt_depth_ho)`
+  implements the SMPTE ST 2042-1:2022 §15.4.1 `idwt(state,
+  coeff_data)` process for the `state[dwt_depth_ho] > 0`
+  branch: seed the DC band from `coeff_data[0][L]`, invoke
+  the round-249 `h_synth` (with `state[wavelet_index_ho]`)
+  `dwt_depth_ho` times across `coeff_data[n][H]`, then chain
+  the existing `vh_synth` (with `state[wavelet_index]`) over
+  the remaining symmetric levels. With `dwt_depth_ho == 0`
+  the function is byte-identical to the pre-v3 `idwt` (the
+  §12.4.4 NOTE invariant), and a dedicated three-filter ×
+  three-depth test pins that equivalence. A forward
+  companion `wavelet::dwt_with_ho` peels off the symmetric
+  levels first then the horizontal-only levels (the §15.4.1
+  inverse order), producing a pyramid laid out exactly as
+  `idwt_with_ho` consumes. Four new unit tests cover:
+  symmetric-case equivalence with `idwt`, a pure
+  horizontal-only round-trip on a 16×4 picture (no
+  `vh_synth` levels — isolates the `h_synth` chain), a
+  combined `dwt_depth_ho > 0` ∧ `dwt_depth > 0` round-trip
+  across five `(filter_v, filter_ho, depth, ho-depth)`
+  combinations that all exercise §12.4.4.2 `wavelet_index_ho
+  != wavelet_index` AND §12.4.4.3 `dwt_depth_ho > 0`
+  simultaneously, and an output-dimension algebra test
+  (`width = lw << (ho + d)`, `height = lh << d`). The
+  picture decoder still surfaces
+  `PictureError::AsymmetricTransformUnsupported` for
+  asymmetric streams — wiring `idwt_with_ho` into
+  `picture.rs` is a separate round-scope step because the
+  §13 slice-unpacking layout for the L / H bands (§13.5.3
+  `ld_slice` / §13.5.4 `hq_slice` asymmetric branches) is
+  not yet implemented. Crate-wide tests 419 → 423 (+4).
 - **VC-2 §15.4.2 horizontal-only synthesis** (round-249) —
   `wavelet::h_synth(l, h, filter)` implements the SMPTE ST
   2042-1:2022 §15.4.2 `h_synthesis(state, L_data, H_data)`
