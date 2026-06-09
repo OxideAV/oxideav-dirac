@@ -742,9 +742,20 @@ fn mc_one(
 /// (set by §12.4 just before the call) are `wavelet_index_ho =
 /// wavelet_index` and `dwt_depth_ho = 0`; only the flag-gated reads
 /// may override them.
+///
+/// `wavelet_index_ho` is the raw §12.4.4.2 spec value (kept so the
+/// asymmetric rejection diagnostic can echo it verbatim);
+/// `wavelet_ho` is the typed [`WaveletFilter`] the parser resolved it
+/// to. The two are always in lock-step: a bogus index is surfaced as
+/// [`PictureError::UnknownWaveletIndex`] at parse time, so any
+/// `ExtendedTransformParameters` produced by this module carries a
+/// known filter even on the asymmetric path. Callers that route the
+/// asymmetric IDWT through [`crate::wavelet::idwt_with_ho`] can pass
+/// `wavelet_ho` straight through without re-resolving.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ExtendedTransformParameters {
     pub wavelet_index_ho: u32,
+    pub wavelet_ho: WaveletFilter,
     pub dwt_depth_ho: u32,
 }
 
@@ -758,15 +769,28 @@ pub(crate) struct ExtendedTransformParameters {
 /// the (possibly non-default) values are usable. The parser must
 /// always run on a v3 stream so that subsequent bits (slice
 /// parameters, quant matrix) are correctly aligned.
+///
+/// When `asym_transform_index_flag` is set the parsed index is
+/// validated against [`WaveletFilter::from_index`] before the
+/// asymmetric-vs-default decision is made: an out-of-range value
+/// (`> 6`) surfaces [`PictureError::UnknownWaveletIndex`] in the same
+/// way the symmetric `wavelet_index` does in
+/// [`parse_transform_parameters`], so the asymmetric rejection
+/// downstream never has to disambiguate "valid asymmetric filter" from
+/// "bogus filter index".
 pub(crate) fn parse_extended_transform_parameters(
     r: &mut BitReader<'_>,
     wavelet_index_default: u32,
+    wavelet_default: WaveletFilter,
 ) -> Result<ExtendedTransformParameters, PictureError> {
     let mut wavelet_index_ho = wavelet_index_default;
+    let mut wavelet_ho = wavelet_default;
     let mut dwt_depth_ho: u32 = 0;
     let asym_transform_index_flag = r.read_bool();
     if asym_transform_index_flag {
         wavelet_index_ho = r.read_uint();
+        wavelet_ho = WaveletFilter::from_index(wavelet_index_ho)
+            .ok_or(PictureError::UnknownWaveletIndex(wavelet_index_ho))?;
     }
     let asym_transform_flag = r.read_bool();
     if asym_transform_flag {
@@ -781,6 +805,7 @@ pub(crate) fn parse_extended_transform_parameters(
     }
     Ok(ExtendedTransformParameters {
         wavelet_index_ho,
+        wavelet_ho,
         dwt_depth_ho,
     })
 }
@@ -811,7 +836,7 @@ pub(crate) fn parse_transform_parameters(
         // versions of this specification"). A genuinely asymmetric
         // transform is rejected with `AsymmetricTransformUnsupported`
         // carrying the parsed values for diagnostics.
-        let ext = parse_extended_transform_parameters(r, w_idx)?;
+        let ext = parse_extended_transform_parameters(r, w_idx, wavelet)?;
         if ext.wavelet_index_ho != w_idx || ext.dwt_depth_ho != 0 {
             return Err(PictureError::AsymmetricTransformUnsupported {
                 wavelet_index_ho: ext.wavelet_index_ho,
@@ -1325,12 +1350,14 @@ mod tests {
         bytes: &[u8],
     ) -> Result<ExtendedTransformParameters, PictureError> {
         let mut r = BitReader::new(bytes);
-        parse_extended_transform_parameters(&mut r, default_widx)
+        let default_filter = WaveletFilter::from_index(default_widx)
+            .expect("test default wavelet index must be 0..=6");
+        parse_extended_transform_parameters(&mut r, default_widx, default_filter)
     }
 
     /// Both flags zero → defaults survive: `wavelet_index_ho` =
-    /// `wavelet_index`, `dwt_depth_ho` = 0. Exactly two flag bits are
-    /// consumed.
+    /// `wavelet_index`, `wavelet_ho` = the symmetric typed filter,
+    /// `dwt_depth_ho` = 0. Exactly two flag bits are consumed.
     #[test]
     fn extended_transform_parameters_both_flags_off() {
         // Byte 0b00xxxxxx — two leading 0 bits, rest is padding the
@@ -1340,6 +1367,7 @@ mod tests {
             parsed,
             ExtendedTransformParameters {
                 wavelet_index_ho: 2,
+                wavelet_ho: WaveletFilter::DeslauriersDubuc13_7,
                 dwt_depth_ho: 0,
             }
         );
@@ -1348,7 +1376,8 @@ mod tests {
     /// `asym_transform_index_flag = 1` overrides `wavelet_index_ho`.
     /// The follow `read_uint()` of value 5 is the five-bit interleaved
     /// exp-Golomb code `0 1 0 0 1` (follow/data/follow/data/term);
-    /// then `asym_transform_flag = 0`.
+    /// then `asym_transform_flag = 0`. The typed `wavelet_ho` follows
+    /// the raw index through [`WaveletFilter::from_index`].
     #[test]
     fn extended_transform_parameters_only_index_flag() {
         // Bit pattern (MSB first):
@@ -1361,13 +1390,15 @@ mod tests {
             parsed,
             ExtendedTransformParameters {
                 wavelet_index_ho: 5,
+                wavelet_ho: WaveletFilter::Fidelity,
                 dwt_depth_ho: 0,
             }
         );
     }
 
     /// `asym_transform_flag = 1` overrides `dwt_depth_ho`. Pattern:
-    /// flag1=0, flag2=1, then `read_uint() = 0` (one bit `1`).
+    /// flag1=0, flag2=1, then `read_uint() = 0` (one bit `1`). The
+    /// `wavelet_ho` field carries the symmetric default.
     #[test]
     fn extended_transform_parameters_only_depth_flag() {
         // Bit pattern (MSB first):
@@ -1380,6 +1411,7 @@ mod tests {
             parsed,
             ExtendedTransformParameters {
                 wavelet_index_ho: 4,
+                wavelet_ho: WaveletFilter::Haar1,
                 dwt_depth_ho: 0,
             }
         );
@@ -1388,6 +1420,7 @@ mod tests {
     /// Both flags set. Bits: flag1=1, `read_uint()`=3 (`00001`,
     /// 5 bits), flag2=1, `read_uint()`=1 (`001`, 3 bits). Total
     /// 10 bits = 2 bytes (6 trailing pad bits at zero are unread).
+    /// `wavelet_ho` resolves to [`WaveletFilter::Haar0`].
     #[test]
     fn extended_transform_parameters_both_flags_on() {
         // 1 00001 1 001 = byte0 `1000_0110` = 0x86, byte1 `01xx_xxxx` = 0x40.
@@ -1396,6 +1429,7 @@ mod tests {
             parsed,
             ExtendedTransformParameters {
                 wavelet_index_ho: 3,
+                wavelet_ho: WaveletFilter::Haar0,
                 dwt_depth_ho: 1,
             }
         );
@@ -1411,5 +1445,60 @@ mod tests {
         // byte1 `1xxx_xxxx` = 0x80.
         let err = parse_ext(0, &[0x40, 0x80]).unwrap_err();
         assert!(matches!(err, PictureError::UnsupportedDwtDepth(7)));
+    }
+
+    /// `asym_transform_index_flag = 1` with an out-of-range
+    /// `wavelet_index_ho` (`> 6`, since §12.4.4.2 reuses the
+    /// `wavelet_index` value-space) is rejected as
+    /// [`PictureError::UnknownWaveletIndex`] at parse time, mirroring
+    /// the symmetric `wavelet_index` validation in
+    /// [`parse_transform_parameters`]. This keeps the asymmetric
+    /// rejection downstream free of the "valid filter or bogus index?"
+    /// disambiguation — by the time the caller sees an
+    /// `AsymmetricTransformUnsupported`, the embedded filter index is
+    /// guaranteed to be a known [`WaveletFilter`].
+    #[test]
+    fn extended_transform_parameters_unknown_wavelet_index_ho_rejected() {
+        // `read_uint` is interleaved exp-Golomb (`follow,data` pairs
+        // terminated by a `1` follow-bit). Bit-level trace for
+        // value = 8: start `value = 1`, then
+        //   follow=0,data=0 → 2; follow=0,data=0 → 4;
+        //   follow=0,data=1 → 9; terminator=1 → return 9 − 1 = 8.
+        // That's the 7-bit sequence `0 0 0 0 0 1 1`. Prefixed with the
+        // `asym_transform_index_flag = 1` bit gives the 8-bit byte
+        // `1 0 0 0 0 0 1 1` = 0b1000_0011 = 0x83. The parser bails out
+        // at `from_index(8)` before reading `asym_transform_flag`, so
+        // a single byte is sufficient.
+        let err = parse_ext(0, &[0x83]).unwrap_err();
+        assert!(
+            matches!(err, PictureError::UnknownWaveletIndex(8)),
+            "expected UnknownWaveletIndex(8), got {err:?}"
+        );
+    }
+
+    /// `asym_transform_index_flag = 1` with a valid-but-different
+    /// `wavelet_index_ho` is **not** rejected by
+    /// [`parse_extended_transform_parameters`] itself — the asymmetric
+    /// vs symmetric decision belongs to the caller
+    /// ([`parse_transform_parameters`] surfaces
+    /// [`PictureError::AsymmetricTransformUnsupported`]). This test
+    /// pins that the parser returns the typed filter unmodified.
+    #[test]
+    fn extended_transform_parameters_valid_asymmetric_index_passes_through() {
+        // Bit pattern (MSB first):
+        //   1                          asym_transform_index_flag = 1
+        //   0 0 0 0 1                  read_uint() = 3 (Haar0)
+        //   0                          asym_transform_flag = 0
+        // 7 bits → 0b1000_0100 = 0x84 with 1 trailing pad bit.
+        // Default is wavelet 1 = LeGall5_3.
+        let parsed = parse_ext(1, &[0x84]).unwrap();
+        assert_eq!(
+            parsed,
+            ExtendedTransformParameters {
+                wavelet_index_ho: 3,
+                wavelet_ho: WaveletFilter::Haar0,
+                dwt_depth_ho: 0,
+            }
+        );
     }
 }

@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **§12.4.4 `wavelet_index_ho` typed-validation lift** (round-266)
+  — `parse_extended_transform_parameters` now resolves the parsed
+  `wavelet_index_ho` to a typed [`wavelet::WaveletFilter`] at parse
+  time, exposed on `ExtendedTransformParameters::wavelet_ho`
+  alongside the existing raw `wavelet_index_ho: u32` (which is kept
+  so the asymmetric rejection diagnostic can still echo the
+  bitstream value verbatim). When `asym_transform_index_flag` is
+  set, an out-of-range index (`> 6`, since §12.4.4.2 reuses the
+  `wavelet_index` value-space) is now rejected upfront as
+  `PictureError::UnknownWaveletIndex`, mirroring the symmetric
+  `wavelet_index` validation in `parse_transform_parameters` —
+  before this change, a bogus ho index could either silently match
+  the default and be accepted, or surface as
+  `AsymmetricTransformUnsupported { wavelet_index_ho: <bogus>, .. }`
+  which conflated "valid asymmetric filter we don't yet implement"
+  with "value the §12.4.4.2 table doesn't define". The
+  asymmetric-rejection downstream in `parse_transform_parameters`
+  is otherwise unchanged: any `ExtendedTransformParameters` whose
+  `wavelet_index_ho != wavelet_index` or `dwt_depth_ho != 0` still
+  fails out with `AsymmetricTransformUnsupported`, but now the
+  embedded filter index is guaranteed to name a real
+  [`wavelet::WaveletFilter`]. Two new unit tests pin the new
+  surface: one drives a 1-byte payload that decodes to
+  `wavelet_index_ho = 8` (the bit pattern `1 0 0 0 0 0 1 1` =
+  `0x83`) and asserts `UnknownWaveletIndex(8)`; the other drives a
+  valid-but-different asymmetric index (`wavelet_index_ho = 3
+  (Haar0)` over a `wavelet = LeGall5_3` default) and asserts the
+  parser returns the typed filter unmodified, leaving the
+  asymmetric-vs-symmetric decision to the caller. The four
+  pre-existing `extended_transform_parameters_*` tests were
+  re-pinned to include the new `wavelet_ho` field in their
+  expected-value structs; their bit patterns are unchanged.
+  Library test count: 209 → 211 (+2 = the two new validation
+  tests; the five pre-existing
+  `extended_transform_parameters_*` tests already shipped in
+  round-201).
 - **VC-2 §15.4.1 asymmetric IDWT driver** (round-256) —
   `wavelet::idwt_with_ho(pyramid, filter_v, filter_ho, dwt_depth_ho)`
   implements the SMPTE ST 2042-1:2022 §15.4.1 `idwt(state,
