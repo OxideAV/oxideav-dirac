@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/OxideAV/oxideav-dirac/compare/v0.0.7...v0.0.8) - 2026-06-09
+
+### Other
+
+- typed-validation lift on §12.4.4 wavelet_index_ho (round-266)
+- VC-2 §15.4.1 asymmetric IDWT driver — idwt_with_ho (round-256)
+- VC-2 §15.4.2 h_synthesis horizontal-only IDWT step (round-249)
+- drop release-plz.toml — use release-plz defaults across the workspace
+- VC-2 v3 FragmentedPictureDecoder — picture-level §14 driver (round-248)
+- VC-2 v3 fragment-assembler robustness oracle (round-238)
+- VC-2 v3 §14.5 fragmented_wavelet_transform DC kick (round-233)
+- VC-2 v3 §14.3 + §14.4 fragmented-picture state machine (round-229)
+- VC-2 v3 §14.2 fragment-header parser + §10.5.2 Table 5 predicate (round-223)
+- VC-2 HQ + LD encoder dwt_depth axis coverage (round-218)
+- VC-2 v3 asymmetric extended_transform_parameters emission + decoder-rejection tests (round-212)
+- VC-2 v3 extended_transform_parameters emission (round-206)
+- VC-2 v3 extended_transform_parameters parser (round-201)
+- row-major slice driving in vh_synth / vh_analysis + DD9/7 bench coverage (round-195)
+- VC-2 inter-encoder fuzz oracle (round-193)
+- criterion harness for decode / encode / roundtrip (round-190)
+- tune HQ fuzz-oracle slice grid + frame amplitude for debug builds
+- VC-2 HQ + LD rate-control fuzz oracle (round-179)
+- VC-2 LD/HQ malformed-input fuzz oracle + 4 robustness fixes (round-165)
+- VC-2 drain-rate-hysteresis (VbvHysteresis) rate-control variant (round-159)
+- per-picture running_surplus_bytes rate-control telemetry (round-152)
+- VC-2 LD leaky-bucket (VBV) rate-control variant (round-149)
+- VC-2 HQ leaky-bucket (VBV) rate-control variant (round-146)
+- VC-2 HQ multi-picture rate-controlled sequence driver (round-141)
+- VC-2 HQ picture-level rate-control picker (round-138)
+- VC-2 LD multi-picture rate-controlled sequence driver (round-134)
+- VC-2 LD picture-level rate-control picker
+- §12.3.6.6 inter DC-prediction unbiased-mean floor rounding (round-128)
+- §13.2.1 inter quant-offset (round-125)
+- fix §5.4 intra DC-prediction unbiased-mean rounding
+
 ### Added
 
 - **§12.4.4 `wavelet_index_ho` typed-validation lift** (round-266)
