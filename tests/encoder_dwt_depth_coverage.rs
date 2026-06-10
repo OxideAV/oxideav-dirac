@@ -127,7 +127,11 @@ fn slice_grid_for_64x64_yuv420(dwt_depth: u32) -> (u32, u32) {
 /// to 4.
 fn zero_custom_quant_matrix(dwt_depth: u32) -> QuantMatrix {
     let levels: Vec<[u32; 4]> = (0..=dwt_depth).map(|_| [0, 0, 0, 0]).collect();
-    QuantMatrix { dwt_depth, levels }
+    QuantMatrix {
+        dwt_depth,
+        dwt_depth_ho: 0,
+        levels,
+    }
 }
 
 // ------------------------------------------------------------------

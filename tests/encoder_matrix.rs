@@ -442,6 +442,7 @@ fn hq_custom_quant_matrix_framing_roundtrips_q0() {
     // at qindex=0 the effective quantiser is 0 everywhere → lossless.
     let zero_matrix = QuantMatrix {
         dwt_depth: 3,
+        dwt_depth_ho: 0,
         levels: vec![[0; 4]; 4],
     };
     let params = EncoderParams::default_hq(WaveletFilter::LeGall5_3, 3)
@@ -498,6 +499,7 @@ fn hq_custom_all_zero_matrix_differs_from_default_at_q8() {
 
     let zero_matrix = QuantMatrix {
         dwt_depth: 3,
+        dwt_depth_ho: 0,
         levels: vec![[0; 4]; 4],
     };
     let mut custom = EncoderParams::default_hq(WaveletFilter::LeGall5_3, 3)
@@ -563,6 +565,7 @@ fn ld_custom_quant_matrix_roundtrips_q0() {
 
     let zero_matrix = QuantMatrix {
         dwt_depth: 3,
+        dwt_depth_ho: 0,
         levels: vec![[0; 4]; 4],
     };
     let params = LdEncoderParams::default_ld(WaveletFilter::LeGall5_3, 3, 4, 4, 256)

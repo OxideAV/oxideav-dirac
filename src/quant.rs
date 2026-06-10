@@ -21,6 +21,7 @@
 //! Annex E.1 gives the default matrix for each combination of wavelet
 //! filter and transform depth up to depth 4.
 
+use crate::bits::BitReader;
 use crate::subband::Orient;
 use crate::wavelet::WaveletFilter;
 
@@ -159,13 +160,30 @@ pub fn inverse_quant_for(qcoeff: i32, q: u32, is_intra: bool) -> i32 {
 }
 
 /// The per-subband quantisation matrix used for low-delay slice
-/// decoding (§13.5.4). Indexed by `(level, orient)`; level 0 carries
-/// only LL, all other levels carry HL/LH/HH.
+/// decoding (§13.5.4). Indexed by `(level, orient)`.
+///
+/// For a **symmetric** transform (`dwt_depth_ho == 0`) level 0 carries
+/// only LL and every higher level carries an HL/LH/HH triplet.
+///
+/// For an **asymmetric** (horizontal-only) transform
+/// (`dwt_depth_ho > 0`, SMPTE ST 2042-1:2022 §12.4.5.3 / §13.2.1) the
+/// total number of levels is `dwt_depth_ho + dwt_depth`. Level 0 then
+/// carries only the L (DC) band, levels `1..=dwt_depth_ho` carry a
+/// single horizontal-only H band, and the remaining
+/// `dwt_depth_ho+1 ..= dwt_depth_ho+dwt_depth` levels each carry an
+/// HL/LH/HH triplet. Both the single L band and the single H band live
+/// in the index-0 ("low") slot of their level, mirroring the LL
+/// convention, so the storage layout is unchanged.
 #[derive(Debug, Clone)]
 pub struct QuantMatrix {
     pub dwt_depth: u32,
+    /// Horizontal-only transform depth (§12.4.4.3). `0` for a
+    /// symmetric transform; the first `dwt_depth_ho` non-DC levels are
+    /// then horizontal-only H bands rather than HL/LH/HH triplets.
+    pub dwt_depth_ho: u32,
     /// `levels[level][orient_index]`. `orient_index` matches
-    /// [`Orient::as_index`], so LL=0, HL=1, LH=2, HH=3.
+    /// [`Orient::as_index`], so LL=0, HL=1, LH=2, HH=3. For asymmetric
+    /// levels the single L / H band uses the index-0 slot.
     pub levels: Vec<[u32; 4]>,
 }
 
@@ -254,7 +272,61 @@ impl QuantMatrix {
                 }
             }
         }
-        Some(Self { dwt_depth, levels })
+        Some(Self {
+            dwt_depth,
+            dwt_depth_ho: 0,
+            levels,
+        })
+    }
+
+    /// Parse a custom quantisation matrix (SMPTE ST 2042-1:2022
+    /// §12.4.5.3, the `custom_quant_matrix == True` branch), supporting
+    /// both the symmetric (`dwt_depth_ho == 0`) and asymmetric
+    /// (`dwt_depth_ho > 0`) level layouts.
+    ///
+    /// The caller has already consumed the `custom_quant_matrix` flag
+    /// and `wavelet_index` / `dwt_depth` / `dwt_depth_ho`; this reads
+    /// the matrix body in stream order:
+    ///
+    /// * Level 0 — one `read_uint`: LL if symmetric, otherwise L.
+    /// * Levels `1..=dwt_depth_ho` (asymmetric only) — one `read_uint`
+    ///   each: the horizontal-only H band.
+    /// * Levels `dwt_depth_ho+1 ..= dwt_depth_ho+dwt_depth` — three
+    ///   `read_uint`s each, in HL, LH, HH order.
+    ///
+    /// With `dwt_depth_ho == 0` this is bit-for-bit the legacy
+    /// symmetric read (LL then `dwt_depth` HL/LH/HH triplets).
+    pub fn parse_custom(r: &mut BitReader<'_>, dwt_depth: u32, dwt_depth_ho: u32) -> Self {
+        let total = (dwt_depth_ho + dwt_depth) as usize + 1;
+        let mut levels: Vec<[u32; 4]> = Vec::with_capacity(total);
+        if dwt_depth_ho == 0 {
+            // Symmetric: level 0 is LL (index 0).
+            let ll = r.read_uint();
+            levels.push([ll, 0, 0, 0]);
+        } else {
+            // Asymmetric: level 0 is the single L (DC) band, stored in
+            // the index-0 slot; levels 1..=dwt_depth_ho are single H
+            // bands, also in the index-0 slot.
+            let l = r.read_uint();
+            levels.push([l, 0, 0, 0]);
+            for _ in 1..=dwt_depth_ho {
+                let h = r.read_uint();
+                levels.push([h, 0, 0, 0]);
+            }
+        }
+        // Remaining levels carry an HL/LH/HH triplet, regardless of the
+        // symmetric/asymmetric distinction.
+        for _ in 0..dwt_depth {
+            let hl = r.read_uint();
+            let lh = r.read_uint();
+            let hh = r.read_uint();
+            levels.push([0, hl, lh, hh]);
+        }
+        Self {
+            dwt_depth,
+            dwt_depth_ho,
+            levels,
+        }
     }
 
     /// Safe getter. Returns 0 when `(level, orient)` is out of range.
@@ -497,5 +569,106 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ---- §12.4.5.3 custom quant_matrix parsing ----
+
+    /// Encode a sequence of `read_uint` values into a byte buffer the
+    /// way the bitstream packs them, then hand back a reader cursored
+    /// at the start. Used to drive [`QuantMatrix::parse_custom`].
+    fn reader_for(values: &[u32]) -> (Vec<u8>, usize) {
+        let mut w = crate::bitwriter::BitWriter::new();
+        for &v in values {
+            w.write_uint(v);
+        }
+        // Trailing align byte so the reader always has a full byte to
+        // consume; `byte_pos` after parsing tells us how far we read.
+        let bytes = w.finish();
+        let n = values.len();
+        (bytes, n)
+    }
+
+    /// With `dwt_depth_ho == 0` the custom parser is bit-for-bit the
+    /// legacy symmetric layout: LL at level 0, then `dwt_depth`
+    /// HL/LH/HH triplets. Mirrors the inline read the picture parser
+    /// used before the asymmetric lift.
+    #[test]
+    fn parse_custom_symmetric_matches_legacy_layout() {
+        // depth 2: LL=4, then (HL,LH,HH) for levels 1 and 2.
+        let vals = [4u32, 2, 2, 0, 5, 5, 3];
+        let (bytes, _) = reader_for(&vals);
+        let mut r = BitReader::new(&bytes);
+        let qm = QuantMatrix::parse_custom(&mut r, 2, 0);
+        assert_eq!(qm.dwt_depth, 2);
+        assert_eq!(qm.dwt_depth_ho, 0);
+        assert_eq!(qm.levels.len(), 3);
+        assert_eq!(qm.levels[0], [4, 0, 0, 0]);
+        assert_eq!(qm.levels[1], [0, 2, 2, 0]);
+        assert_eq!(qm.levels[2], [0, 5, 5, 3]);
+        // Lookups resolve through the `Orient` enum.
+        assert_eq!(qm.get(0, Orient::LL), 4);
+        assert_eq!(qm.get(2, Orient::HL), 5);
+        assert_eq!(qm.get(2, Orient::HH), 3);
+    }
+
+    /// §12.4.5.3 asymmetric layout (`dwt_depth_ho > 0`): level 0 is a
+    /// single L (DC) band, levels `1..=dwt_depth_ho` are single H
+    /// bands, then `dwt_depth` HL/LH/HH triplets. Total levels =
+    /// `dwt_depth_ho + dwt_depth + 1`. Both the L and the H bands live
+    /// in the index-0 slot (§13.2.1).
+    #[test]
+    fn parse_custom_asymmetric_layout() {
+        // dwt_depth_ho = 2, dwt_depth = 1.
+        //   level 0: L  = 7
+        //   level 1: H  = 11
+        //   level 2: H  = 13
+        //   level 3: HL,LH,HH = 5,6,8
+        let vals = [7u32, 11, 13, 5, 6, 8];
+        let (bytes, _) = reader_for(&vals);
+        let mut r = BitReader::new(&bytes);
+        let qm = QuantMatrix::parse_custom(&mut r, 1, 2);
+        assert_eq!(qm.dwt_depth, 1);
+        assert_eq!(qm.dwt_depth_ho, 2);
+        assert_eq!(qm.levels.len(), 4);
+        // L (DC) and the two H bands all use the index-0 ("low") slot.
+        assert_eq!(qm.levels[0], [7, 0, 0, 0]);
+        assert_eq!(qm.levels[1], [11, 0, 0, 0]);
+        assert_eq!(qm.levels[2], [13, 0, 0, 0]);
+        assert_eq!(qm.levels[3], [0, 5, 6, 8]);
+    }
+
+    /// The asymmetric read consumes exactly `1 + dwt_depth_ho +
+    /// 3*dwt_depth` uints and leaves the reader byte-aligned at the
+    /// expected boundary — pinning that the parser neither over- nor
+    /// under-reads, which is what keeps the subsequent slice data
+    /// aligned in a real stream.
+    #[test]
+    fn parse_custom_asymmetric_consumes_exact_uints() {
+        // Pad with a sentinel after the matrix; assert we can still read it.
+        let matrix = [3u32, 9, 4, 7, 2];
+        let sentinel = 42u32;
+        let mut all: Vec<u32> = matrix.to_vec();
+        all.push(sentinel);
+        let (bytes, _) = reader_for(&all);
+        let mut r = BitReader::new(&bytes);
+        // dwt_depth_ho = 1, dwt_depth = 1 → 1 + 1 + 3 = 5 uints.
+        let qm = QuantMatrix::parse_custom(&mut r, 1, 1);
+        assert_eq!(qm.levels[0], [3, 0, 0, 0]); // L
+        assert_eq!(qm.levels[1], [9, 0, 0, 0]); // H
+        assert_eq!(qm.levels[2], [0, 4, 7, 2]); // HL,LH,HH
+                                                // The very next uint must be the sentinel: proves the matrix
+                                                // read stopped at the right bit.
+        assert_eq!(r.read_uint(), sentinel);
+    }
+
+    /// A zero-depth, zero-ho matrix is a single LL entry and nothing
+    /// else — the degenerate boundary.
+    #[test]
+    fn parse_custom_zero_depth() {
+        let (bytes, _) = reader_for(&[6u32]);
+        let mut r = BitReader::new(&bytes);
+        let qm = QuantMatrix::parse_custom(&mut r, 0, 0);
+        assert_eq!(qm.levels.len(), 1);
+        assert_eq!(qm.levels[0], [6, 0, 0, 0]);
     }
 }

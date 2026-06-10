@@ -823,27 +823,24 @@ pub(crate) fn parse_transform_parameters(
     if dwt_depth > 6 {
         return Err(PictureError::UnsupportedDwtDepth(dwt_depth));
     }
-    if major_version >= 3 {
-        // §12.4.4 `extended_transform_parameters()`. The block can
-        // optionally select a horizontal-only wavelet filter and an
-        // extra horizontal-only DWT depth. We parse the syntax
-        // unconditionally so that subsequent fields are bit-aligned,
-        // but only accept v3 streams whose extended parameters reduce
-        // to the symmetric default (§12.4.4 NOTE: "If
-        // state[dwt_depth_ho] is 0 and state[wavelet_index_ho] is
-        // state[wavelet_index] then the inverse wavelet transform
-        // process (see 13.2) is identical to that defined in earlier
-        // versions of this specification"). A genuinely asymmetric
-        // transform is rejected with `AsymmetricTransformUnsupported`
-        // carrying the parsed values for diagnostics.
+    // §12.4.4 `extended_transform_parameters()`. The block (v3 only)
+    // can optionally select a horizontal-only wavelet filter and an
+    // extra horizontal-only DWT depth. We parse the syntax
+    // unconditionally so the remaining §12.4.5 fields stay bit-aligned;
+    // the asymmetric rejection (for the unwired §13.5 slice / §15.4.1
+    // IDWT path) is deferred to *after* the whole block is consumed so
+    // the §12.4.5.3 quant_matrix — whose layout depends on
+    // `dwt_depth_ho` (§13.2.1) — is read in the correct shape even for
+    // streams we cannot yet reconstruct. For pre-v3 streams the block
+    // is absent and `dwt_depth_ho` is 0 (the §12.4.4 NOTE invariant:
+    // with `dwt_depth_ho == 0` and `wavelet_index_ho == wavelet_index`
+    // the inverse transform is identical to earlier versions).
+    let (wavelet_index_ho, dwt_depth_ho) = if major_version >= 3 {
         let ext = parse_extended_transform_parameters(r, w_idx, wavelet)?;
-        if ext.wavelet_index_ho != w_idx || ext.dwt_depth_ho != 0 {
-            return Err(PictureError::AsymmetricTransformUnsupported {
-                wavelet_index_ho: ext.wavelet_index_ho,
-                dwt_depth_ho: ext.dwt_depth_ho,
-            });
-        }
-    }
+        (ext.wavelet_index_ho, ext.dwt_depth_ho)
+    } else {
+        (w_idx, 0)
+    };
 
     // §12.4.5.2 slice_parameters.
     let slices_x = r.read_uint();
@@ -862,23 +859,40 @@ pub(crate) fn parse_transform_parameters(
             }
         };
 
-    // §12.4.5.3 quant_matrix.
+    // §12.4.5.3 quant_matrix. The custom branch is asymmetric-aware:
+    // with `dwt_depth_ho > 0` it reads a single L (DC) band, then
+    // `dwt_depth_ho` single H bands, then the `dwt_depth` HL/LH/HH
+    // triplets (§13.2.1 ordering). With `dwt_depth_ho == 0` it is the
+    // legacy symmetric read. The default (`set_quant_matrix`) branch
+    // only covers symmetric transforms here — §12.4.5.3 requires
+    // `custom_quant_matrix == True` for every asymmetric case that this
+    // crate could otherwise reach (notably `dwt_depth_ho > 4`,
+    // `dwt_depth_ho + dwt_depth > 5`, and the wavelet-index
+    // combinations), and the asymmetric Annex-D default tables are not
+    // yet transcribed, so a default-matrix asymmetric stream falls
+    // through to the `AsymmetricTransformUnsupported` rejection below.
     let custom_flag = r.read_bool();
     let quant_matrix = if custom_flag {
-        let ll0 = r.read_uint();
-        let mut levels: Vec<[u32; 4]> = Vec::with_capacity(dwt_depth as usize + 1);
-        levels.push([ll0, 0, 0, 0]);
-        for _ in 1..=dwt_depth {
-            let hl = r.read_uint();
-            let lh = r.read_uint();
-            let hh = r.read_uint();
-            levels.push([0, hl, lh, hh]);
-        }
-        QuantMatrix { dwt_depth, levels }
+        QuantMatrix::parse_custom(r, dwt_depth, dwt_depth_ho)
     } else {
         QuantMatrix::default_for(wavelet, dwt_depth)
             .ok_or(PictureError::UnsupportedDwtDepth(dwt_depth))?
     };
+
+    // The §12.4.5 block is now fully consumed. A genuinely asymmetric
+    // transform (§12.4.4.2 `wavelet_index_ho != wavelet_index` or
+    // §12.4.4.3 `dwt_depth_ho != 0`) is rejected here for the
+    // downstream §13.5 slice-coefficient / §15.4.1 IDWT path, which is
+    // not yet wired. The parse above stayed bit-exact through the whole
+    // transform-parameters block, so a caller that only needs the
+    // header (or that recovers from this error) sees a correctly
+    // aligned reader and a fully-populated `quant_matrix`.
+    if wavelet_index_ho != w_idx || dwt_depth_ho != 0 {
+        return Err(PictureError::AsymmetricTransformUnsupported {
+            wavelet_index_ho,
+            dwt_depth_ho,
+        });
+    }
 
     Ok(TransformParameters {
         wavelet,
@@ -1500,5 +1514,93 @@ mod tests {
                 dwt_depth_ho: 0,
             }
         );
+    }
+
+    // ---------------------------------------------------------------
+    // §12.4 parse_transform_parameters — asymmetric quant_matrix path
+    // ---------------------------------------------------------------
+
+    use crate::bitwriter::BitWriter;
+
+    /// Build a full §12.4 `transform_parameters` byte payload with a
+    /// custom quant_matrix. When `ho > 0` the extended block selects an
+    /// asymmetric transform (`asym_transform_flag = 1`, the same
+    /// `wavelet_index` reused as `wavelet_index_ho`) and the matrix is
+    /// emitted in the §12.4.5.3 asymmetric shape; when `ho == 0` it is
+    /// a symmetric v3 stream whose extended block reduces to the
+    /// default.
+    fn build_transform_params_hq(
+        wavelet_index: u32,
+        dwt_depth: u32,
+        ho: u32,
+        matrix_uints: &[u32],
+    ) -> Vec<u8> {
+        let mut w = BitWriter::new();
+        w.write_uint(wavelet_index); // wavelet_index
+        w.write_uint(dwt_depth); // dwt_depth
+                                 // extended_transform_parameters (§12.4.4):
+        w.write_bool(false); // asym_transform_index_flag = 0 → ho index = default
+        if ho > 0 {
+            w.write_bool(true); // asym_transform_flag = 1
+            w.write_uint(ho); // dwt_depth_ho
+        } else {
+            w.write_bool(false); // asym_transform_flag = 0
+        }
+        // slice_parameters (§12.4.5.2, HQ branch): slices_x, slices_y,
+        // slice_prefix_bytes, slice_size_scaler.
+        w.write_uint(1);
+        w.write_uint(1);
+        w.write_uint(0);
+        w.write_uint(1);
+        // quant_matrix (§12.4.5.3): custom flag then body.
+        w.write_bool(true);
+        for &v in matrix_uints {
+            w.write_uint(v);
+        }
+        w.finish()
+    }
+
+    /// A v3 asymmetric stream is parsed through the entire §12.4.5
+    /// block — including the §12.4.5.3 asymmetric quant_matrix shape —
+    /// and only *then* rejected with `AsymmetricTransformUnsupported`
+    /// carrying the parsed `dwt_depth_ho`. The matrix body uses the
+    /// asymmetric layout (L, then `ho` H bands, then `dwt_depth`
+    /// triplets); if the parser read it with the symmetric shape it
+    /// would mis-align and consume the wrong number of uints, but the
+    /// rejection here is value-checked so the run-through is exercised.
+    #[test]
+    fn parse_transform_parameters_asymmetric_rejected_after_full_parse() {
+        // wavelet_index = 1 (LeGall5_3), dwt_depth = 1, ho = 2.
+        // Matrix (asymmetric): L, H, H, then one HL/LH/HH triplet.
+        let matrix = [7u32, 11, 13, 5, 6, 8];
+        let bytes = build_transform_params_hq(1, 1, 2, &matrix);
+        let mut r = BitReader::new(&bytes);
+        let err = parse_transform_parameters(&mut r, LowDelayProfile::HQ, 3).unwrap_err();
+        assert_eq!(
+            err,
+            PictureError::AsymmetricTransformUnsupported {
+                wavelet_index_ho: 1,
+                dwt_depth_ho: 2,
+            }
+        );
+    }
+
+    /// A symmetric v3 stream (extended block present but reducing to
+    /// the default, `ho == 0`) still parses to a full
+    /// `TransformParameters` with the custom matrix intact — the
+    /// deferred-rejection refactor must not regress the symmetric path.
+    #[test]
+    fn parse_transform_parameters_symmetric_v3_still_parses() {
+        // wavelet_index = 1, dwt_depth = 1, ho = 0.
+        // Symmetric matrix: LL, then one HL/LH/HH triplet.
+        let matrix = [4u32, 2, 2, 0];
+        let bytes = build_transform_params_hq(1, 1, 0, &matrix);
+        let mut r = BitReader::new(&bytes);
+        let tp = parse_transform_parameters(&mut r, LowDelayProfile::HQ, 3).unwrap();
+        assert_eq!(tp.wavelet, WaveletFilter::LeGall5_3);
+        assert_eq!(tp.dwt_depth, 1);
+        assert_eq!(tp.quant_matrix.dwt_depth_ho, 0);
+        assert_eq!(tp.quant_matrix.levels[0], [4, 0, 0, 0]);
+        assert_eq!(tp.quant_matrix.levels[1], [0, 2, 2, 0]);
     }
 }

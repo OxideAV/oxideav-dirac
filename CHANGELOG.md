@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **§12.4.5.3 asymmetric `quant_matrix` parsing** (round-274) —
+  `QuantMatrix::parse_custom(r, dwt_depth, dwt_depth_ho)` implements
+  the SMPTE ST 2042-1:2022 §12.4.5.3 `custom_quant_matrix == True`
+  branch for both the symmetric (`dwt_depth_ho == 0`) and the
+  asymmetric (`dwt_depth_ho > 0`) layouts. The asymmetric body reads
+  a single L (DC) band at level 0, then `dwt_depth_ho` single
+  horizontal-only H bands, then `dwt_depth` HL/LH/HH triplets — the
+  §13.2.1 subband ordering (total levels `dwt_depth_ho + dwt_depth +
+  1`). The L and H bands occupy the index-0 ("low") slot of their
+  level, mirroring the existing LL convention, so the
+  `Vec<[u32; 4]>` storage is unchanged; a new `dwt_depth_ho` field
+  on [`quant::QuantMatrix`] records the split (0 for every existing
+  symmetric matrix). `parse_transform_parameters` was restructured so
+  the §12.4.4 `extended_transform_parameters` block is parsed and its
+  `dwt_depth_ho` captured *before* the §12.4.5.2 slice_parameters and
+  §12.4.5.3 quant_matrix, and the `AsymmetricTransformUnsupported`
+  rejection (still surfaced for the unwired §13.5 slice / §15.4.1
+  IDWT path) is deferred until the whole transform-parameters block
+  has been consumed in its correct, `dwt_depth_ho`-dependent shape.
+  This keeps the reader bit-aligned through a v3 asymmetric header
+  rather than bailing mid-block. The default (`set_quant_matrix`)
+  asymmetric path stays deferred — §12.4.5.3 mandates
+  `custom_quant_matrix == True` for the asymmetric cases this crate
+  could reach, and the Annex-D asymmetric default tables are not yet
+  transcribed. Six new unit tests: four pin `parse_custom`
+  (symmetric-equals-legacy, asymmetric L/H/triplet layout, exact-uint
+  consumption with a trailing sentinel, zero-depth degenerate) and
+  two drive `parse_transform_parameters` end-to-end on a synthesised
+  v3 HQ header (asymmetric → value-checked `AsymmetricTransformUnsupported`
+  after a full parse; symmetric-v3 → full `TransformParameters` with
+  the custom matrix intact, guarding the refactor against regression).
+  Library test count: 211 → 217 (+6).
 - **§12.4.4 `wavelet_index_ho` typed-validation lift** (round-266)
   — `parse_extended_transform_parameters` now resolves the parsed
   `wavelet_index_ho` to a typed [`wavelet::WaveletFilter`] at parse
