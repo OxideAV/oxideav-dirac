@@ -9,6 +9,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **§12.4.4 asymmetric (horizontal-only) transform — end-to-end decode
+  + encode** (round-282) — streams with `dwt_depth_ho > 0` now decode
+  through the full chain: `TransformParameters` carries the typed
+  `wavelet_ho` / `dwt_depth_ho`, the §13.2.2 / §13.2.3 pyramid and
+  subband dimensions span all `dwt_depth_ho + dwt_depth` levels
+  (`subband::init_pyramid_ho` / `subband_dims_ho` /
+  `padded_component_dims_ho` — width pads to `2^(ho+depth)`, height
+  only to `2^depth`), the §13.5.3 / §13.5.4 slice unpack walks the new
+  shared `subband::slice_band_order` sequence (L, then H ×
+  `dwt_depth_ho`, then HL/LH/HH triplets), `quant::slice_quantisers`
+  implements the §13.5.5 asymmetric else-branch (H quantiser emitted
+  in pyramid slot 3, where the H band lives, bridging the matrix's
+  §12.4.5.3 slot-0 storage), and the IDWT routes through the
+  round-256 `wavelet::idwt_with_ho` (§15.4.1 driver + §15.4.2
+  `h_synthesis` levels). LD's §13.5.2 DC prediction targets the
+  level-0 L band — the same `[0][0]` pyramid slot as LL, so the call
+  shape is unchanged. The fragmented path (§14) is wired identically:
+  `dwt_depth_ho` flows into the assembler, the pyramids/dims use the
+  asymmetric layout, `finish()` runs `idwt_with_ho`, and the §14.4
+  trailing DC kick now succeeds on asymmetric LD pictures
+  (`AssemblerError::AsymmetricDcPredictionUnsupported` is retained
+  for API compatibility but no longer raised).
+  `PictureError::AsymmetricTransformUnsupported` now fires **only**
+  for an asymmetric stream with `custom_quant_matrix = False` (the
+  Annex D asymmetric default-matrix tables are not transcribed yet);
+  a v3 stream with `wavelet_index_ho != wavelet_index` but
+  `dwt_depth_ho == 0` decodes with the symmetric default per the
+  §12.4.4 NOTE, and `dwt_depth_ho + dwt_depth > 6` rejects as
+  `UnsupportedDwtDepth`. Encoder side:
+  `EncoderParams::with_asymmetric_transform(wavelet_ho, dwt_depth_ho)`
+  (and the `LdEncoderParams` twin) selects v3, installs the override
+  plus an all-zero custom quant matrix in the asymmetric shape;
+  `forward_component` / `forward_component_ld` pad per §13.2.3 and run
+  `wavelet::dwt_with_ho`; the slice packers and `write_quant_matrix`
+  follow the asymmetric layout. New `dwt_depth_ho()` / `wavelet_ho()`
+  accessors expose the effective values on both param structs.
+  Roundtrip pins: HQ asymmetric self-roundtrips bit-exact at qindex 0
+  for `(dwt_depth, dwt_depth_ho, wavelet_ho)` ∈ {(3, 1, LeGall 5/3),
+  (2, 2, Haar0), (2, 1, DD 9/7)} — the latter two with
+  `wavelet_index_ho != wavelet_index`; LD asymmetric ho=1 ≥ 35 dB
+  Y/U/V at qindex 0; the inert `wavelet_index_ho`-only override
+  (`dwt_depth_ho == 0`) decodes identically to the symmetric stream
+  on both profiles. Crate-wide tests 431 → 438 (+7).
+
 - **§12.4.5.3 asymmetric `quant_matrix` parsing** (round-274) —
   `QuantMatrix::parse_custom(r, dwt_depth, dwt_depth_ho)` implements
   the SMPTE ST 2042-1:2022 §12.4.5.3 `custom_quant_matrix == True`

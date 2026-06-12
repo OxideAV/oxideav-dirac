@@ -339,21 +339,39 @@ impl QuantMatrix {
     }
 }
 
-/// `slice_quantisers` (§13.5.4): subtract each subband's quantisation
+/// `slice_quantizers` (§13.5.5): subtract each subband's quantisation
 /// matrix entry from `qindex`, clamping to 0. Returns the per-level
-/// `[LL, HL, LH, HH]` effective quantisers.
+/// `[LL, HL, LH, HH]` effective quantisers, in **pyramid-slot layout**
+/// ([`Orient::as_index`]):
+///
+/// * Symmetric (`dwt_depth_ho == 0`): level 0 carries the LL quantiser
+///   in slot 0; every higher level carries HL/LH/HH in slots 1..=3.
+/// * Asymmetric (`dwt_depth_ho > 0`, §13.5.5 else-branch): level 0
+///   carries the L quantiser in slot 0; levels `1..=dwt_depth_ho`
+///   carry the single H-band quantiser in **slot 3** — the slot the
+///   horizontal-only H band occupies in the coefficient pyramid (see
+///   [`crate::subband::init_pyramid_ho`] /
+///   [`crate::wavelet::idwt_with_ho`]) — so a single `(level, slot)`
+///   pair indexes both the band and its quantiser. Note the *matrix*
+///   stores the H entry in its index-0 slot (the §12.4.5.3
+///   stream-order convention documented on [`QuantMatrix::levels`]);
+///   this function performs the slot bridge.
 pub fn slice_quantisers(qindex: u32, qmatrix: &QuantMatrix) -> Vec<[u32; 4]> {
+    let ho = qmatrix.dwt_depth_ho as usize;
     let mut out: Vec<[u32; 4]> = Vec::with_capacity(qmatrix.levels.len());
     for (level, triplet) in qmatrix.levels.iter().enumerate() {
-        let q_ll = if level == 0 {
-            qindex.saturating_sub(triplet[0])
+        if level == 0 {
+            // LL (symmetric) / L (asymmetric) — slot 0 either way.
+            out.push([qindex.saturating_sub(triplet[0]), 0, 0, 0]);
+        } else if level <= ho {
+            // Horizontal-only H band: matrix slot 0 → pyramid slot 3.
+            out.push([0, 0, 0, qindex.saturating_sub(triplet[0])]);
         } else {
-            0
-        };
-        let q_hl = qindex.saturating_sub(triplet[1]);
-        let q_lh = qindex.saturating_sub(triplet[2]);
-        let q_hh = qindex.saturating_sub(triplet[3]);
-        out.push([q_ll, q_hl, q_lh, q_hh]);
+            let q_hl = qindex.saturating_sub(triplet[1]);
+            let q_lh = qindex.saturating_sub(triplet[2]);
+            let q_hh = qindex.saturating_sub(triplet[3]);
+            out.push([0, q_hl, q_lh, q_hh]);
+        }
     }
     out
 }
@@ -424,6 +442,26 @@ mod tests {
         assert_eq!(q[1][2], 1);
         // Level 1 HH matrix entry = 0 → 3.
         assert_eq!(q[1][3], 3);
+    }
+
+    /// §13.5.5 asymmetric branch: the L quantiser stays in slot 0 and
+    /// the per-level H quantiser is emitted in pyramid slot 3 (where
+    /// the H band itself lives), bridging the matrix's slot-0 storage.
+    #[test]
+    fn slice_quantisers_asymmetric_slot_bridge() {
+        // dwt_depth_ho = 2, dwt_depth = 1:
+        //   level 0: L  = 7, level 1: H = 3, level 2: H = 1,
+        //   level 3: HL,LH,HH = 5,6,8.
+        let qm = QuantMatrix {
+            dwt_depth: 1,
+            dwt_depth_ho: 2,
+            levels: vec![[7, 0, 0, 0], [3, 0, 0, 0], [1, 0, 0, 0], [0, 5, 6, 8]],
+        };
+        let q = slice_quantisers(10, &qm);
+        assert_eq!(q[0], [3, 0, 0, 0]); // L: 10 - 7
+        assert_eq!(q[1], [0, 0, 0, 7]); // H: 10 - 3, in slot 3
+        assert_eq!(q[2], [0, 0, 0, 9]); // H: 10 - 1, in slot 3
+        assert_eq!(q[3], [0, 5, 4, 2]); // HL/LH/HH: 10 - {5,6,8}
     }
 
     #[test]

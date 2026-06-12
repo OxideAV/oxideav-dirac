@@ -522,20 +522,12 @@ fn step(asm: &mut FragmentAssembler, model: &mut Model, op: Op) {
                 // short-circuits to a no-op before any other check,
                 // so an asymmetric HQ picture still returns Ok(()).
                 assert_eq!(asm_res, Ok(()), "HQ kick is a no-op even when asymmetric");
-            } else if model.dwt_depth_ho != 0 {
-                assert_eq!(
-                    asm_res,
-                    Err(AssemblerError::AsymmetricDcPredictionUnsupported {
-                        dwt_depth_ho: model.dwt_depth_ho,
-                    }),
-                    "LD asymmetric DC kick must reject"
-                );
             } else {
-                assert_eq!(
-                    asm_res,
-                    Ok(()),
-                    "LD kick succeeds on symmetric completed picture"
-                );
+                // LD kick succeeds on any completed picture —
+                // symmetric (level-0 LL) and asymmetric (level-0 L,
+                // same `[0][0]` pyramid slot per the §14.4
+                // else-branch) alike.
+                assert_eq!(asm_res, Ok(()), "LD kick succeeds on completed picture");
             }
         }
     }
@@ -796,13 +788,15 @@ fn dc_kick_on_hq_path_is_noop_buffer_unchanged() {
     );
 }
 
-/// §14.5 DC kick on LD path with `dwt_depth_ho > 0` must surface
-/// `AsymmetricDcPredictionUnsupported`. Pins that the asymmetric-
-/// transform gap is consistently reported (mirrors
-/// `PictureError::AsymmetricTransformUnsupported` on the
-/// non-fragmented path).
+/// §14.4 DC kick on the LD path with `dwt_depth_ho > 0` succeeds: the
+/// else-branch of the §14.4 `fragment_data` pseudocode runs
+/// `dc_prediction(state[y_transform][0][L])`, and the level-0 L band
+/// occupies the same `[0][0]` pyramid slot as the symmetric LL band,
+/// so the routine and its result are identical. (Earlier rounds
+/// rejected this case with `AsymmetricDcPredictionUnsupported`; the
+/// variant is retained for API compatibility but no longer raised.)
 #[test]
-fn dc_kick_ld_asymmetric_rejected() {
+fn dc_kick_ld_asymmetric_succeeds() {
     for dwt_depth_ho in [1u32, 2, 3, 4] {
         let mut asm = FragmentAssembler::new();
         let setup = FragmentHeader {
@@ -823,15 +817,20 @@ fn dc_kick_ld_asymmetric_rejected() {
         };
         asm.on_data_fragment(&data, 0xCC).unwrap();
 
-        let mut ll = SubbandData::new(2, 2);
-        let mut comps = [&mut ll];
-        let err = asm
-            .fragmented_wavelet_transform_dc_prediction(&mut comps)
-            .unwrap_err();
-        assert_eq!(
-            err,
-            AssemblerError::AsymmetricDcPredictionUnsupported { dwt_depth_ho }
-        );
+        // Seed pattern with a known §13.4 result (same as the
+        // symmetric single-component pin in `crate::fragment`).
+        let mut l_band = SubbandData::new(2, 2);
+        l_band.set(0, 0, 4);
+        l_band.set(0, 1, 1);
+        l_band.set(1, 0, 1);
+        l_band.set(1, 1, 1);
+        let mut comps = [&mut l_band];
+        asm.fragmented_wavelet_transform_dc_prediction(&mut comps)
+            .unwrap();
+        assert_eq!(l_band.get(0, 0), 4);
+        assert_eq!(l_band.get(0, 1), 5);
+        assert_eq!(l_band.get(1, 0), 5);
+        assert_eq!(l_band.get(1, 1), 6);
     }
 }
 

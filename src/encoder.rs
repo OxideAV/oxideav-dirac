@@ -34,9 +34,11 @@ use crate::bitwriter::BitWriter;
 use crate::parse_info::BBCD;
 use crate::quant::{slice_quantisers, QuantMatrix};
 use crate::sequence::SequenceHeader;
-use crate::subband::{padded_component_dims, subband_dims, Orient, SubbandData};
+use crate::subband::{
+    padded_component_dims_ho, slice_band_order, subband_dims_ho, Orient, SubbandData,
+};
 use crate::video_format::ChromaFormat;
-use crate::wavelet::{dwt, WaveletFilter};
+use crate::wavelet::{dwt, dwt_with_ho, WaveletFilter};
 
 /// Parameters that drive picture encoding. Mirrors the subset of
 /// `TransformParameters` the HQ-profile encoder actually needs.
@@ -100,11 +102,8 @@ pub struct EncoderParams {
     /// matches the v2 process verbatim. Callers MUST also set the
     /// sequence header's `parse_parameters.version_major` to `3` so the
     /// decoder dispatches into [`crate::picture::parse_extended_transform_parameters`].
-    /// Encoder emission of asymmetric (non-default) parameters is
-    /// exposed via [`Self::extended_transform_override`] for negative
-    /// testing only — our decoder does not yet implement the
-    /// horizontal-only IDWT and will reject the resulting stream with
-    /// [`crate::picture::PictureError::AsymmetricTransformUnsupported`].
+    /// Asymmetric (non-default) emission is configured via
+    /// [`Self::extended_transform_override`].
     pub major_version: u32,
     /// Optional override for the `extended_transform_parameters()`
     /// block (SMPTE ST 2042-1:2022 §12.4.4). `None` (default) keeps the
@@ -116,14 +115,20 @@ pub struct EncoderParams {
     /// and `asym_transform_flag = (dwt_depth_ho != 0)`, with each
     /// non-default value written as an interleaved exp-Golomb code.
     ///
-    /// Only consulted when [`Self::major_version`] is `>= 3`. The
-    /// override is **negative-testing-only**: our decoder does not yet
-    /// implement the §13.5.5 horizontal-only IDWT, so any non-default
-    /// emission surfaces as
-    /// [`crate::picture::PictureError::AsymmetricTransformUnsupported`]
-    /// at the parse boundary. The override is still spec-conformantly
-    /// written, so a future decoder gaining asymmetric support would
-    /// consume the same bitstream without change.
+    /// Only consulted when [`Self::major_version`] is `>= 3`. With
+    /// `dwt_depth_ho > 0` the whole encode pipeline follows the
+    /// asymmetric layout: the forward transform runs `dwt_depth_ho`
+    /// horizontal-only analysis levels beneath the `dwt_depth` 2-D
+    /// levels ([`crate::wavelet::dwt_with_ho`]), the slice packers
+    /// emit the §13.5.4 asymmetric band order (L, then H ×
+    /// `dwt_depth_ho`, then HL/LH/HH triplets), and the §12.4.5.3
+    /// quant matrix is written in the asymmetric shape. The caller
+    /// must then set [`Self::custom_quant_matrix`] and supply a
+    /// [`QuantMatrix`] whose `dwt_depth_ho` matches (the Annex D
+    /// asymmetric default tables are not transcribed, so the decode
+    /// side rejects a default-matrix asymmetric stream) — the
+    /// [`Self::with_asymmetric_transform`] helper sets all of this
+    /// up in one call.
     pub extended_transform_override: Option<ExtendedTransformOverride>,
 }
 
@@ -186,14 +191,41 @@ impl EncoderParams {
     /// Override the §12.4.4 `extended_transform_parameters()` emission
     /// with explicit asymmetric values. Only takes effect when
     /// [`Self::major_version`] is `>= 3`. See
-    /// [`Self::extended_transform_override`] for the full semantics.
-    /// Intended for negative testing of the decoder's
-    /// `AsymmetricTransformUnsupported` rejection path.
+    /// [`Self::extended_transform_override`] for the full semantics —
+    /// with `dwt_depth_ho > 0` the caller must also install a matching
+    /// custom asymmetric quant matrix; prefer
+    /// [`Self::with_asymmetric_transform`], which does both.
     pub fn with_extended_transform_override(
         mut self,
         override_: ExtendedTransformOverride,
     ) -> Self {
         self.extended_transform_override = Some(override_);
+        self
+    }
+
+    /// Configure a fully-wired §12.4.4 asymmetric (horizontal-only)
+    /// transform: selects the v3 syntax, installs the
+    /// `extended_transform_parameters()` override for `(wavelet_ho,
+    /// dwt_depth_ho)`, and replaces the quantisation matrix with an
+    /// all-zero **custom** matrix in the §12.4.5.3 asymmetric shape
+    /// (`1 + dwt_depth_ho + 3 * dwt_depth` entries) — required because
+    /// the Annex D asymmetric default tables are not transcribed. An
+    /// all-zero matrix leaves every subband at the slice qindex
+    /// (§13.5.5 subtracts matrix entries from `qindex`), so qindex 0
+    /// stays lossless. The caller must still set the sequence header's
+    /// `parse_parameters.version_major` to `3`.
+    pub fn with_asymmetric_transform(
+        mut self,
+        wavelet_ho: WaveletFilter,
+        dwt_depth_ho: u32,
+    ) -> Self {
+        self.major_version = 3;
+        self.extended_transform_override = Some(ExtendedTransformOverride {
+            wavelet_index_ho: wavelet_index(wavelet_ho),
+            dwt_depth_ho,
+        });
+        self.quant_matrix = zero_quant_matrix(self.dwt_depth, dwt_depth_ho);
+        self.custom_quant_matrix = true;
         self
     }
 
@@ -215,6 +247,46 @@ impl EncoderParams {
     pub fn with_slice_size_target(mut self, target: u32) -> Self {
         self.slice_size_target = Some(target);
         self
+    }
+
+    /// Effective §12.4.4.3 `dwt_depth_ho`: the override value when the
+    /// v3 syntax is selected, otherwise 0 (pre-v3 streams have no
+    /// `extended_transform_parameters()` block).
+    pub fn dwt_depth_ho(&self) -> u32 {
+        if self.major_version >= 3 {
+            self.extended_transform_override
+                .map_or(0, |e| e.dwt_depth_ho)
+        } else {
+            0
+        }
+    }
+
+    /// Effective §12.4.4.2 horizontal-only wavelet filter: the
+    /// override's `wavelet_index_ho` resolved through
+    /// [`WaveletFilter::from_index`], defaulting to [`Self::wavelet`]
+    /// when no override is active (the §12.4.4 default) or the index
+    /// is out of range.
+    pub fn wavelet_ho(&self) -> WaveletFilter {
+        if self.major_version >= 3 {
+            self.extended_transform_override
+                .and_then(|e| WaveletFilter::from_index(e.wavelet_index_ho))
+                .unwrap_or(self.wavelet)
+        } else {
+            self.wavelet
+        }
+    }
+}
+
+/// All-zero custom quantisation matrix in the §12.4.5.3 shape for
+/// `(dwt_depth, dwt_depth_ho)` — `1 + dwt_depth_ho + 3 * dwt_depth`
+/// in-band entries, all zero, so every subband's effective quantiser
+/// equals the slice qindex (§13.5.5).
+fn zero_quant_matrix(dwt_depth: u32, dwt_depth_ho: u32) -> QuantMatrix {
+    let total = (dwt_depth_ho + dwt_depth) as usize + 1;
+    QuantMatrix {
+        dwt_depth,
+        dwt_depth_ho,
+        levels: vec![[0u32; 4]; total],
     }
 }
 
@@ -253,12 +325,8 @@ pub fn encode_hq_intra_picture(
     let v_py = forward_component(v, chroma_w, chroma_h, sequence.chroma_depth, params);
 
     // Precompute per-level subband sizes for each component.
-    let mut luma_dims: Vec<(usize, usize)> = Vec::with_capacity(params.dwt_depth as usize + 1);
-    let mut chroma_dims: Vec<(usize, usize)> = Vec::with_capacity(params.dwt_depth as usize + 1);
-    for level in 0..=params.dwt_depth {
-        luma_dims.push(subband_dims(luma_w, luma_h, params.dwt_depth, level));
-        chroma_dims.push(subband_dims(chroma_w, chroma_h, params.dwt_depth, level));
-    }
+    let luma_dims = component_dims(luma_w, luma_h, params.dwt_depth, params.dwt_depth_ho());
+    let chroma_dims = component_dims(chroma_w, chroma_h, params.dwt_depth, params.dwt_depth_ho());
 
     for sy in 0..params.slices_y {
         for sx in 0..params.slices_x {
@@ -375,12 +443,8 @@ pub fn hq_slice_qindexes(
     let u_py = forward_component(u, chroma_w, chroma_h, sequence.chroma_depth, params);
     let v_py = forward_component(v, chroma_w, chroma_h, sequence.chroma_depth, params);
 
-    let mut luma_dims: Vec<(usize, usize)> = Vec::with_capacity(params.dwt_depth as usize + 1);
-    let mut chroma_dims: Vec<(usize, usize)> = Vec::with_capacity(params.dwt_depth as usize + 1);
-    for level in 0..=params.dwt_depth {
-        luma_dims.push(subband_dims(luma_w, luma_h, params.dwt_depth, level));
-        chroma_dims.push(subband_dims(chroma_w, chroma_h, params.dwt_depth, level));
-    }
+    let luma_dims = component_dims(luma_w, luma_h, params.dwt_depth, params.dwt_depth_ho());
+    let chroma_dims = component_dims(chroma_w, chroma_h, params.dwt_depth, params.dwt_depth_ho());
 
     let mut out = Vec::with_capacity((params.slices_x * params.slices_y) as usize);
     for sy in 0..params.slices_y {
@@ -442,12 +506,8 @@ pub fn hq_picture_payload_bytes_at_qindex(
     let u_py = forward_component(u, chroma_w, chroma_h, sequence.chroma_depth, params);
     let v_py = forward_component(v, chroma_w, chroma_h, sequence.chroma_depth, params);
 
-    let mut luma_dims: Vec<(usize, usize)> = Vec::with_capacity(params.dwt_depth as usize + 1);
-    let mut chroma_dims: Vec<(usize, usize)> = Vec::with_capacity(params.dwt_depth as usize + 1);
-    for level in 0..=params.dwt_depth {
-        luma_dims.push(subband_dims(luma_w, luma_h, params.dwt_depth, level));
-        chroma_dims.push(subband_dims(chroma_w, chroma_h, params.dwt_depth, level));
-    }
+    let luma_dims = component_dims(luma_w, luma_h, params.dwt_depth, params.dwt_depth_ho());
+    let chroma_dims = component_dims(chroma_w, chroma_h, params.dwt_depth, params.dwt_depth_ho());
 
     let mut w = BitWriter::new();
     // §12.2 picture_header: byte-align then 4-byte picture_number.
@@ -519,12 +579,8 @@ pub fn pick_hq_picture_qindex(
     let u_py = forward_component(u, chroma_w, chroma_h, sequence.chroma_depth, params);
     let v_py = forward_component(v, chroma_w, chroma_h, sequence.chroma_depth, params);
 
-    let mut luma_dims: Vec<(usize, usize)> = Vec::with_capacity(params.dwt_depth as usize + 1);
-    let mut chroma_dims: Vec<(usize, usize)> = Vec::with_capacity(params.dwt_depth as usize + 1);
-    for level in 0..=params.dwt_depth {
-        luma_dims.push(subband_dims(luma_w, luma_h, params.dwt_depth, level));
-        chroma_dims.push(subband_dims(chroma_w, chroma_h, params.dwt_depth, level));
-    }
+    let luma_dims = component_dims(luma_w, luma_h, params.dwt_depth, params.dwt_depth_ho());
+    let chroma_dims = component_dims(chroma_w, chroma_h, params.dwt_depth, params.dwt_depth_ho());
 
     let floor = params.qindex.min(127);
     for qindex in floor..=127 {
@@ -654,8 +710,8 @@ fn write_transform_parameters(w: &mut BitWriter, params: &EncoderParams) {
     //     `asym_transform_index_flag = (wavelet_index_ho != w_idx)` and
     //     `asym_transform_flag = (dwt_depth_ho != 0)`, each followed by
     //     the corresponding interleaved exp-Golomb value when the flag
-    //     is `True`. Negative-testing-only — see
-    //     `EncoderParams::extended_transform_override`.
+    //     is `True` — see `EncoderParams::extended_transform_override`
+    //     for the full asymmetric-pipeline semantics.
     if params.major_version >= 3 {
         match params.extended_transform_override {
             None => {
@@ -683,7 +739,14 @@ fn write_transform_parameters(w: &mut BitWriter, params: &EncoderParams) {
     w.write_uint(params.slice_size_scaler);
     // §12.4.5.3 quant_matrix: emit flag=0 (default Annex E.1 table) or,
     // when `custom_quant_matrix` is set, flag=1 plus the explicit
-    // per-subband entries.
+    // per-subband entries. A custom matrix must be shaped for the
+    // emitted `dwt_depth_ho`, or the decoder reads it mis-aligned.
+    debug_assert!(
+        !params.custom_quant_matrix || params.quant_matrix.dwt_depth_ho == params.dwt_depth_ho(),
+        "custom quant matrix dwt_depth_ho ({}) must match the emitted §12.4.4.3 dwt_depth_ho ({})",
+        params.quant_matrix.dwt_depth_ho,
+        params.dwt_depth_ho(),
+    );
     write_quant_matrix(w, params.custom_quant_matrix, &params.quant_matrix);
 }
 
@@ -692,8 +755,9 @@ fn write_transform_parameters(w: &mut BitWriter, params: &EncoderParams) {
 /// When `custom == false` we write `custom_quant_matrix = False`; the
 /// decoder then reconstructs the Annex E.1 default for the picture's
 /// wavelet / depth via `set_quant_matrix()`. When `custom == true` we
-/// write `custom_quant_matrix = True` followed by the explicit values in
-/// the spec's exact read order:
+/// write `custom_quant_matrix = True` followed by the explicit values
+/// in the spec's exact read order — symmetric
+/// (`matrix.dwt_depth_ho == 0`):
 ///
 /// ```text
 ///   state[QMATRIX][0][LL] = read_uint()
@@ -703,20 +767,30 @@ fn write_transform_parameters(w: &mut BitWriter, params: &EncoderParams) {
 ///     state[QMATRIX][level][HH] = read_uint()
 /// ```
 ///
+/// or asymmetric (`matrix.dwt_depth_ho > 0`): the level-0 **L** entry,
+/// one **H** entry per level `1..=dwt_depth_ho`, then the HL/LH/HH
+/// triplets for levels `dwt_depth_ho+1..=dwt_depth_ho+dwt_depth`.
+///
 /// `matrix.levels[level]` is `[LL, HL, LH, HH]` ([`Orient::as_index`]
-/// ordering), so level 0 contributes its `[0]` entry and each higher
-/// level contributes `[1], [2], [3]` — bit-exactly the order the decoder
-/// reads in `picture::parse_transform_parameters`.
+/// ordering) with the single L / H entries in slot 0 (the
+/// [`QuantMatrix::parse_custom`] storage convention), so the emission
+/// is bit-exactly the order the decoder reads in
+/// `picture::parse_transform_parameters`.
 fn write_quant_matrix(w: &mut BitWriter, custom: bool, matrix: &QuantMatrix) {
     if !custom {
         w.write_bool(false);
         return;
     }
     w.write_bool(true);
-    // Level 0: LL only.
+    // Level 0: LL (symmetric) / L (asymmetric) — slot 0 either way.
     w.write_uint(matrix.levels[0][0]);
-    // Levels 1..=dwt_depth: HL, LH, HH in that order.
-    for level in 1..=matrix.dwt_depth as usize {
+    // Asymmetric horizontal-only levels: one H entry each (slot 0).
+    let ho = matrix.dwt_depth_ho as usize;
+    for level in 1..=ho {
+        w.write_uint(matrix.levels[level][0]);
+    }
+    // Levels dwt_depth_ho+1..=dwt_depth_ho+dwt_depth: HL, LH, HH.
+    for level in ho + 1..=ho + matrix.dwt_depth as usize {
         let triplet = matrix.levels[level];
         w.write_uint(triplet[1]); // HL
         w.write_uint(triplet[2]); // LH
@@ -740,8 +814,26 @@ pub fn wavelet_index(filter: WaveletFilter) -> u32 {
     }
 }
 
-/// Pad one component up to a multiple of `2^dwt_depth`, subtract the
-/// depth midpoint, run the forward DWT and return the pyramid.
+/// Per-level subband dims for one component, asymmetric-aware
+/// (§13.2.3): one `(width, height)` entry per level
+/// `0..=dwt_depth_ho + dwt_depth`.
+fn component_dims(
+    comp_w: u32,
+    comp_h: u32,
+    dwt_depth: u32,
+    dwt_depth_ho: u32,
+) -> Vec<(usize, usize)> {
+    (0..=dwt_depth_ho + dwt_depth)
+        .map(|level| subband_dims_ho(comp_w, comp_h, dwt_depth, dwt_depth_ho, level))
+        .collect()
+}
+
+/// Pad one component (width up to a multiple of
+/// `2^(dwt_depth_ho + dwt_depth)`, height up to a multiple of
+/// `2^dwt_depth` — §13.2.3), subtract the depth midpoint, run the
+/// forward DWT and return the pyramid. With an active asymmetric
+/// override the transform is [`dwt_with_ho`] (the §15.4.1 inverse:
+/// `dwt_depth` 2-D levels atop `dwt_depth_ho` horizontal-only levels).
 fn forward_component(
     plane: &[u8],
     comp_w: u32,
@@ -749,7 +841,8 @@ fn forward_component(
     depth: u32,
     params: &EncoderParams,
 ) -> Vec<[SubbandData; 4]> {
-    let (pw, ph) = padded_component_dims(comp_w, comp_h, params.dwt_depth);
+    let ho = params.dwt_depth_ho();
+    let (pw, ph) = padded_component_dims_ho(comp_w, comp_h, params.dwt_depth, ho);
     let half: i32 = 1i32 << (depth - 1);
     let mut pic = SubbandData::new(pw, ph);
     for y in 0..ph {
@@ -760,7 +853,17 @@ fn forward_component(
             pic.set(y, x, v);
         }
     }
-    dwt(&pic, params.wavelet, params.dwt_depth)
+    if ho == 0 {
+        dwt(&pic, params.wavelet, params.dwt_depth)
+    } else {
+        dwt_with_ho(
+            &pic,
+            params.wavelet,
+            params.wavelet_ho(),
+            params.dwt_depth,
+            ho,
+        )
+    }
 }
 
 /// Forward quantisation (§13.3.1 inverse). The spec's inverse quant
@@ -877,12 +980,10 @@ fn encode_hq_component(
     sy: u32,
 ) -> Vec<u8> {
     let mut w = BitWriter::new();
-    // Level 0 — LL only.
-    write_slice_band(&mut w, 0, Orient::LL, sx, sy, params, q_per_level, py, dims);
-    for level in 1..=params.dwt_depth {
-        for orient in [Orient::HL, Orient::LH, Orient::HH] {
-            write_slice_band(&mut w, level, orient, sx, sy, params, q_per_level, py, dims);
-        }
+    // §13.5.4 band order — shared symmetric/asymmetric sequence
+    // (L/LL, any horizontal-only H bands, then HL/LH/HH triplets).
+    for (level, orient) in slice_band_order(params.dwt_depth, params.dwt_depth_ho()) {
+        write_slice_band(&mut w, level, orient, sx, sy, params, q_per_level, py, dims);
     }
     w.byte_align();
     w.finish()
@@ -1345,13 +1446,59 @@ impl LdEncoderParams {
     /// with explicit asymmetric values. Only takes effect when
     /// [`Self::major_version`] is `>= 3`. LD counterpart to
     /// [`EncoderParams::with_extended_transform_override`] — see that
-    /// method for the full semantics. Negative-testing-only.
+    /// method for the full semantics; with `dwt_depth_ho > 0` prefer
+    /// [`Self::with_asymmetric_transform`], which also installs the
+    /// matching custom asymmetric quant matrix.
     pub fn with_extended_transform_override(
         mut self,
         override_: ExtendedTransformOverride,
     ) -> Self {
         self.extended_transform_override = Some(override_);
         self
+    }
+
+    /// Configure a fully-wired §12.4.4 asymmetric (horizontal-only)
+    /// transform on the LD path. LD counterpart to
+    /// [`EncoderParams::with_asymmetric_transform`] — selects v3,
+    /// installs the override and an all-zero custom quant matrix in
+    /// the §12.4.5.3 asymmetric shape. The caller must still set the
+    /// sequence header's `parse_parameters.version_major` to `3`.
+    pub fn with_asymmetric_transform(
+        mut self,
+        wavelet_ho: WaveletFilter,
+        dwt_depth_ho: u32,
+    ) -> Self {
+        self.major_version = 3;
+        self.extended_transform_override = Some(ExtendedTransformOverride {
+            wavelet_index_ho: wavelet_index(wavelet_ho),
+            dwt_depth_ho,
+        });
+        self.quant_matrix = zero_quant_matrix(self.dwt_depth, dwt_depth_ho);
+        self.custom_quant_matrix = true;
+        self
+    }
+
+    /// Effective §12.4.4.3 `dwt_depth_ho` — see
+    /// [`EncoderParams::dwt_depth_ho`].
+    pub fn dwt_depth_ho(&self) -> u32 {
+        if self.major_version >= 3 {
+            self.extended_transform_override
+                .map_or(0, |e| e.dwt_depth_ho)
+        } else {
+            0
+        }
+    }
+
+    /// Effective §12.4.4.2 horizontal-only wavelet filter — see
+    /// [`EncoderParams::wavelet_ho`].
+    pub fn wavelet_ho(&self) -> WaveletFilter {
+        if self.major_version >= 3 {
+            self.extended_transform_override
+                .and_then(|e| WaveletFilter::from_index(e.wavelet_index_ho))
+                .unwrap_or(self.wavelet)
+        } else {
+            self.wavelet
+        }
     }
 }
 
@@ -1466,12 +1613,8 @@ pub fn encode_ld_intra_picture(
     forward_dc_prediction(&mut u_qpy[0][0]);
     forward_dc_prediction(&mut v_qpy[0][0]);
 
-    let mut luma_dims: Vec<(usize, usize)> = Vec::with_capacity(params.dwt_depth as usize + 1);
-    let mut chroma_dims: Vec<(usize, usize)> = Vec::with_capacity(params.dwt_depth as usize + 1);
-    for level in 0..=params.dwt_depth {
-        luma_dims.push(subband_dims(luma_w, luma_h, params.dwt_depth, level));
-        chroma_dims.push(subband_dims(chroma_w, chroma_h, params.dwt_depth, level));
-    }
+    let luma_dims = component_dims(luma_w, luma_h, params.dwt_depth, params.dwt_depth_ho());
+    let chroma_dims = component_dims(chroma_w, chroma_h, params.dwt_depth, params.dwt_depth_ho());
 
     for sy in 0..params.slices_y {
         for sx in 0..params.slices_x {
@@ -1561,12 +1704,8 @@ pub fn pick_ld_picture_qindex(
     let u_py = forward_component_ld(u, chroma_w, chroma_h, sequence.chroma_depth, params);
     let v_py = forward_component_ld(v, chroma_w, chroma_h, sequence.chroma_depth, params);
 
-    let mut luma_dims: Vec<(usize, usize)> = Vec::with_capacity(params.dwt_depth as usize + 1);
-    let mut chroma_dims: Vec<(usize, usize)> = Vec::with_capacity(params.dwt_depth as usize + 1);
-    for level in 0..=params.dwt_depth {
-        luma_dims.push(subband_dims(luma_w, luma_h, params.dwt_depth, level));
-        chroma_dims.push(subband_dims(chroma_w, chroma_h, params.dwt_depth, level));
-    }
+    let luma_dims = component_dims(luma_w, luma_h, params.dwt_depth, params.dwt_depth_ho());
+    let chroma_dims = component_dims(chroma_w, chroma_h, params.dwt_depth, params.dwt_depth_ho());
 
     let floor = params.qindex.min(127);
     for qindex in floor..=127 {
@@ -1610,12 +1749,8 @@ pub fn ld_picture_qindex_diagnostic(
     let u_py = forward_component_ld(u, chroma_w, chroma_h, sequence.chroma_depth, params);
     let v_py = forward_component_ld(v, chroma_w, chroma_h, sequence.chroma_depth, params);
 
-    let mut luma_dims: Vec<(usize, usize)> = Vec::with_capacity(params.dwt_depth as usize + 1);
-    let mut chroma_dims: Vec<(usize, usize)> = Vec::with_capacity(params.dwt_depth as usize + 1);
-    for level in 0..=params.dwt_depth {
-        luma_dims.push(subband_dims(luma_w, luma_h, params.dwt_depth, level));
-        chroma_dims.push(subband_dims(chroma_w, chroma_h, params.dwt_depth, level));
-    }
+    let luma_dims = component_dims(luma_w, luma_h, params.dwt_depth, params.dwt_depth_ho());
+    let chroma_dims = component_dims(chroma_w, chroma_h, params.dwt_depth, params.dwt_depth_ho());
 
     let q_per_level = slice_quantisers(qindex, &params.quant_matrix);
     let mut y_qpy = quantise_pyramid_ld(&y_py, &q_per_level);
@@ -2310,6 +2445,13 @@ fn write_ld_transform_parameters(w: &mut BitWriter, params: &LdEncoderParams) {
     w.write_uint(params.slice_bytes_numer);
     w.write_uint(params.slice_bytes_denom);
     // §12.4.5.3 quant_matrix: default (flag=0) or explicit (flag=1).
+    // A custom matrix must be shaped for the emitted `dwt_depth_ho`.
+    debug_assert!(
+        !params.custom_quant_matrix || params.quant_matrix.dwt_depth_ho == params.dwt_depth_ho(),
+        "custom quant matrix dwt_depth_ho ({}) must match the emitted §12.4.4.3 dwt_depth_ho ({})",
+        params.quant_matrix.dwt_depth_ho,
+        params.dwt_depth_ho(),
+    );
     write_quant_matrix(w, params.custom_quant_matrix, &params.quant_matrix);
 }
 
@@ -2320,7 +2462,8 @@ fn forward_component_ld(
     depth: u32,
     params: &LdEncoderParams,
 ) -> Vec<[SubbandData; 4]> {
-    let (pw, ph) = padded_component_dims(comp_w, comp_h, params.dwt_depth);
+    let ho = params.dwt_depth_ho();
+    let (pw, ph) = padded_component_dims_ho(comp_w, comp_h, params.dwt_depth, ho);
     let half: i32 = 1i32 << (depth - 1);
     let mut pic = SubbandData::new(pw, ph);
     for y in 0..ph {
@@ -2331,7 +2474,17 @@ fn forward_component_ld(
             pic.set(y, x, v);
         }
     }
-    dwt(&pic, params.wavelet, params.dwt_depth)
+    if ho == 0 {
+        dwt(&pic, params.wavelet, params.dwt_depth)
+    } else {
+        dwt_with_ho(
+            &pic,
+            params.wavelet,
+            params.wavelet_ho(),
+            params.dwt_depth,
+            ho,
+        )
+    }
 }
 
 fn quantise_pyramid_ld(
@@ -2506,12 +2659,9 @@ fn write_ld_component(
     sy: u32,
     _is_luma: bool,
 ) {
-    // Level 0 — LL only.
-    write_ld_slice_band(w, 0, Orient::LL, sx, sy, params, qpy, dims);
-    for level in 1..=params.dwt_depth {
-        for orient in [Orient::HL, Orient::LH, Orient::HH] {
-            write_ld_slice_band(w, level, orient, sx, sy, params, qpy, dims);
-        }
+    // §13.5.3 band order — shared symmetric/asymmetric sequence.
+    for (level, orient) in slice_band_order(params.dwt_depth, params.dwt_depth_ho()) {
+        write_ld_slice_band(w, level, orient, sx, sy, params, qpy, dims);
     }
 }
 
@@ -2525,11 +2675,9 @@ fn write_ld_chroma_interleaved(
     sx: u32,
     sy: u32,
 ) {
-    write_ld_slice_chroma_pair(w, 0, Orient::LL, sx, sy, params, u_qpy, v_qpy, chroma_dims);
-    for level in 1..=params.dwt_depth {
-        for orient in [Orient::HL, Orient::LH, Orient::HH] {
-            write_ld_slice_chroma_pair(w, level, orient, sx, sy, params, u_qpy, v_qpy, chroma_dims);
-        }
+    // §13.5.3 band order — shared symmetric/asymmetric sequence.
+    for (level, orient) in slice_band_order(params.dwt_depth, params.dwt_depth_ho()) {
+        write_ld_slice_chroma_pair(w, level, orient, sx, sy, params, u_qpy, v_qpy, chroma_dims);
     }
 }
 

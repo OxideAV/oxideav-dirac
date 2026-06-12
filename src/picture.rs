@@ -25,8 +25,8 @@ use crate::bits::BitReader;
 use crate::parse_info::ParseInfo;
 use crate::quant::{inverse_quant, slice_quantisers, QuantMatrix};
 use crate::sequence::SequenceHeader;
-use crate::subband::{init_pyramid, padded_component_dims, subband_dims, Orient, SubbandData};
-use crate::wavelet::{idwt, WaveletFilter};
+use crate::subband::{init_pyramid_ho, slice_band_order, subband_dims_ho, Orient, SubbandData};
+use crate::wavelet::{idwt, idwt_with_ho, WaveletFilter};
 
 /// A single fully-decoded picture: Y / U / V plane arrays (one signed
 /// int per pixel, non-negative after output offset), plus the picture
@@ -77,6 +77,18 @@ pub enum LowDelayProfile {
 pub struct TransformParameters {
     pub wavelet: WaveletFilter,
     pub dwt_depth: u32,
+    /// §12.4.4.2 horizontal-only wavelet filter
+    /// (`state[wavelet_index_ho]`). Defaults to `wavelet` on pre-v3
+    /// streams and on v3 streams that leave
+    /// `asym_transform_index_flag` at `False`. Only consulted by the
+    /// IDWT when `dwt_depth_ho > 0` (the §15.4.1 horizontal-only loop
+    /// runs zero iterations otherwise).
+    pub wavelet_ho: WaveletFilter,
+    /// §12.4.4.3 horizontal-only transform depth
+    /// (`state[dwt_depth_ho]`). `0` for a symmetric transform; `> 0`
+    /// adds that many §15.4.2 `h_synthesis` levels atop the
+    /// `dwt_depth` symmetric levels.
+    pub dwt_depth_ho: u32,
     pub slices_x: u32,
     pub slices_y: u32,
     /// Set only for LD.
@@ -100,13 +112,17 @@ pub enum PictureError {
     UnknownWaveletIndex(u32),
     UnsupportedDwtDepth(u32),
     ZeroSliceBytes,
-    /// Stream declares `major_version >= 3` and the
+    /// Stream declares `major_version >= 3`, the
     /// `extended_transform_parameters()` block (§12.4.4) selects an
-    /// asymmetric (horizontal-only) wavelet transform that this
-    /// decoder does not yet implement. `wavelet_index_ho` is the
+    /// asymmetric transform (`dwt_depth_ho > 0`), **and** the
+    /// §12.4.5.3 `custom_quant_matrix` flag is `False` — the stream
+    /// relies on the Annex D *asymmetric* default quantisation
+    /// matrices, which this decoder has not transcribed yet.
+    /// Custom-matrix asymmetric streams decode end-to-end through
+    /// [`crate::wavelet::idwt_with_ho`]; only the default-matrix
+    /// combination still rejects. `wavelet_index_ho` is the
     /// horizontal-only filter index and `dwt_depth_ho` the extra
-    /// horizontal-only depth (at least one of which must be
-    /// non-default for the rejection to fire — see §12.4.4.2 / .3).
+    /// horizontal-only depth.
     AsymmetricTransformUnsupported {
         wavelet_index_ho: u32,
         dwt_depth_ho: u32,
@@ -136,7 +152,7 @@ impl core::fmt::Display for PictureError {
                 dwt_depth_ho,
             } => write!(
                 f,
-                "v3 asymmetric transform unsupported (wavelet_index_ho={wavelet_index_ho}, dwt_depth_ho={dwt_depth_ho})"
+                "v3 asymmetric transform unsupported with the Annex D default quant matrix (wavelet_index_ho={wavelet_index_ho}, dwt_depth_ho={dwt_depth_ho}); custom-matrix asymmetric streams decode"
             ),
             Self::SliceOverflow => write!(f, "slice data overflows declared length"),
             Self::MissingReference(n) => {
@@ -341,15 +357,26 @@ fn decode_low_delay_picture(
     let chroma_w = sequence.chroma_width;
     let chroma_h = sequence.chroma_height;
 
-    let mut y_py = init_pyramid(luma_w, luma_h, params.dwt_depth);
-    let mut u_py = init_pyramid(chroma_w, chroma_h, params.dwt_depth);
-    let mut v_py = init_pyramid(chroma_w, chroma_h, params.dwt_depth);
+    // Pyramid and per-level dims cover all `dwt_depth_ho + dwt_depth`
+    // levels (§13.2.2 / §13.2.3); with `dwt_depth_ho == 0` this is the
+    // legacy symmetric layout.
+    let ho = params.dwt_depth_ho;
+    let total_levels = ho + params.dwt_depth;
+    let mut y_py = init_pyramid_ho(luma_w, luma_h, params.dwt_depth, ho);
+    let mut u_py = init_pyramid_ho(chroma_w, chroma_h, params.dwt_depth, ho);
+    let mut v_py = init_pyramid_ho(chroma_w, chroma_h, params.dwt_depth, ho);
 
-    let mut luma_dims: Vec<(usize, usize)> = Vec::with_capacity(params.dwt_depth as usize + 1);
-    let mut chroma_dims: Vec<(usize, usize)> = Vec::with_capacity(params.dwt_depth as usize + 1);
-    for level in 0..=params.dwt_depth {
-        luma_dims.push(subband_dims(luma_w, luma_h, params.dwt_depth, level));
-        chroma_dims.push(subband_dims(chroma_w, chroma_h, params.dwt_depth, level));
+    let mut luma_dims: Vec<(usize, usize)> = Vec::with_capacity(total_levels as usize + 1);
+    let mut chroma_dims: Vec<(usize, usize)> = Vec::with_capacity(total_levels as usize + 1);
+    for level in 0..=total_levels {
+        luma_dims.push(subband_dims_ho(luma_w, luma_h, params.dwt_depth, ho, level));
+        chroma_dims.push(subband_dims_ho(
+            chroma_w,
+            chroma_h,
+            params.dwt_depth,
+            ho,
+            level,
+        ));
     }
 
     for sy in 0..params.slices_y {
@@ -381,19 +408,22 @@ fn decode_low_delay_picture(
         }
     }
 
-    // §13.4 DC prediction — LD only. HQ never applies it.
+    // §13.4 / §13.5.2 DC prediction — LD only. HQ never applies it.
+    // For the asymmetric layout the level-0 entry is the L band (same
+    // slot 0), so the call shape is identical (§13.5.2 transform_data
+    // else-branch: `dc_prediction(state[y_transform][0][L])`).
     if matches!(profile, LowDelayProfile::LD) {
         intra_dc_prediction(&mut y_py[0][0]);
         intra_dc_prediction(&mut u_py[0][0]);
         intra_dc_prediction(&mut v_py[0][0]);
     }
 
-    let y_data = idwt(&y_py, params.wavelet);
-    let u_data = idwt(&u_py, params.wavelet);
-    let v_data = idwt(&v_py, params.wavelet);
-
-    let (_luma_pw, _luma_ph) = padded_component_dims(luma_w, luma_h, params.dwt_depth);
-    let (_chroma_pw, _chroma_ph) = padded_component_dims(chroma_w, chroma_h, params.dwt_depth);
+    // §15.4.1 IDWT. With `dwt_depth_ho == 0` `idwt_with_ho` is
+    // byte-equivalent to the symmetric `idwt` (the horizontal-only
+    // loop runs zero iterations and `wavelet_ho` is unused).
+    let y_data = idwt_with_ho(&y_py, params.wavelet, params.wavelet_ho, ho);
+    let u_data = idwt_with_ho(&u_py, params.wavelet, params.wavelet_ho, ho);
+    let v_data = idwt_with_ho(&v_py, params.wavelet, params.wavelet_ho, ho);
     let y = trim_clip_offset(
         &y_data,
         luma_w as usize,
@@ -825,22 +855,25 @@ pub(crate) fn parse_transform_parameters(
     }
     // §12.4.4 `extended_transform_parameters()`. The block (v3 only)
     // can optionally select a horizontal-only wavelet filter and an
-    // extra horizontal-only DWT depth. We parse the syntax
-    // unconditionally so the remaining §12.4.5 fields stay bit-aligned;
-    // the asymmetric rejection (for the unwired §13.5 slice / §15.4.1
-    // IDWT path) is deferred to *after* the whole block is consumed so
-    // the §12.4.5.3 quant_matrix — whose layout depends on
-    // `dwt_depth_ho` (§13.2.1) — is read in the correct shape even for
-    // streams we cannot yet reconstruct. For pre-v3 streams the block
-    // is absent and `dwt_depth_ho` is 0 (the §12.4.4 NOTE invariant:
-    // with `dwt_depth_ho == 0` and `wavelet_index_ho == wavelet_index`
-    // the inverse transform is identical to earlier versions).
-    let (wavelet_index_ho, dwt_depth_ho) = if major_version >= 3 {
+    // extra horizontal-only DWT depth, both of which feed the §13.5
+    // slice unpack (asymmetric band order), the §13.2.3 subband
+    // dimensions and the §15.4.1 IDWT driver. For pre-v3 streams the
+    // block is absent and `dwt_depth_ho` is 0 (the §12.4.4 NOTE
+    // invariant: with `dwt_depth_ho == 0` and `wavelet_index_ho ==
+    // wavelet_index` the inverse transform is identical to earlier
+    // versions).
+    let (wavelet_index_ho, wavelet_ho, dwt_depth_ho) = if major_version >= 3 {
         let ext = parse_extended_transform_parameters(r, w_idx, wavelet)?;
-        (ext.wavelet_index_ho, ext.dwt_depth_ho)
+        (ext.wavelet_index_ho, ext.wavelet_ho, ext.dwt_depth_ho)
     } else {
-        (w_idx, 0)
+        (w_idx, wavelet, 0)
     };
+    // §13.2.2 total level count: a single pyramid spans both the
+    // horizontal-only and the 2-D levels. Keep the combined depth
+    // within the same physical ceiling as `dwt_depth` itself.
+    if dwt_depth_ho + dwt_depth > 6 {
+        return Err(PictureError::UnsupportedDwtDepth(dwt_depth_ho + dwt_depth));
+    }
 
     // §12.4.5.2 slice_parameters.
     let slices_x = r.read_uint();
@@ -864,39 +897,36 @@ pub(crate) fn parse_transform_parameters(
     // `dwt_depth_ho` single H bands, then the `dwt_depth` HL/LH/HH
     // triplets (§13.2.1 ordering). With `dwt_depth_ho == 0` it is the
     // legacy symmetric read. The default (`set_quant_matrix`) branch
-    // only covers symmetric transforms here — §12.4.5.3 requires
-    // `custom_quant_matrix == True` for every asymmetric case that this
-    // crate could otherwise reach (notably `dwt_depth_ho > 4`,
-    // `dwt_depth_ho + dwt_depth > 5`, and the wavelet-index
-    // combinations), and the asymmetric Annex-D default tables are not
-    // yet transcribed, so a default-matrix asymmetric stream falls
-    // through to the `AsymmetricTransformUnsupported` rejection below.
+    // only covers the *symmetric* Annex D tables: a genuinely
+    // asymmetric stream (`dwt_depth_ho > 0`) that relies on the
+    // Annex D asymmetric defaults is rejected below until those tables
+    // are transcribed. The parse stays bit-exact through the whole
+    // transform-parameters block either way, so a caller that recovers
+    // from the rejection sees a correctly aligned reader.
+    //
+    // A v3 stream with `wavelet_index_ho != wavelet_index` but
+    // `dwt_depth_ho == 0` is decoded with the symmetric default
+    // matrix: the §15.4.1 horizontal-only loop runs zero iterations,
+    // so the filter override has no effect on the transform and the
+    // quant-matrix layout is the symmetric one.
     let custom_flag = r.read_bool();
     let quant_matrix = if custom_flag {
         QuantMatrix::parse_custom(r, dwt_depth, dwt_depth_ho)
+    } else if dwt_depth_ho != 0 {
+        return Err(PictureError::AsymmetricTransformUnsupported {
+            wavelet_index_ho,
+            dwt_depth_ho,
+        });
     } else {
         QuantMatrix::default_for(wavelet, dwt_depth)
             .ok_or(PictureError::UnsupportedDwtDepth(dwt_depth))?
     };
 
-    // The §12.4.5 block is now fully consumed. A genuinely asymmetric
-    // transform (§12.4.4.2 `wavelet_index_ho != wavelet_index` or
-    // §12.4.4.3 `dwt_depth_ho != 0`) is rejected here for the
-    // downstream §13.5 slice-coefficient / §15.4.1 IDWT path, which is
-    // not yet wired. The parse above stayed bit-exact through the whole
-    // transform-parameters block, so a caller that only needs the
-    // header (or that recovers from this error) sees a correctly
-    // aligned reader and a fully-populated `quant_matrix`.
-    if wavelet_index_ho != w_idx || dwt_depth_ho != 0 {
-        return Err(PictureError::AsymmetricTransformUnsupported {
-            wavelet_index_ho,
-            dwt_depth_ho,
-        });
-    }
-
     Ok(TransformParameters {
         wavelet,
         dwt_depth,
+        wavelet_ho,
+        dwt_depth_ho,
         slices_x,
         slices_y,
         slice_bytes_numer,
@@ -945,65 +975,42 @@ pub(crate) fn decode_ld_slice(
 
     let q_per_level = slice_quantisers(qindex, &params.quant_matrix);
 
+    // §13.5.3 band order — symmetric and asymmetric layouts share
+    // the `slice_band_order` sequence (L/LL first, then any
+    // horizontal-only H bands, then the HL/LH/HH triplets).
+    let order = slice_band_order(params.dwt_depth, params.dwt_depth_ho);
     {
         let mut f = Funnel::new(r, slice_y_length);
-        decode_luma_band(
-            &mut f,
-            0,
-            Orient::LL,
-            sx,
-            sy,
-            params,
-            y_py,
-            luma_dims,
-            &q_per_level,
-        );
-        for level in 1..=params.dwt_depth {
-            for orient in [Orient::HL, Orient::LH, Orient::HH] {
-                decode_luma_band(
-                    &mut f,
-                    level,
-                    orient,
-                    sx,
-                    sy,
-                    params,
-                    y_py,
-                    luma_dims,
-                    &q_per_level,
-                );
-            }
+        for &(level, orient) in &order {
+            decode_luma_band(
+                &mut f,
+                level,
+                orient,
+                sx,
+                sy,
+                params,
+                y_py,
+                luma_dims,
+                &q_per_level,
+            );
         }
         f.flush();
     }
     {
         let mut f = Funnel::new(r, chroma_bits);
-        decode_chroma_pair(
-            &mut f,
-            0,
-            Orient::LL,
-            sx,
-            sy,
-            params,
-            u_py,
-            v_py,
-            chroma_dims,
-            &q_per_level,
-        );
-        for level in 1..=params.dwt_depth {
-            for orient in [Orient::HL, Orient::LH, Orient::HH] {
-                decode_chroma_pair(
-                    &mut f,
-                    level,
-                    orient,
-                    sx,
-                    sy,
-                    params,
-                    u_py,
-                    v_py,
-                    chroma_dims,
-                    &q_per_level,
-                );
-            }
+        for &(level, orient) in &order {
+            decode_chroma_pair(
+                &mut f,
+                level,
+                orient,
+                sx,
+                sy,
+                params,
+                u_py,
+                v_py,
+                chroma_dims,
+                &q_per_level,
+            );
         }
         f.flush();
     }
@@ -1050,31 +1057,19 @@ pub(crate) fn decode_hq_slice(
             1 => u_py,
             _ => v_py,
         };
-        decode_hq_component_band(
-            &mut f,
-            0,
-            Orient::LL,
-            sx,
-            sy,
-            params,
-            py,
-            dims,
-            &q_per_level,
-        );
-        for level in 1..=params.dwt_depth {
-            for orient in [Orient::HL, Orient::LH, Orient::HH] {
-                decode_hq_component_band(
-                    &mut f,
-                    level,
-                    orient,
-                    sx,
-                    sy,
-                    params,
-                    py,
-                    dims,
-                    &q_per_level,
-                );
-            }
+        // §13.5.4 band order — shared symmetric/asymmetric sequence.
+        for (level, orient) in slice_band_order(params.dwt_depth, params.dwt_depth_ho) {
+            decode_hq_component_band(
+                &mut f,
+                level,
+                orient,
+                sx,
+                sy,
+                params,
+                py,
+                dims,
+                &q_per_level,
+            );
         }
         f.flush();
     }
@@ -1560,20 +1555,53 @@ mod tests {
         w.finish()
     }
 
-    /// A v3 asymmetric stream is parsed through the entire §12.4.5
-    /// block — including the §12.4.5.3 asymmetric quant_matrix shape —
-    /// and only *then* rejected with `AsymmetricTransformUnsupported`
-    /// carrying the parsed `dwt_depth_ho`. The matrix body uses the
-    /// asymmetric layout (L, then `ho` H bands, then `dwt_depth`
-    /// triplets); if the parser read it with the symmetric shape it
-    /// would mis-align and consume the wrong number of uints, but the
-    /// rejection here is value-checked so the run-through is exercised.
+    /// A v3 asymmetric stream with a custom quant matrix parses to a
+    /// full `TransformParameters`: `dwt_depth_ho` and `wavelet_ho` are
+    /// populated and the §12.4.5.3 matrix body is read in the
+    /// asymmetric shape (L, then `ho` H bands, then `dwt_depth`
+    /// triplets). If the parser read the matrix with the symmetric
+    /// shape it would mis-align and consume the wrong number of uints,
+    /// so the value-checked matrix pins the layout.
     #[test]
-    fn parse_transform_parameters_asymmetric_rejected_after_full_parse() {
+    fn parse_transform_parameters_asymmetric_custom_matrix_accepted() {
         // wavelet_index = 1 (LeGall5_3), dwt_depth = 1, ho = 2.
         // Matrix (asymmetric): L, H, H, then one HL/LH/HH triplet.
         let matrix = [7u32, 11, 13, 5, 6, 8];
         let bytes = build_transform_params_hq(1, 1, 2, &matrix);
+        let mut r = BitReader::new(&bytes);
+        let tp = parse_transform_parameters(&mut r, LowDelayProfile::HQ, 3).unwrap();
+        assert_eq!(tp.wavelet, WaveletFilter::LeGall5_3);
+        // asym_transform_index_flag was 0 → wavelet_ho defaults to the
+        // 2-D filter (§12.4.4.2).
+        assert_eq!(tp.wavelet_ho, WaveletFilter::LeGall5_3);
+        assert_eq!(tp.dwt_depth, 1);
+        assert_eq!(tp.dwt_depth_ho, 2);
+        assert_eq!(tp.quant_matrix.dwt_depth_ho, 2);
+        assert_eq!(tp.quant_matrix.levels[0], [7, 0, 0, 0]); // L
+        assert_eq!(tp.quant_matrix.levels[1], [11, 0, 0, 0]); // H
+        assert_eq!(tp.quant_matrix.levels[2], [13, 0, 0, 0]); // H
+        assert_eq!(tp.quant_matrix.levels[3], [0, 5, 6, 8]); // HL/LH/HH
+    }
+
+    /// A v3 asymmetric stream that relies on the Annex D *default*
+    /// quantisation matrices (`custom_quant_matrix = False`) is still
+    /// rejected with `AsymmetricTransformUnsupported` — those tables
+    /// are not transcribed yet. Only the default-matrix combination
+    /// rejects; the custom-matrix stream above decodes.
+    #[test]
+    fn parse_transform_parameters_asymmetric_default_matrix_rejected() {
+        let mut w = BitWriter::new();
+        w.write_uint(1); // wavelet_index = LeGall5_3
+        w.write_uint(1); // dwt_depth
+        w.write_bool(false); // asym_transform_index_flag
+        w.write_bool(true); // asym_transform_flag
+        w.write_uint(2); // dwt_depth_ho
+        w.write_uint(1); // slices_x
+        w.write_uint(1); // slices_y
+        w.write_uint(0); // slice_prefix_bytes
+        w.write_uint(1); // slice_size_scaler
+        w.write_bool(false); // custom_quant_matrix = False → Annex D
+        let bytes = w.finish();
         let mut r = BitReader::new(&bytes);
         let err = parse_transform_parameters(&mut r, LowDelayProfile::HQ, 3).unwrap_err();
         assert_eq!(

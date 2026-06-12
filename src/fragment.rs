@@ -75,8 +75,8 @@ use crate::picture::{
     TransformParameters,
 };
 use crate::sequence::SequenceHeader;
-use crate::subband::{init_pyramid, subband_dims, SubbandData};
-use crate::wavelet::idwt;
+use crate::subband::{init_pyramid_ho, subband_dims_ho, SubbandData};
+use crate::wavelet::idwt_with_ho;
 
 /// A picture fragment header, parsed per §14.2.
 ///
@@ -373,16 +373,13 @@ pub enum AssemblerError {
     /// `state[fragmented_picture_done]` flag so a partial picture
     /// must not invoke the trailing prediction step.
     DcPredictionBeforePictureComplete,
-    /// The §14.5 trailing kick was requested with a `dwt_depth_ho >
-    /// 0` — the picture used the asymmetric (horizontal-only)
-    /// transform from §12.4.4.3, which routes the trailing
-    /// prediction to a level-`dwt_depth_ho` L (low-pass-only)
-    /// subband instead of the level-0 LL subband. The asymmetric
-    /// IDWT path is not implemented in this crate yet (see
-    /// [`crate::picture::PictureError::AsymmetricTransformUnsupported`]);
-    /// the error variant is here so the §14.5 entry point fails
-    /// consistently with the rest of the v3 asymmetric surface
-    /// until that work lands.
+    /// Historical variant — **no longer raised**. Earlier rounds
+    /// rejected the §14.4 trailing kick on asymmetric pictures
+    /// (`dwt_depth_ho > 0`, §12.4.4.3); the §14.4 else-branch in
+    /// fact targets the level-0 **L** subband, which lives in the
+    /// same `[0][0]` pyramid slot as the symmetric LL band, so the
+    /// kick is identical and now always succeeds. The variant is
+    /// retained so downstream `match` arms keep compiling.
     AsymmetricDcPredictionUnsupported { dwt_depth_ho: u32 },
 }
 
@@ -671,17 +668,13 @@ impl FragmentAssembler {
     ///
     /// Returns:
     /// * `Ok(())` after a successful kick (LD path) or a successful
-    ///   no-op (HQ path).
+    ///   no-op (HQ path). An asymmetric picture (`dwt_depth_ho > 0`,
+    ///   §12.4.4.3) succeeds too: the §14.4 else-branch targets each
+    ///   component's level-0 **L** subband, which occupies the same
+    ///   `[0][0]` pyramid slot as the symmetric LL band, so the
+    ///   caller-supplied bands and the §13.4 routine are identical.
     /// * `Err(DcPredictionBeforePictureComplete)` if any data
     ///   fragment for the active picture is still outstanding.
-    /// * `Err(AsymmetricDcPredictionUnsupported { dwt_depth_ho })`
-    ///   if the active picture's `extended_transform_parameters()`
-    ///   selected `dwt_depth_ho > 0` (§12.4.4.3): the §14.5 kick
-    ///   then targets the level-`dwt_depth_ho` L subband instead of
-    ///   the level-0 LL subband, and that path is not implemented
-    ///   in this crate yet — mirrors
-    ///   [`crate::picture::PictureError::AsymmetricTransformUnsupported`]
-    ///   raised by the non-fragmented v3 path.
     ///
     /// On success, the assembler does NOT auto-reset; the next setup
     /// fragment is accepted because `fragmented_picture_done()`
@@ -699,16 +692,12 @@ impl FragmentAssembler {
             // skips the trailing `dc_prediction(...)` kick entirely.
             return Ok(());
         }
-        if self.dwt_depth_ho != 0 {
-            // §14.5 / §12.4.4.3: a horizontal-only depth selects the
-            // level-`dwt_depth_ho` L (low-pass) subband instead of
-            // the level-0 LL subband for the trailing prediction.
-            // The L subband path is not implemented yet — surface
-            // the gap so callers can short-circuit cleanly.
-            return Err(AssemblerError::AsymmetricDcPredictionUnsupported {
-                dwt_depth_ho: self.dwt_depth_ho,
-            });
-        }
+        // §14.4 `fragment_data`: with `dwt_depth_ho == 0` the kick
+        // targets each component's level-0 LL subband; with
+        // `dwt_depth_ho > 0` it targets the level-0 **L** subband —
+        // which occupies the same pyramid slot (`[0][0]`), so the
+        // caller passes the same band either way and the §13.4
+        // routine is identical.
         for ll in components.iter_mut() {
             intra_dc_prediction(ll);
         }
@@ -1031,29 +1020,38 @@ impl<'s> FragmentedPictureDecoder<'s> {
         self.assembler.on_transform_parameters(
             params.slices_x,
             params.slices_y,
-            // §12.4.4.3 `dwt_depth_ho` defaulted to 0 for v2 streams
-            // and on v3 streams that landed in the symmetric default.
-            // The asymmetric path is rejected in
-            // `parse_transform_parameters` so we always pass 0 here.
-            0,
+            // §12.4.4.3 `dwt_depth_ho` — 0 for v2 streams and for v3
+            // streams in the symmetric default; > 0 selects the
+            // asymmetric (horizontal-only) layout, which the slice
+            // unpack / pyramid / IDWT below all follow.
+            params.dwt_depth_ho,
         )?;
 
         // Allocate the three component pyramids and pre-compute per-
-        // level subband dims (every slice call needs both).
+        // level subband dims (every slice call needs both). Both are
+        // asymmetric-aware (§13.2.2 / §13.2.3): the pyramid spans
+        // `dwt_depth_ho + dwt_depth` levels.
         let luma_w = self.sequence.luma_width;
         let luma_h = self.sequence.luma_height;
         let chroma_w = self.sequence.chroma_width;
         let chroma_h = self.sequence.chroma_height;
-        self.y_py = init_pyramid(luma_w, luma_h, params.dwt_depth);
-        self.u_py = init_pyramid(chroma_w, chroma_h, params.dwt_depth);
-        self.v_py = init_pyramid(chroma_w, chroma_h, params.dwt_depth);
-        self.luma_dims = Vec::with_capacity(params.dwt_depth as usize + 1);
-        self.chroma_dims = Vec::with_capacity(params.dwt_depth as usize + 1);
-        for level in 0..=params.dwt_depth {
+        let ho = params.dwt_depth_ho;
+        let total_levels = ho + params.dwt_depth;
+        self.y_py = init_pyramid_ho(luma_w, luma_h, params.dwt_depth, ho);
+        self.u_py = init_pyramid_ho(chroma_w, chroma_h, params.dwt_depth, ho);
+        self.v_py = init_pyramid_ho(chroma_w, chroma_h, params.dwt_depth, ho);
+        self.luma_dims = Vec::with_capacity(total_levels as usize + 1);
+        self.chroma_dims = Vec::with_capacity(total_levels as usize + 1);
+        for level in 0..=total_levels {
             self.luma_dims
-                .push(subband_dims(luma_w, luma_h, params.dwt_depth, level));
-            self.chroma_dims
-                .push(subband_dims(chroma_w, chroma_h, params.dwt_depth, level));
+                .push(subband_dims_ho(luma_w, luma_h, params.dwt_depth, ho, level));
+            self.chroma_dims.push(subband_dims_ho(
+                chroma_w,
+                chroma_h,
+                params.dwt_depth,
+                ho,
+                level,
+            ));
         }
         self.picture_number = header.picture_number;
         self.profile = Some(profile);
@@ -1187,9 +1185,26 @@ impl<'s> FragmentedPictureDecoder<'s> {
                 ])?;
         }
 
-        let y_data = idwt(&self.y_py, params.wavelet);
-        let u_data = idwt(&self.u_py, params.wavelet);
-        let v_data = idwt(&self.v_py, params.wavelet);
+        // §15.4.1 IDWT — with `dwt_depth_ho == 0` `idwt_with_ho` is
+        // byte-equivalent to the symmetric `idwt`.
+        let y_data = idwt_with_ho(
+            &self.y_py,
+            params.wavelet,
+            params.wavelet_ho,
+            params.dwt_depth_ho,
+        );
+        let u_data = idwt_with_ho(
+            &self.u_py,
+            params.wavelet,
+            params.wavelet_ho,
+            params.dwt_depth_ho,
+        );
+        let v_data = idwt_with_ho(
+            &self.v_py,
+            params.wavelet,
+            params.wavelet_ho,
+            params.dwt_depth_ho,
+        );
 
         let luma_w = self.sequence.luma_width as usize;
         let luma_h = self.sequence.luma_height as usize;
@@ -1910,28 +1925,35 @@ mod tests {
         assert_eq!(err, AssemblerError::DcPredictionBeforePictureComplete);
     }
 
-    /// §14.5 / §12.4.4.3: when `dwt_depth_ho > 0`, the trailing
-    /// prediction targets the level-`dwt_depth_ho` L (low-pass-only)
-    /// subband instead of the level-0 LL subband. The L-subband path
-    /// is not implemented yet; the assembler returns
-    /// `AsymmetricDcPredictionUnsupported` with the offending depth
-    /// surfaced for diagnostics. Mirrors the v3 non-fragmented
-    /// `PictureError::AsymmetricTransformUnsupported` rejection.
+    /// §14.4 / §12.4.4.3: when `dwt_depth_ho > 0`, the trailing
+    /// prediction targets the level-0 **L** subband — the §14.4
+    /// else-branch is `dc_prediction(state[y_transform][0][L])` —
+    /// which occupies the same `[0][0]` pyramid slot as the symmetric
+    /// LL band. The kick therefore succeeds on an asymmetric picture
+    /// and runs the identical §13.4 routine on the caller-supplied
+    /// band. (Earlier rounds rejected this case with
+    /// `AsymmetricDcPredictionUnsupported`; that variant is no longer
+    /// raised.)
     #[test]
-    fn fragmented_dc_prediction_rejects_asymmetric_transform() {
+    fn fragmented_dc_prediction_accepts_asymmetric_transform() {
         let mut asm = FragmentAssembler::new();
         asm.on_setup_fragment(&setup_hdr(0), 0xCC).unwrap();
         asm.on_transform_parameters(2, 2, 2).unwrap();
         asm.on_data_fragment(&data_hdr(0, 4, 0, 0), 0xCC).unwrap();
         assert!(asm.fragmented_picture_done());
-        let mut y_ll = flat_ll_band(3, 3, 1);
-        let err = asm
-            .fragmented_wavelet_transform_dc_prediction(&mut [&mut y_ll])
-            .unwrap_err();
-        assert_eq!(
-            err,
-            AssemblerError::AsymmetricDcPredictionUnsupported { dwt_depth_ho: 2 }
-        );
+        // Same seed pattern as the symmetric single-component test:
+        // the asymmetric kick must produce the identical §13.4 result.
+        let mut y_l = flat_ll_band(2, 2, 0);
+        y_l.set(0, 0, 4);
+        y_l.set(0, 1, 1);
+        y_l.set(1, 0, 1);
+        y_l.set(1, 1, 1);
+        asm.fragmented_wavelet_transform_dc_prediction(&mut [&mut y_l])
+            .unwrap();
+        assert_eq!(y_l.get(0, 0), 4);
+        assert_eq!(y_l.get(0, 1), 5);
+        assert_eq!(y_l.get(1, 0), 5);
+        assert_eq!(y_l.get(1, 1), 6);
     }
 
     /// §14.5 on a single-component (luma-only) call site: passing a
