@@ -279,6 +279,153 @@ impl QuantMatrix {
         })
     }
 
+    /// Look up the default *asymmetric* (horizontal-only) quantisation
+    /// matrix for a `(wavelet_index, wavelet_index_ho, dwt_depth,
+    /// dwt_depth_ho)` combination, per SMPTE ST 2042-1:2022 Annex D
+    /// (Tables D.1–D.8, the `set_quant_matrix()` referenced from
+    /// §12.4.5.3).
+    ///
+    /// Annex D defines defaults for two sets of cases:
+    ///
+    /// 1. `wavelet_index_ho == wavelet_index` (Tables D.1–D.7, one per
+    ///    filter index 0..=6), with `dwt_depth <= 4`, `dwt_depth_ho <= 4`
+    ///    and `dwt_depth + dwt_depth_ho <= 5`.
+    /// 2. `wavelet_index == 3` (Haar, no shift) and
+    ///    `wavelet_index_ho == 1` (LeGall) — Table D.8 — under the same
+    ///    depth bounds.
+    ///
+    /// Any combination outside those tables returns `None`: the spec
+    /// then requires a custom matrix (§12.4.5.3).
+    ///
+    /// With `dwt_depth_ho == 0` this reduces to the symmetric Annex D
+    /// defaults and is consistent with [`Self::default_for`]; callers
+    /// that already have a symmetric stream may use either.
+    ///
+    /// The returned [`QuantMatrix`] follows the same storage convention
+    /// as [`Self::parse_custom`]: level 0 holds the L (or LL) value in
+    /// slot 0, levels `1..=dwt_depth_ho` hold the single H band in slot
+    /// 0, and the remaining `dwt_depth` levels hold the HL/LH/HH triplet
+    /// in slots 1..=3.
+    pub fn default_for_asymmetric(
+        wavelet: WaveletFilter,
+        wavelet_ho: WaveletFilter,
+        dwt_depth: u32,
+        dwt_depth_ho: u32,
+    ) -> Option<Self> {
+        // Annex D depth bounds (the "Combined values ... not present in
+        // the tables ... shall require a custom matrix" clause).
+        if dwt_depth > 4 || dwt_depth_ho > 4 || dwt_depth + dwt_depth_ho > 5 {
+            return None;
+        }
+        let d = dwt_depth as usize;
+        let ho = dwt_depth_ho as usize;
+
+        // Build the level list from a (l0, h_bands, triplets) shape that
+        // is constant across the `dwt_depth` column (Tables D.1, D.2,
+        // D.3, D.6, D.7). `l0` is the level-0 L/LL value; `h_bands` the
+        // per-level H values (levels 1..=ho); `triplets` the bottom-up
+        // HL/LH/HH triplets, of which the first `dwt_depth` apply.
+        fn build(
+            l0: u32,
+            h_bands: &[u32],
+            triplets: &[(u32, u32, u32)],
+            d: usize,
+        ) -> Vec<[u32; 4]> {
+            let mut levels: Vec<[u32; 4]> = Vec::with_capacity(1 + h_bands.len() + d);
+            levels.push([l0, 0, 0, 0]);
+            for &h in h_bands {
+                levels.push([h, 0, 0, 0]);
+            }
+            for &(hl, lh, hh) in triplets.iter().take(d) {
+                levels.push([0, hl, lh, hh]);
+            }
+            levels
+        }
+
+        // For the depth-INVARIANT tables (D.1/2/3/6/7), each `ho` block
+        // names the level-0 L value, the H-band values for levels
+        // 1..=ho, and the full triplet list (the first `dwt_depth` of
+        // which are emitted).
+        type DepthInvariant = (u32, &'static [u32], &'static [(u32, u32, u32)]);
+
+        let depth_invariant: Option<DepthInvariant> = match (wavelet, wavelet_ho) {
+            // Table D.1 — Deslauriers-Dubuc (9,7), index 0.
+            (WaveletFilter::DeslauriersDubuc9_7, WaveletFilter::DeslauriersDubuc9_7) => {
+                Some(match ho {
+                    0 => (5, &[], &[(3, 3, 0), (4, 4, 1), (5, 5, 2), (6, 6, 3)]),
+                    1 => (3, &[0], &[(3, 3, 0), (4, 4, 1), (5, 5, 2), (6, 6, 3)]),
+                    2 => (3, &[0, 3], &[(5, 5, 3), (6, 6, 4), (7, 7, 5)]),
+                    3 => (3, &[0, 3, 5], &[(8, 8, 5), (9, 9, 6)]),
+                    _ => (3, &[0, 3, 5, 8], &[(10, 10, 8)]),
+                })
+            }
+            // Table D.2 — LeGall (5,3), index 1.
+            (WaveletFilter::LeGall5_3, WaveletFilter::LeGall5_3) => Some(match ho {
+                0 => (4, &[], &[(2, 2, 0), (4, 4, 2), (5, 5, 3), (7, 7, 5)]),
+                1 => (2, &[0], &[(3, 3, 1), (4, 4, 2), (6, 6, 4), (8, 8, 6)]),
+                2 => (2, &[0, 3], &[(6, 6, 4), (7, 7, 5), (9, 9, 7)]),
+                3 => (2, &[0, 3, 6], &[(8, 8, 6), (10, 10, 8)]),
+                _ => (2, &[0, 3, 6, 8], &[(11, 11, 9)]),
+            }),
+            // Table D.3 — Deslauriers-Dubuc (13,7), index 2.
+            (WaveletFilter::DeslauriersDubuc13_7, WaveletFilter::DeslauriersDubuc13_7) => {
+                Some(match ho {
+                    0 => (5, &[], &[(3, 3, 0), (4, 4, 1), (5, 5, 2), (6, 6, 3)]),
+                    1 => (3, &[0], &[(3, 3, 0), (4, 4, 1), (5, 5, 2), (6, 6, 3)]),
+                    2 => (3, &[0, 3], &[(5, 5, 2), (6, 6, 4), (7, 7, 5)]),
+                    3 => (3, &[0, 3, 5], &[(8, 8, 5), (9, 9, 6)]),
+                    _ => (3, &[0, 3, 5, 8], &[(10, 10, 8)]),
+                })
+            }
+            // Table D.6 — Fidelity, index 5.
+            (WaveletFilter::Fidelity, WaveletFilter::Fidelity) => Some(match ho {
+                0 => (0, &[], &[(4, 4, 8), (8, 8, 12), (13, 13, 17), (17, 17, 21)]),
+                1 => (
+                    0,
+                    &[4],
+                    &[(6, 6, 10), (11, 11, 15), (15, 15, 19), (19, 19, 23)],
+                ),
+                2 => (0, &[4, 6], &[(8, 8, 12), (13, 13, 17), (17, 17, 21)]),
+                3 => (0, &[4, 6, 8], &[(11, 11, 15), (15, 15, 19)]),
+                _ => (0, &[4, 6, 8, 11], &[(13, 13, 17)]),
+            }),
+            // Table D.7 — Daubechies (9,7), index 6.
+            (WaveletFilter::Daubechies9_7, WaveletFilter::Daubechies9_7) => Some(match ho {
+                0 => (3, &[], &[(1, 1, 0), (4, 4, 2), (6, 6, 5), (9, 9, 7)]),
+                1 => (1, &[0], &[(3, 3, 2), (6, 6, 4), (8, 8, 7), (11, 11, 9)]),
+                2 => (1, &[0, 3], &[(6, 6, 5), (9, 9, 8), (11, 11, 10)]),
+                3 => (1, &[0, 3, 6], &[(10, 10, 8), (12, 12, 11)]),
+                _ => (1, &[0, 3, 6, 10], &[(13, 13, 12)]),
+            }),
+            _ => None,
+        };
+
+        if let Some((l0, h_bands, triplets)) = depth_invariant {
+            return Some(Self {
+                dwt_depth,
+                dwt_depth_ho,
+                levels: build(l0, h_bands, triplets, d),
+            });
+        }
+
+        // Depth-DEPENDENT tables (D.4 Haar0, D.5 Haar1, D.8 Haar0/LeGall):
+        // the L/H band values change between the `dwt_depth` columns
+        // because the Haar lifting carries a per-level shift. These are
+        // transcribed cell-by-cell, keyed `[ho][depth]` → full level
+        // list. An empty list marks an invalid `(ho, depth)` cell.
+        let levels = match (wavelet, wavelet_ho) {
+            (WaveletFilter::Haar0, WaveletFilter::Haar0) => haar0_levels(ho, d)?,
+            (WaveletFilter::Haar1, WaveletFilter::Haar1) => haar1_levels(ho, d)?,
+            (WaveletFilter::Haar0, WaveletFilter::LeGall5_3) => haar0_legall_levels(ho, d)?,
+            _ => return None,
+        };
+        Some(Self {
+            dwt_depth,
+            dwt_depth_ho,
+            levels,
+        })
+    }
+
     /// Parse a custom quantisation matrix (SMPTE ST 2042-1:2022
     /// §12.4.5.3, the `custom_quant_matrix == True` branch), supporting
     /// both the symmetric (`dwt_depth_ho == 0`) and asymmetric
@@ -337,6 +484,118 @@ impl QuantMatrix {
         }
         self.levels[l][orient.as_index()]
     }
+}
+
+/// Assemble a [`QuantMatrix::levels`] list from the explicit per-cell
+/// shape of a depth-dependent Annex D table (D.4 / D.5 / D.8): the
+/// level-0 L value, the per-level H-band values (levels 1..=ho), and
+/// the bottom-up HL/LH/HH triplets (levels ho+1..=ho+depth).
+/// One depth-dependent Annex D cell: the level-0 L value, the per-level
+/// H-band values (levels `1..=dwt_depth_ho`), and the bottom-up
+/// HL/LH/HH triplets (levels `dwt_depth_ho+1..=dwt_depth_ho+dwt_depth`).
+type AnnexDCell = (u32, &'static [u32], &'static [(u32, u32, u32)]);
+
+fn assemble_levels(l0: u32, h_bands: &[u32], triplets: &[(u32, u32, u32)]) -> Vec<[u32; 4]> {
+    let mut levels: Vec<[u32; 4]> = Vec::with_capacity(1 + h_bands.len() + triplets.len());
+    levels.push([l0, 0, 0, 0]);
+    for &h in h_bands {
+        levels.push([h, 0, 0, 0]);
+    }
+    for &(hl, lh, hh) in triplets {
+        levels.push([0, hl, lh, hh]);
+    }
+    levels
+}
+
+/// SMPTE ST 2042-1:2022 Table D.4 — default matrices for
+/// `wavelet_index == 3` and `wavelet_index_ho == 3` (Haar, no shift).
+/// Transcribed per `(dwt_depth_ho, dwt_depth)` cell; `None` for cells
+/// outside the table (those require a custom matrix).
+fn haar0_levels(ho: usize, d: usize) -> Option<Vec<[u32; 4]>> {
+    // For Haar0, level 0 = 4*(ho_offset) ... the L/H bands change with
+    // depth, so the cells are transcribed verbatim rather than derived.
+    let (l0, h, t): AnnexDCell = match (ho, d) {
+        (0, 1) => (8, &[], &[(4, 4, 0)]),
+        (0, 2) => (12, &[], &[(8, 8, 4), (4, 4, 0)]),
+        (0, 3) => (16, &[], &[(12, 12, 8), (8, 8, 4), (4, 4, 0)]),
+        (0, 4) => (20, &[], &[(16, 16, 12), (12, 12, 8), (8, 8, 4), (4, 4, 0)]),
+        (1, 0) => (4, &[0], &[]),
+        (1, 1) => (10, &[6], &[(4, 4, 0)]),
+        (1, 2) => (14, &[10], &[(8, 8, 4), (4, 4, 0)]),
+        (1, 3) => (18, &[14], &[(12, 12, 8), (8, 8, 4), (4, 4, 0)]),
+        (1, 4) => (
+            22,
+            &[18],
+            &[(16, 16, 12), (12, 12, 8), (8, 8, 4), (4, 4, 0)],
+        ),
+        (2, 0) => (6, &[2, 0], &[]),
+        (2, 1) => (12, &[8, 6], &[(4, 4, 0)]),
+        (2, 2) => (16, &[12, 10], &[(8, 8, 4), (4, 4, 0)]),
+        (2, 3) => (20, &[16, 14], &[(12, 12, 8), (8, 8, 4), (4, 4, 0)]),
+        (3, 0) => (8, &[4, 2, 0], &[]),
+        (3, 1) => (14, &[10, 8, 6], &[(4, 4, 0)]),
+        (3, 2) => (18, &[14, 12, 10], &[(8, 8, 4), (4, 4, 0)]),
+        (4, 0) => (10, &[6, 4, 2, 0], &[]),
+        (4, 1) => (16, &[12, 10, 8, 6], &[(4, 4, 0)]),
+        _ => return None,
+    };
+    Some(assemble_levels(l0, h, t))
+}
+
+/// SMPTE ST 2042-1:2022 Table D.5 — default matrices for
+/// `wavelet_index == 4` and `wavelet_index_ho == 4` (Haar, single shift
+/// per level).
+fn haar1_levels(ho: usize, d: usize) -> Option<Vec<[u32; 4]>> {
+    let (l0, h, t): AnnexDCell = match (ho, d) {
+        (0, 1) => (8, &[], &[(4, 4, 0)]),
+        (0, 2) => (8, &[], &[(4, 4, 0), (4, 4, 0)]),
+        (0, 3) => (8, &[], &[(4, 4, 0), (4, 4, 0), (4, 4, 0)]),
+        (0, 4) => (8, &[], &[(4, 4, 0), (4, 4, 0), (4, 4, 0), (4, 4, 0)]),
+        (1, 0) => (4, &[0], &[]),
+        (1, 1) => (6, &[2], &[(4, 4, 0)]),
+        (1, 2) => (6, &[2], &[(4, 4, 0), (4, 4, 0)]),
+        (1, 3) => (6, &[2], &[(4, 4, 0), (4, 4, 0), (4, 4, 0)]),
+        (1, 4) => (6, &[2], &[(4, 4, 0), (4, 4, 0), (4, 4, 0), (4, 4, 0)]),
+        (2, 0) => (4, &[0, 2], &[]),
+        (2, 1) => (4, &[0, 2], &[(4, 4, 0)]),
+        (2, 2) => (4, &[0, 2], &[(4, 4, 0), (4, 4, 0)]),
+        (2, 3) => (4, &[0, 2], &[(4, 4, 0), (4, 4, 0), (4, 4, 0)]),
+        (3, 0) => (4, &[0, 2, 4], &[]),
+        (3, 1) => (4, &[0, 2, 4], &[(6, 6, 2)]),
+        (3, 2) => (4, &[0, 2, 4], &[(6, 6, 2), (6, 6, 2)]),
+        (4, 0) => (4, &[0, 2, 4, 6], &[]),
+        (4, 1) => (4, &[0, 2, 4, 6], &[(8, 8, 4)]),
+        _ => return None,
+    };
+    Some(assemble_levels(l0, h, t))
+}
+
+/// SMPTE ST 2042-1:2022 Table D.8 — default matrices for
+/// `wavelet_index == 3` (Haar, no shift) and `wavelet_index_ho == 1`
+/// (LeGall). The single cross-filter default the spec defines.
+fn haar0_legall_levels(ho: usize, d: usize) -> Option<Vec<[u32; 4]>> {
+    let (l0, h, t): AnnexDCell = match (ho, d) {
+        (0, 1) => (6, &[], &[(4, 2, 0)]),
+        (0, 2) => (6, &[], &[(4, 2, 0), (5, 3, 1)]),
+        (0, 3) => (6, &[], &[(4, 2, 0), (5, 3, 1), (6, 4, 2)]),
+        (0, 4) => (6, &[], &[(4, 2, 0), (5, 3, 1), (6, 4, 2), (6, 5, 2)]),
+        (1, 0) => (2, &[0], &[]),
+        (1, 1) => (3, &[1], &[(4, 2, 0)]),
+        (1, 2) => (3, &[1], &[(4, 2, 0), (5, 3, 1)]),
+        (1, 3) => (3, &[1], &[(4, 2, 0), (5, 3, 1), (6, 4, 2)]),
+        (1, 4) => (3, &[1], &[(4, 2, 0), (5, 3, 1), (6, 4, 2), (6, 5, 2)]),
+        (2, 0) => (2, &[0, 3], &[]),
+        (2, 1) => (2, &[0, 3], &[(6, 4, 2)]),
+        (2, 2) => (2, &[0, 3], &[(6, 4, 2), (6, 5, 2)]),
+        (2, 3) => (2, &[0, 3], &[(6, 4, 2), (6, 5, 2), (7, 5, 3)]),
+        (3, 0) => (2, &[0, 3, 6], &[]),
+        (3, 1) => (2, &[0, 3, 6], &[(8, 7, 4)]),
+        (3, 2) => (2, &[0, 3, 6], &[(8, 7, 4), (9, 7, 5)]),
+        (4, 0) => (2, &[0, 3, 6, 8], &[]),
+        (4, 1) => (2, &[0, 3, 6, 8], &[(11, 9, 7)]),
+        _ => return None,
+    };
+    Some(assemble_levels(l0, h, t))
 }
 
 /// `slice_quantizers` (§13.5.5): subtract each subband's quantisation
@@ -467,6 +726,142 @@ mod tests {
     #[test]
     fn dwt_depth_greater_than_four_rejected() {
         assert!(QuantMatrix::default_for(WaveletFilter::LeGall5_3, 5).is_none());
+    }
+
+    // ---- Annex D asymmetric default matrices ---------------------------
+
+    /// With `dwt_depth_ho == 0` and `wavelet_index_ho == wavelet_index`
+    /// the Annex D lookup must agree with the legacy symmetric
+    /// `default_for` across every filter and every depth 1..=4 (the
+    /// §12.4.4 NOTE invariant — v3 reduces to v2 at the defaults).
+    #[test]
+    fn default_for_asymmetric_symmetric_case_matches_default_for() {
+        let filters = [
+            WaveletFilter::DeslauriersDubuc9_7,
+            WaveletFilter::LeGall5_3,
+            WaveletFilter::DeslauriersDubuc13_7,
+            WaveletFilter::Haar0,
+            WaveletFilter::Haar1,
+            WaveletFilter::Fidelity,
+            WaveletFilter::Daubechies9_7,
+        ];
+        for f in filters {
+            for depth in 1..=4 {
+                let sym = QuantMatrix::default_for(f, depth).unwrap();
+                let asym = QuantMatrix::default_for_asymmetric(f, f, depth, 0).unwrap();
+                assert_eq!(
+                    sym.levels, asym.levels,
+                    "filter {f:?} depth {depth}: symmetric vs Annex D ho=0 mismatch"
+                );
+                assert_eq!(asym.dwt_depth_ho, 0);
+            }
+        }
+    }
+
+    /// Table D.2 (LeGall) `dwt_depth_ho = 2`, `dwt_depth = 1`: L=2,
+    /// H bands 0 and 3, then the level-3 triplet `6, 6, 4`.
+    #[test]
+    fn default_for_asymmetric_legall_d2_ho2_depth1() {
+        let qm = QuantMatrix::default_for_asymmetric(
+            WaveletFilter::LeGall5_3,
+            WaveletFilter::LeGall5_3,
+            1,
+            2,
+        )
+        .unwrap();
+        assert_eq!(qm.dwt_depth, 1);
+        assert_eq!(qm.dwt_depth_ho, 2);
+        assert_eq!(qm.levels.len(), 4);
+        assert_eq!(qm.levels[0], [2, 0, 0, 0]); // L
+        assert_eq!(qm.levels[1], [0, 0, 0, 0]); // H = 0
+        assert_eq!(qm.levels[2], [3, 0, 0, 0]); // H = 3
+        assert_eq!(qm.levels[3], [0, 6, 6, 4]); // HL, LH, HH
+    }
+
+    /// Table D.4 (Haar0) `dwt_depth_ho = 2`, `dwt_depth = 3`: the
+    /// depth-dependent L/H band values plus three triplets bottom-up.
+    #[test]
+    fn default_for_asymmetric_haar0_d4_ho2_depth3() {
+        let qm =
+            QuantMatrix::default_for_asymmetric(WaveletFilter::Haar0, WaveletFilter::Haar0, 3, 2)
+                .unwrap();
+        assert_eq!(qm.levels.len(), 6);
+        assert_eq!(qm.levels[0], [20, 0, 0, 0]); // L
+        assert_eq!(qm.levels[1], [16, 0, 0, 0]); // H
+        assert_eq!(qm.levels[2], [14, 0, 0, 0]); // H
+        assert_eq!(qm.levels[3], [0, 12, 12, 8]);
+        assert_eq!(qm.levels[4], [0, 8, 8, 4]);
+        assert_eq!(qm.levels[5], [0, 4, 4, 0]);
+    }
+
+    /// Table D.8 — the cross-filter default: `wavelet_index == 3`
+    /// (Haar0 vertical) and `wavelet_index_ho == 1` (LeGall horizontal),
+    /// `dwt_depth_ho = 1`, `dwt_depth = 2`.
+    #[test]
+    fn default_for_asymmetric_haar0_legall_d8_ho1_depth2() {
+        let qm = QuantMatrix::default_for_asymmetric(
+            WaveletFilter::Haar0,
+            WaveletFilter::LeGall5_3,
+            2,
+            1,
+        )
+        .unwrap();
+        assert_eq!(qm.levels.len(), 4);
+        assert_eq!(qm.levels[0], [3, 0, 0, 0]); // L
+        assert_eq!(qm.levels[1], [1, 0, 0, 0]); // H
+        assert_eq!(qm.levels[2], [0, 4, 2, 0]); // HL, LH, HH
+        assert_eq!(qm.levels[3], [0, 5, 3, 1]);
+    }
+
+    /// Table D.7 (Daubechies (9,7)) `dwt_depth_ho = 4`, `dwt_depth = 1`
+    /// — the deepest horizontal-only column the table defines.
+    #[test]
+    fn default_for_asymmetric_daubechies_d7_ho4_depth1() {
+        let qm = QuantMatrix::default_for_asymmetric(
+            WaveletFilter::Daubechies9_7,
+            WaveletFilter::Daubechies9_7,
+            1,
+            4,
+        )
+        .unwrap();
+        assert_eq!(qm.levels.len(), 6);
+        assert_eq!(qm.levels[0], [1, 0, 0, 0]); // L
+        assert_eq!(qm.levels[1], [0, 0, 0, 0]); // H
+        assert_eq!(qm.levels[2], [3, 0, 0, 0]); // H
+        assert_eq!(qm.levels[3], [6, 0, 0, 0]); // H
+        assert_eq!(qm.levels[4], [10, 0, 0, 0]); // H
+        assert_eq!(qm.levels[5], [0, 13, 13, 12]);
+    }
+
+    /// Annex D depth bounds: `dwt_depth + dwt_depth_ho > 5`, or either
+    /// axis > 4, or a non-defined filter pair, returns `None` (the spec
+    /// then requires a custom matrix).
+    #[test]
+    fn default_for_asymmetric_off_table_is_none() {
+        // sum > 5.
+        assert!(QuantMatrix::default_for_asymmetric(
+            WaveletFilter::LeGall5_3,
+            WaveletFilter::LeGall5_3,
+            3,
+            3
+        )
+        .is_none());
+        // dwt_depth_ho > 4.
+        assert!(QuantMatrix::default_for_asymmetric(
+            WaveletFilter::LeGall5_3,
+            WaveletFilter::LeGall5_3,
+            0,
+            5
+        )
+        .is_none());
+        // Undefined cross-filter pair (LeGall vertical + DD9,7 ho).
+        assert!(QuantMatrix::default_for_asymmetric(
+            WaveletFilter::LeGall5_3,
+            WaveletFilter::DeslauriersDubuc9_7,
+            1,
+            1
+        )
+        .is_none());
     }
 
     // ---- §13.2.1 intra vs inter quant_offset ---------------------------

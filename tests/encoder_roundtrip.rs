@@ -335,12 +335,13 @@ fn encode_then_decode_ld_v3_symmetric_default_qindex0_psnr_over_35() {
 // the §13.5 asymmetric slice unpack, the §13.5.5 asymmetric slice
 // quantisers and the §15.4.1 / §15.4.2 horizontal-only synthesis
 // levels; with `dwt_depth_ho == 0` the override is inert (the §12.4.4
-// NOTE shortcut). The only remaining rejection is an asymmetric stream
-// that relies on the untranscribed Annex D *default* quantisation
-// matrices (`custom_quant_matrix = False`).
+// NOTE shortcut). Asymmetric streams using the Annex D *default*
+// quantisation matrices (`custom_quant_matrix = False`, Tables D.1–D.8)
+// now decode too; only a `(filter, ho-filter, depth, ho)` combination
+// with no Annex D default and no custom matrix still rejects.
 // ---------------------------------------------------------------------
 
-const ASYM_ERR_SUBSTR: &str = "v3 asymmetric transform unsupported";
+const ASYM_ERR_SUBSTR: &str = "no Annex D default quant matrix";
 
 /// Decode `stream` through the registry decoder and return the frame.
 fn decode_video_frame(stream: Vec<u8>) -> oxideav_core::VideoFrame {
@@ -433,22 +434,61 @@ fn encode_hq_v3_asym_dwt_depth_ho_lossless_roundtrip() {
 }
 
 /// HQ v3 asymmetric stream relying on the Annex D *default*
-/// quantisation matrices (`custom_quant_matrix = False`) is still
-/// rejected — those tables are not transcribed yet. Pins the one
-/// remaining `AsymmetricTransformUnsupported` arm.
+/// quantisation matrices (`custom_quant_matrix = False`, Table D.2)
+/// now decodes end-to-end. The encoder emits `custom_quant_matrix =
+/// False`; the decoder looks the matrix up from Annex D rather than
+/// reading it in-band. At qindex 0 every band's effective quantiser is
+/// 0 regardless of the matrix values (§13.5.5 clamps `qindex - entry`
+/// to 0), so the reconstruction is bit-exact. Covers ho ∈ {1, 2}
+/// (sum ≤ 5) and a differing horizontal-only filter (Table D.8's
+/// Haar0/LeGall cross-default).
 #[test]
-fn encode_hq_v3_asym_default_matrix_rejected_by_decoder() {
+fn encode_hq_v3_asym_default_matrix_decodes() {
+    let (y, u, v) = synthetic_testsrc_64_yuv420();
+    for (wavelet, dwt_depth, wavelet_ho, ho) in [
+        (
+            WaveletFilter::LeGall5_3,
+            3u32,
+            WaveletFilter::LeGall5_3,
+            1u32,
+        ), // Table D.2
+        (WaveletFilter::LeGall5_3, 2, WaveletFilter::LeGall5_3, 2), // Table D.2
+        (WaveletFilter::Haar0, 2, WaveletFilter::LeGall5_3, 1),     // Table D.8 cross-default
+    ] {
+        let mut seq_v3 = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+        seq_v3.parse_parameters.version_major = 3;
+        // Fully-wired asymmetric setup (shape-consistent quantiser
+        // bookkeeping), then flip `custom_quant_matrix` to False so the
+        // wire carries the `custom_quant_matrix = False` flag — the
+        // Annex D default-matrix asymmetric stream.
+        let mut params =
+            EncoderParams::default_hq(wavelet, dwt_depth).with_asymmetric_transform(wavelet_ho, ho);
+        params.custom_quant_matrix = false;
+
+        let stream = encode_single_hq_intra_stream(&seq_v3, &params, 0, &y, &u, &v);
+        let frame = decode_video_frame(stream);
+        assert_eq!(
+            frame.planes[0].data,
+            y.to_vec(),
+            "Y plane mismatch (wavelet={wavelet:?}, depth={dwt_depth}, wavelet_ho={wavelet_ho:?}, ho={ho})"
+        );
+        assert_eq!(frame.planes[1].data, u.to_vec(), "U plane mismatch");
+        assert_eq!(frame.planes[2].data, v.to_vec(), "V plane mismatch");
+    }
+}
+
+/// An asymmetric stream whose `(filter, ho-filter, depth, ho)`
+/// combination has no Annex D default (here `dwt_depth + dwt_depth_ho
+/// > 5`) and supplies no custom matrix is still rejected: the spec
+/// requires a custom matrix there (§12.4.5.3). Pins the remaining
+/// `AsymmetricTransformUnsupported` arm.
+#[test]
+fn encode_hq_v3_asym_off_table_default_matrix_rejected_by_decoder() {
     let mut seq_v3 = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
     seq_v3.parse_parameters.version_major = 3;
-    // Start from the fully-wired asymmetric setup (so the encoder's
-    // own quantiser/band bookkeeping is shape-consistent), then flip
-    // `custom_quant_matrix` back to False: the wire carries the
-    // `custom_quant_matrix = False` flag, producing exactly the
-    // default-matrix asymmetric stream the decoder rejects. The slice
-    // payload after the transform-parameters block is irrelevant —
-    // decode fails at the header.
+    // dwt_depth = 3 + dwt_depth_ho = 3 → sum 6 > 5: no Annex D default.
     let mut params = EncoderParams::default_hq(WaveletFilter::LeGall5_3, 3)
-        .with_asymmetric_transform(WaveletFilter::LeGall5_3, 1);
+        .with_asymmetric_transform(WaveletFilter::LeGall5_3, 3);
     params.custom_quant_matrix = false;
 
     let (y, u, v) = synthetic_testsrc_64_yuv420();
@@ -462,7 +502,7 @@ fn encode_hq_v3_asym_default_matrix_rejected_by_decoder() {
         .expect("send asym stream");
     let err = dec
         .receive_frame()
-        .expect_err("default-matrix asymmetric v3 stream must be rejected");
+        .expect_err("off-table default-matrix asymmetric v3 stream must be rejected");
     let msg = format!("{err}");
     assert!(
         msg.contains(ASYM_ERR_SUBSTR),

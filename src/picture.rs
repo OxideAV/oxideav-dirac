@@ -114,15 +114,16 @@ pub enum PictureError {
     ZeroSliceBytes,
     /// Stream declares `major_version >= 3`, the
     /// `extended_transform_parameters()` block (§12.4.4) selects an
-    /// asymmetric transform (`dwt_depth_ho > 0`), **and** the
-    /// §12.4.5.3 `custom_quant_matrix` flag is `False` — the stream
-    /// relies on the Annex D *asymmetric* default quantisation
-    /// matrices, which this decoder has not transcribed yet.
-    /// Custom-matrix asymmetric streams decode end-to-end through
-    /// [`crate::wavelet::idwt_with_ho`]; only the default-matrix
-    /// combination still rejects. `wavelet_index_ho` is the
-    /// horizontal-only filter index and `dwt_depth_ho` the extra
-    /// horizontal-only depth.
+    /// asymmetric transform (`dwt_depth_ho > 0`), the §12.4.5.3
+    /// `custom_quant_matrix` flag is `False`, **and** the
+    /// `(wavelet_index, wavelet_index_ho, dwt_depth, dwt_depth_ho)`
+    /// combination is not one of the Annex D default tables (Tables
+    /// D.1–D.8) — the spec then requires a custom matrix (§12.4.5.3).
+    /// All Annex D asymmetric defaults — the seven `wavelet_index_ho ==
+    /// wavelet_index` filters plus the Haar0/LeGall cross-default — now
+    /// decode end-to-end through [`crate::wavelet::idwt_with_ho`].
+    /// `wavelet_index_ho` is the horizontal-only filter index and
+    /// `dwt_depth_ho` the extra horizontal-only depth.
     AsymmetricTransformUnsupported {
         wavelet_index_ho: u32,
         dwt_depth_ho: u32,
@@ -152,7 +153,7 @@ impl core::fmt::Display for PictureError {
                 dwt_depth_ho,
             } => write!(
                 f,
-                "v3 asymmetric transform unsupported with the Annex D default quant matrix (wavelet_index_ho={wavelet_index_ho}, dwt_depth_ho={dwt_depth_ho}); custom-matrix asymmetric streams decode"
+                "v3 asymmetric transform: no Annex D default quant matrix for this combination (wavelet_index_ho={wavelet_index_ho}, dwt_depth_ho={dwt_depth_ho}); a custom matrix is required (§12.4.5.3)"
             ),
             Self::SliceOverflow => write!(f, "slice data overflows declared length"),
             Self::MissingReference(n) => {
@@ -897,26 +898,33 @@ pub(crate) fn parse_transform_parameters(
     // `dwt_depth_ho` single H bands, then the `dwt_depth` HL/LH/HH
     // triplets (§13.2.1 ordering). With `dwt_depth_ho == 0` it is the
     // legacy symmetric read. The default (`set_quant_matrix`) branch
-    // only covers the *symmetric* Annex D tables: a genuinely
-    // asymmetric stream (`dwt_depth_ho > 0`) that relies on the
-    // Annex D asymmetric defaults is rejected below until those tables
-    // are transcribed. The parse stays bit-exact through the whole
-    // transform-parameters block either way, so a caller that recovers
-    // from the rejection sees a correctly aligned reader.
+    // looks up the Annex D defaults (Tables D.1–D.8), which cover both
+    // the symmetric (`dwt_depth_ho == 0`) and asymmetric
+    // (`dwt_depth_ho > 0`) layouts. The parse stays bit-exact through
+    // the whole transform-parameters block either way, so a caller that
+    // recovers from a rejection sees a correctly aligned reader.
     //
     // A v3 stream with `wavelet_index_ho != wavelet_index` but
     // `dwt_depth_ho == 0` is decoded with the symmetric default
     // matrix: the §15.4.1 horizontal-only loop runs zero iterations,
     // so the filter override has no effect on the transform and the
     // quant-matrix layout is the symmetric one.
+    //
+    // Combinations outside Annex D (e.g. a `wavelet_index_ho !=
+    // wavelet_index` pair other than the one Haar0/LeGall cross-default
+    // of Table D.8, or `dwt_depth + dwt_depth_ho > 5`) have no default
+    // table and require a custom matrix (§12.4.5.3); a stream that omits
+    // it is rejected with `AsymmetricTransformUnsupported`.
     let custom_flag = r.read_bool();
     let quant_matrix = if custom_flag {
         QuantMatrix::parse_custom(r, dwt_depth, dwt_depth_ho)
     } else if dwt_depth_ho != 0 {
-        return Err(PictureError::AsymmetricTransformUnsupported {
-            wavelet_index_ho,
-            dwt_depth_ho,
-        });
+        QuantMatrix::default_for_asymmetric(wavelet, wavelet_ho, dwt_depth, dwt_depth_ho).ok_or(
+            PictureError::AsymmetricTransformUnsupported {
+                wavelet_index_ho,
+                dwt_depth_ho,
+            },
+        )?
     } else {
         QuantMatrix::default_for(wavelet, dwt_depth)
             .ok_or(PictureError::UnsupportedDwtDepth(dwt_depth))?
@@ -1583,13 +1591,13 @@ mod tests {
         assert_eq!(tp.quant_matrix.levels[3], [0, 5, 6, 8]); // HL/LH/HH
     }
 
-    /// A v3 asymmetric stream that relies on the Annex D *default*
-    /// quantisation matrices (`custom_quant_matrix = False`) is still
-    /// rejected with `AsymmetricTransformUnsupported` — those tables
-    /// are not transcribed yet. Only the default-matrix combination
-    /// rejects; the custom-matrix stream above decodes.
+    /// A v3 asymmetric stream relying on the Annex D *default*
+    /// quantisation matrices (`custom_quant_matrix = False`) now parses
+    /// to a full `TransformParameters` whose matrix matches Table D.2
+    /// (LeGall, `dwt_depth_ho = 2`, `dwt_depth = 1`): L=2, H bands 0 and
+    /// 3, then the level-3 triplet `6, 6, 4`.
     #[test]
-    fn parse_transform_parameters_asymmetric_default_matrix_rejected() {
+    fn parse_transform_parameters_asymmetric_default_matrix_accepted() {
         let mut w = BitWriter::new();
         w.write_uint(1); // wavelet_index = LeGall5_3
         w.write_uint(1); // dwt_depth
@@ -1600,15 +1608,48 @@ mod tests {
         w.write_uint(1); // slices_y
         w.write_uint(0); // slice_prefix_bytes
         w.write_uint(1); // slice_size_scaler
-        w.write_bool(false); // custom_quant_matrix = False → Annex D
+        w.write_bool(false); // custom_quant_matrix = False → Annex D D.2
+        let bytes = w.finish();
+        let mut r = BitReader::new(&bytes);
+        let tp = parse_transform_parameters(&mut r, LowDelayProfile::HQ, 3).unwrap();
+        assert_eq!(tp.dwt_depth, 1);
+        assert_eq!(tp.dwt_depth_ho, 2);
+        assert_eq!(tp.quant_matrix.dwt_depth_ho, 2);
+        // Table D.2, dwt_depth_ho=2 / dwt_depth=1.
+        assert_eq!(tp.quant_matrix.levels[0], [2, 0, 0, 0]); // L
+        assert_eq!(tp.quant_matrix.levels[1], [0, 0, 0, 0]); // H = 0
+        assert_eq!(tp.quant_matrix.levels[2], [3, 0, 0, 0]); // H = 3
+        assert_eq!(tp.quant_matrix.levels[3], [0, 6, 6, 4]); // HL/LH/HH
+    }
+
+    /// A v3 asymmetric stream whose `(filter, ho-filter, depth, ho)`
+    /// combination is *not* in Annex D and that supplies no custom
+    /// matrix is rejected with `AsymmetricTransformUnsupported`: the
+    /// spec requires a custom matrix there (§12.4.5.3). LeGall vertical
+    /// with a DD9,7 horizontal-only filter is not a defined default
+    /// pair (only the Haar0/LeGall cross-default of Table D.8 exists).
+    #[test]
+    fn parse_transform_parameters_asymmetric_off_table_rejected() {
+        let mut w = BitWriter::new();
+        w.write_uint(1); // wavelet_index = LeGall5_3
+        w.write_uint(1); // dwt_depth
+        w.write_bool(true); // asym_transform_index_flag = 1 → explicit ho index
+        w.write_uint(0); // wavelet_index_ho = 0 (DD9,7) — no D.x pair
+        w.write_bool(true); // asym_transform_flag
+        w.write_uint(1); // dwt_depth_ho
+        w.write_uint(1); // slices_x
+        w.write_uint(1); // slices_y
+        w.write_uint(0); // slice_prefix_bytes
+        w.write_uint(1); // slice_size_scaler
+        w.write_bool(false); // custom_quant_matrix = False
         let bytes = w.finish();
         let mut r = BitReader::new(&bytes);
         let err = parse_transform_parameters(&mut r, LowDelayProfile::HQ, 3).unwrap_err();
         assert_eq!(
             err,
             PictureError::AsymmetricTransformUnsupported {
-                wavelet_index_ho: 1,
-                dwt_depth_ho: 2,
+                wavelet_index_ho: 0,
+                dwt_depth_ho: 1,
             }
         );
     }

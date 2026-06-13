@@ -124,11 +124,12 @@ pub struct EncoderParams {
     /// `dwt_depth_ho`, then HL/LH/HH triplets), and the §12.4.5.3
     /// quant matrix is written in the asymmetric shape. The caller
     /// must then set [`Self::custom_quant_matrix`] and supply a
-    /// [`QuantMatrix`] whose `dwt_depth_ho` matches (the Annex D
-    /// asymmetric default tables are not transcribed, so the decode
-    /// side rejects a default-matrix asymmetric stream) — the
-    /// [`Self::with_asymmetric_transform`] helper sets all of this
-    /// up in one call.
+    /// [`QuantMatrix`] whose `dwt_depth_ho` matches, or leave
+    /// `custom_quant_matrix = false` for an Annex D default-matrix
+    /// stream (Tables D.1–D.8; the decoder looks the matrix up by
+    /// `(filter, ho-filter, depth, ho)`) — the
+    /// [`Self::with_asymmetric_transform`] helper installs an explicit
+    /// custom matrix in one call.
     pub extended_transform_override: Option<ExtendedTransformOverride>,
 }
 
@@ -208,12 +209,13 @@ impl EncoderParams {
     /// `extended_transform_parameters()` override for `(wavelet_ho,
     /// dwt_depth_ho)`, and replaces the quantisation matrix with an
     /// all-zero **custom** matrix in the §12.4.5.3 asymmetric shape
-    /// (`1 + dwt_depth_ho + 3 * dwt_depth` entries) — required because
-    /// the Annex D asymmetric default tables are not transcribed. An
-    /// all-zero matrix leaves every subband at the slice qindex
-    /// (§13.5.5 subtracts matrix entries from `qindex`), so qindex 0
-    /// stays lossless. The caller must still set the sequence header's
-    /// `parse_parameters.version_major` to `3`.
+    /// (`1 + dwt_depth_ho + 3 * dwt_depth` entries). An all-zero matrix
+    /// leaves every subband at the slice qindex (§13.5.5 subtracts
+    /// matrix entries from `qindex`), so qindex 0 stays lossless. A
+    /// caller that prefers the Annex D default-matrix stream can set
+    /// `custom_quant_matrix = false` afterwards — at qindex 0 the
+    /// decode is bit-identical either way. The caller must still set the
+    /// sequence header's `parse_parameters.version_major` to `3`.
     pub fn with_asymmetric_transform(
         mut self,
         wavelet_ho: WaveletFilter,

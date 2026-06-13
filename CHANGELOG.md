@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Annex D asymmetric default quantisation matrices** (round-290) —
+  `QuantMatrix::default_for_asymmetric(wavelet, wavelet_ho, dwt_depth,
+  dwt_depth_ho)` transcribes SMPTE ST 2042-1:2022 Tables D.1–D.8: the
+  seven `wavelet_index_ho == wavelet_index` filter defaults plus the
+  Table D.8 Haar0 (vertical) / LeGall (horizontal-only) cross-default,
+  for `dwt_depth ≤ 4`, `dwt_depth_ho ≤ 4`, `dwt_depth + dwt_depth_ho ≤
+  5`. The §12.4.5.3 `set_quant_matrix()` default branch now looks the
+  matrix up rather than rejecting: a v3 asymmetric stream with
+  `custom_quant_matrix = False` decodes end-to-end (bit-exact at
+  qindex 0). `PictureError::AsymmetricTransformUnsupported` now fires
+  only when the `(filter, ho-filter, depth, ho)` combination has no
+  Annex D default and no custom matrix is supplied — the spec then
+  mandates a custom matrix. +8 tests (6 `quant` unit cells +
+  cross-checks, 2 picture/encoder-roundtrip end-to-end); crate-wide
+  438 → 446.
 - **§12.4.4 asymmetric (horizontal-only) transform — end-to-end decode
   + encode** (round-282) — streams with `dwt_depth_ho > 0` now decode
   through the full chain: `TransformParameters` carries the typed
