@@ -426,6 +426,71 @@ impl QuantMatrix {
         })
     }
 
+    /// Build the SMPTE ST 2042-1:2022 **Table D.9** "suggested custom
+    /// quantisation matrix" for the Fidelity wavelet (`wavelet_index ==
+    /// 5` and `wavelet_index_ho == 5`).
+    ///
+    /// Table D.6 (the *default* Fidelity matrix this returns the
+    /// corrected counterpart of) carries a documented NOTE: its values
+    /// "do not correctly compensate for differential power gain in
+    /// filter subbands as intended", but were frozen for backward
+    /// compatibility. Table D.9 provides the corrected values; an
+    /// encoder MAY emit them as a custom matrix (`custom_quant_matrix ==
+    /// True`, §12.4.5.3) instead of relying on the D.6 default, and a
+    /// decoder reads them straight back through [`Self::parse_custom`].
+    ///
+    /// The table is *informative* (the spec marks it "(Informative)")
+    /// and applies only to the Fidelity filter, so this is a separate
+    /// constructor rather than a branch of [`Self::default_for_asymmetric`]
+    /// (which transcribes the normative defaults D.1–D.8). The depth
+    /// bounds are the same as Annex D's default-matrix cases:
+    /// `dwt_depth <= 4`, `dwt_depth_ho <= 4`, and
+    /// `dwt_depth + dwt_depth_ho <= 5`; any other combination returns
+    /// `None`.
+    ///
+    /// The returned matrix follows the [`Self::parse_custom`] storage
+    /// convention: level 0 holds the L (or LL) value in slot 0, levels
+    /// `1..=dwt_depth_ho` hold the single H band in slot 0, and the
+    /// remaining `dwt_depth` levels hold the HL/LH/HH triplet in slots
+    /// 1..=3. With `dwt_depth_ho == 0` this is the symmetric Fidelity
+    /// Table D.9 column.
+    pub fn suggested_custom_fidelity(dwt_depth: u32, dwt_depth_ho: u32) -> Option<Self> {
+        if dwt_depth > 4 || dwt_depth_ho > 4 || dwt_depth + dwt_depth_ho > 5 {
+            return None;
+        }
+        let d = dwt_depth as usize;
+        let ho = dwt_depth_ho as usize;
+
+        // Table D.9 is depth-INVARIANT across the `dwt_depth` columns
+        // for a fixed `dwt_depth_ho` (the L/H bands and the bottom-up
+        // HL/LH/HH triplet list are constant; only the first `dwt_depth`
+        // triplets are emitted), exactly like the Table D.6 default it
+        // corrects. Each `ho` block names the level-0 L/LL value, the
+        // per-level H values (levels 1..=ho), and the full triplet list.
+        let (l0, h_bands, triplets): AnnexDCell = match ho {
+            0 => (0, &[], &[(3, 3, 7), (7, 7, 10), (10, 10, 13), (13, 13, 16)]),
+            1 => (
+                0,
+                &[3],
+                &[(5, 5, 8), (8, 8, 12), (11, 11, 15), (15, 15, 18)],
+            ),
+            2 => (0, &[3, 5], &[(7, 7, 10), (10, 10, 13), (13, 13, 16)]),
+            3 => (0, &[3, 5, 7], &[(8, 8, 12), (11, 11, 15)]),
+            _ => (0, &[3, 5, 7, 8], &[(10, 10, 13)]),
+        };
+
+        // `triplets[..d]` selects the first `dwt_depth` bottom-up
+        // levels the column emits; `assemble_levels` then builds the
+        // 1 (L/LL) + ho (H bands) + d (triplets) level list.
+        let levels = assemble_levels(l0, h_bands, &triplets[..d]);
+        debug_assert_eq!(levels.len(), 1 + ho + d);
+        Some(Self {
+            dwt_depth,
+            dwt_depth_ho,
+            levels,
+        })
+    }
+
     /// Parse a custom quantisation matrix (SMPTE ST 2042-1:2022
     /// §12.4.5.3, the `custom_quant_matrix == True` branch), supporting
     /// both the symmetric (`dwt_depth_ho == 0`) and asymmetric
@@ -862,6 +927,84 @@ mod tests {
             1
         )
         .is_none());
+    }
+
+    // ---- Annex D Table D.9 corrected Fidelity matrices -----------------
+
+    /// Table D.9 symmetric column (`dwt_depth_ho = 0`, `dwt_depth = 4`):
+    /// LL=0 then the four corrected HL/LH/HH triplets.
+    #[test]
+    fn suggested_custom_fidelity_symmetric_depth4() {
+        let qm = QuantMatrix::suggested_custom_fidelity(4, 0).unwrap();
+        assert_eq!(qm.levels.len(), 5);
+        assert_eq!(qm.levels[0], [0, 0, 0, 0]); // LL
+        assert_eq!(qm.levels[1], [0, 3, 3, 7]);
+        assert_eq!(qm.levels[2], [0, 7, 7, 10]);
+        assert_eq!(qm.levels[3], [0, 10, 10, 13]);
+        assert_eq!(qm.levels[4], [0, 13, 13, 16]);
+    }
+
+    /// Table D.9 asymmetric column (`dwt_depth_ho = 2`, `dwt_depth = 3`):
+    /// L=0, two H bands (3, 5), then three corrected triplets.
+    #[test]
+    fn suggested_custom_fidelity_ho2_depth3() {
+        let qm = QuantMatrix::suggested_custom_fidelity(3, 2).unwrap();
+        assert_eq!(qm.levels.len(), 6);
+        assert_eq!(qm.levels[0], [0, 0, 0, 0]); // L
+        assert_eq!(qm.levels[1], [3, 0, 0, 0]); // H
+        assert_eq!(qm.levels[2], [5, 0, 0, 0]); // H
+        assert_eq!(qm.levels[3], [0, 7, 7, 10]);
+        assert_eq!(qm.levels[4], [0, 10, 10, 13]);
+        assert_eq!(qm.levels[5], [0, 13, 13, 16]);
+    }
+
+    /// Table D.9's deepest horizontal-only column (`dwt_depth_ho = 4`,
+    /// `dwt_depth = 1`): L=0, four H bands (3, 5, 7, 8), one triplet.
+    #[test]
+    fn suggested_custom_fidelity_ho4_depth1() {
+        let qm = QuantMatrix::suggested_custom_fidelity(1, 4).unwrap();
+        assert_eq!(qm.levels.len(), 6);
+        assert_eq!(qm.levels[0], [0, 0, 0, 0]);
+        assert_eq!(qm.levels[1], [3, 0, 0, 0]);
+        assert_eq!(qm.levels[2], [5, 0, 0, 0]);
+        assert_eq!(qm.levels[3], [7, 0, 0, 0]);
+        assert_eq!(qm.levels[4], [8, 0, 0, 0]);
+        assert_eq!(qm.levels[5], [0, 10, 10, 13]);
+    }
+
+    /// The corrected Table D.9 values differ from the frozen Table D.6
+    /// defaults (the whole reason D.9 exists — D.6 under-weights the
+    /// Fidelity subbands per its NOTE).
+    #[test]
+    fn suggested_custom_fidelity_differs_from_default_d6() {
+        for (depth, ho) in [(4u32, 0u32), (3, 1), (2, 2), (1, 3), (1, 4)] {
+            let corrected = QuantMatrix::suggested_custom_fidelity(depth, ho).unwrap();
+            let default = QuantMatrix::default_for_asymmetric(
+                WaveletFilter::Fidelity,
+                WaveletFilter::Fidelity,
+                depth,
+                ho,
+            )
+            .unwrap();
+            assert_eq!(
+                corrected.levels.len(),
+                default.levels.len(),
+                "depth {depth} ho {ho}: level count must match"
+            );
+            assert_ne!(
+                corrected.levels, default.levels,
+                "depth {depth} ho {ho}: D.9 corrected values must differ from D.6 default"
+            );
+        }
+    }
+
+    /// Annex D depth bounds apply to Table D.9 as well: out-of-bounds
+    /// `(dwt_depth, dwt_depth_ho)` returns `None`.
+    #[test]
+    fn suggested_custom_fidelity_off_table_is_none() {
+        assert!(QuantMatrix::suggested_custom_fidelity(3, 3).is_none()); // sum > 5
+        assert!(QuantMatrix::suggested_custom_fidelity(5, 0).is_none()); // depth > 4
+        assert!(QuantMatrix::suggested_custom_fidelity(0, 5).is_none()); // ho > 4
     }
 
     // ---- §13.2.1 intra vs inter quant_offset ---------------------------

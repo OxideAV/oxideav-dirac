@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Annex D Table D.9 corrected Fidelity quantisation matrices**
+  (round-293) — `QuantMatrix::suggested_custom_fidelity(dwt_depth,
+  dwt_depth_ho)` transcribes SMPTE ST 2042-1:2022 Table D.9, the
+  *corrected* quantisation matrix for the Fidelity wavelet
+  (`wavelet_index == 5`). Table D.6 (the frozen default) carries a NOTE
+  that its values "do not correctly compensate for differential power
+  gain"; D.9 supplies the corrected values that an encoder MAY emit as
+  a custom matrix (`custom_quant_matrix = True`, §12.4.5.3) and the
+  decoder reads straight back through `QuantMatrix::parse_custom`. Same
+  Annex D depth bounds as the defaults (`dwt_depth ≤ 4`, `dwt_depth_ho
+  ≤ 4`, `dwt_depth + dwt_depth_ho ≤ 5`); the table is depth-invariant
+  across the `dwt_depth` columns for each `dwt_depth_ho` block. Wired
+  end-to-end through the existing `EncoderParams::with_custom_quant_matrix`
+  emission path. +6 tests (5 `quant` unit cells incl. a differs-from-D.6
+  cross-check + a Fidelity HQ encode→decode that pins the in-band
+  emission is byte-distinct from the D.6 default and parses without
+  slice desync).
+
 - **Annex D asymmetric default quantisation matrices** (round-290) —
   `QuantMatrix::default_for_asymmetric(wavelet, wavelet_ho, dwt_depth,
   dwt_depth_ho)` transcribes SMPTE ST 2042-1:2022 Tables D.1–D.8: the

@@ -477,6 +477,72 @@ fn encode_hq_v3_asym_default_matrix_decodes() {
     }
 }
 
+/// A Fidelity HQ stream that emits the Annex D **Table D.9** corrected
+/// quantisation matrix as a custom matrix (`custom_quant_matrix =
+/// True`, §12.4.5.3): the encoder writes the D.9 values in-band and the
+/// decoder reads them back through `QuantMatrix::parse_custom`.
+///
+/// Two things are checked end-to-end. First, the D.9 stream is
+/// byte-distinct from the `custom_quant_matrix = False` (Table D.6
+/// default) form — proof the corrected values genuinely travel on the
+/// wire rather than being dropped or coinciding with the default.
+/// Second, the decoder consumes the in-band matrix without desync and
+/// emits a full-size frame: a mis-counted custom-matrix read would
+/// misalign the byte-aligned slice data that follows and surface as a
+/// decode error or a wrong-dimensioned frame. (Bit-exactness is not
+/// asserted: the Fidelity lifting taps are not perfectly reversible in
+/// fixed point — see
+/// `encoder_matrix::hq_q0_fidelity_works_on_low_variance_input` — and
+/// the heavier D.9 entries drive the HQ rate-control qindex up, so the
+/// reconstruction is lossy. The matrix *parsing* is what this test
+/// pins; the table values themselves are checked in the `quant` unit
+/// tests.)
+#[test]
+fn encode_hq_fidelity_d9_custom_matrix_roundtrip() {
+    use oxideav_dirac::quant::QuantMatrix;
+    let (y, u, v) = synthetic_testsrc_64_yuv420();
+
+    for dwt_depth in [1u32, 2, 3, 4] {
+        let mut seq_v3 = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+        seq_v3.parse_parameters.version_major = 3;
+
+        let d9 = QuantMatrix::suggested_custom_fidelity(dwt_depth, 0)
+            .expect("D.9 Fidelity matrix within Annex D depth bounds");
+        let params = EncoderParams::default_hq(WaveletFilter::Fidelity, dwt_depth)
+            .with_custom_quant_matrix(d9);
+        let custom_stream = encode_single_hq_intra_stream(&seq_v3, &params, 0, &y, &u, &v);
+
+        // The same configuration with the frozen Table D.6 default
+        // (custom_quant_matrix = False) must produce a different stream:
+        // the corrected D.9 values are genuinely emitted in-band.
+        let mut default_params = EncoderParams::default_hq(WaveletFilter::Fidelity, dwt_depth);
+        default_params.custom_quant_matrix = false;
+        let default_stream = encode_single_hq_intra_stream(&seq_v3, &default_params, 0, &y, &u, &v);
+        assert_ne!(
+            custom_stream, default_stream,
+            "depth {dwt_depth}: D.9 custom matrix must change the bitstream vs the D.6 default"
+        );
+
+        // The D.9 stream must decode without desync into a full frame.
+        let frame = decode_video_frame(custom_stream);
+        assert_eq!(
+            frame.planes[0].data.len(),
+            64 * 64,
+            "Y plane size (depth={dwt_depth})"
+        );
+        assert_eq!(
+            frame.planes[1].data.len(),
+            32 * 32,
+            "U plane size (depth={dwt_depth})"
+        );
+        assert_eq!(
+            frame.planes[2].data.len(),
+            32 * 32,
+            "V plane size (depth={dwt_depth})"
+        );
+    }
+}
+
 /// An asymmetric stream whose `(filter, ho-filter, depth, ho)`
 /// combination has no Annex D default (here `dwt_depth + dwt_depth_ho
 /// > 5`) and supplies no custom matrix is still rejected: the spec
