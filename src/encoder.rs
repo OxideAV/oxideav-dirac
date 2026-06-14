@@ -251,6 +251,20 @@ impl EncoderParams {
         self
     }
 
+    /// Set the §12.4.5.2 `slice_prefix_bytes` count emitted ahead of
+    /// every HQ slice's qindex byte. Each slice begins with this many
+    /// application-specific bytes (§13.5.4 `read_uint_lit(state,
+    /// slice_prefix_bytes)`); the value travels in the slice-parameters
+    /// header so the decoder knows how many bytes to skip. This encoder
+    /// emits the prefix as zero bytes — the standard leaves the content
+    /// application-defined and a conforming decoder "may skip over the
+    /// contents" (§13.5.4 NOTE). `0` (default) emits no prefix. Only the
+    /// HQ profile carries this field; the LD path ignores it.
+    pub fn with_slice_prefix_bytes(mut self, prefix_bytes: u32) -> Self {
+        self.slice_prefix_bytes = prefix_bytes;
+        self
+    }
+
     /// Effective §12.4.4.3 `dwt_depth_ho`: the override value when the
     /// v3 syntax is selected, otherwise 0 (pre-v3 streams have no
     /// `extended_transform_parameters()` block).

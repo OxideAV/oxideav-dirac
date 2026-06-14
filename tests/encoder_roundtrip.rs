@@ -660,3 +660,74 @@ fn encode_ld_v3_asym_dwt_depth_ho_roundtrip_psnr_over_35() {
     assert!(psnr_u >= 35.0, "LD asym U PSNR {psnr_u:.2} dB below 35 dB");
     assert!(psnr_v >= 35.0, "LD asym V PSNR {psnr_v:.2} dB below 35 dB");
 }
+
+// ---------------------------------------------------------------------
+// §12.4.5.2 / §13.5.4 HQ `slice_prefix_bytes`.
+//
+// The slice-parameters header carries `slice_prefix_bytes`; each HQ
+// slice then begins with that many application-specific bytes ahead of
+// its qindex byte (§13.5.4 `read_uint_lit(state, slice_prefix_bytes)`).
+// The standard leaves the prefix content application-defined and lets a
+// conforming decoder skip over it (§13.5.4 NOTE). This encoder emits the
+// prefix as zero bytes, so an encode→decode round-trip at qindex 0 stays
+// bit-exact regardless of the prefix count, and the emitted stream grows
+// by exactly `slice_prefix_bytes` per slice relative to the no-prefix
+// form. The decoder already skips the prefix; before
+// `EncoderParams::with_slice_prefix_bytes` there was no public way to
+// drive the field, so the round-trip went untested.
+// ---------------------------------------------------------------------
+
+/// Non-zero `slice_prefix_bytes` must still decode bit-exact at q=0, and
+/// the stream must grow by exactly `prefix_bytes * slices_x * slices_y`
+/// over the no-prefix baseline (the only layout change is the per-slice
+/// prefix run; the byte-aligned coefficient blocks are otherwise
+/// identical at the same qindex).
+#[test]
+fn encode_then_decode_hq_slice_prefix_bytes_bit_exact_q0() {
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let (y, u, v) = synthetic_testsrc_64_yuv420();
+
+    let base = EncoderParams::default_hq(WaveletFilter::LeGall5_3, 3);
+    let slices = (base.slices_x * base.slices_y) as usize;
+    let baseline = encode_single_hq_intra_stream(&seq, &base, 0, &y, &u, &v);
+
+    for prefix in [1u32, 3, 7] {
+        let params =
+            EncoderParams::default_hq(WaveletFilter::LeGall5_3, 3).with_slice_prefix_bytes(prefix);
+        assert_eq!(params.slice_prefix_bytes, prefix);
+
+        let stream = encode_single_hq_intra_stream(&seq, &params, 0, &y, &u, &v);
+
+        // The per-slice payload contribution is exactly `prefix` bytes
+        // per slice. The single `slice_prefix_bytes` exp-Golomb code in
+        // the byte-aligned transform-parameters header can additionally
+        // cross one byte boundary as the count grows (0→1 bit, 1→3 bits,
+        // 3→5 bits, 7→7 bits), so the header may add at most one byte on
+        // top of the per-slice contribution.
+        let per_slice = (prefix as usize * slices) as i64;
+        let total_delta = stream.len() as i64 - baseline.len() as i64;
+        assert!(
+            (per_slice..=per_slice + 1).contains(&total_delta),
+            "prefix={prefix}: stream grew by {total_delta} bytes, expected {per_slice}..={} (per-slice prefix run + at most one header byte)",
+            per_slice + 1,
+        );
+
+        // Bit-exact reconstruction — the decoder skips the prefix run.
+        let frame = decode_video_frame(stream);
+        assert_eq!(
+            frame.planes[0].data,
+            y.to_vec(),
+            "prefix={prefix}: Y plane mismatch"
+        );
+        assert_eq!(
+            frame.planes[1].data,
+            u.to_vec(),
+            "prefix={prefix}: U plane mismatch"
+        );
+        assert_eq!(
+            frame.planes[2].data,
+            v.to_vec(),
+            "prefix={prefix}: V plane mismatch"
+        );
+    }
+}

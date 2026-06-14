@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **HQ §12.4.5.2 `slice_prefix_bytes` encoder support** (round-306) —
+  `EncoderParams::with_slice_prefix_bytes(n)` sets the SMPTE ST
+  2042-1:2022 §12.4.5.2 `slice_prefix_bytes` count, so every HQ slice is
+  emitted with `n` leading application-specific bytes (zero-filled by
+  this encoder) ahead of its qindex byte (§13.5.4 `read_uint_lit(state,
+  slice_prefix_bytes)`). The decoder already skipped the prefix run
+  (§13.5.4 NOTE: a conforming decoder may skip the prefix contents); the
+  field was previously unreachable from the public encoder API, so the
+  round-trip went untested. New
+  `encode_then_decode_hq_slice_prefix_bytes_bit_exact_q0` integration
+  test pins bit-exact reconstruction at qindex 0 for `slice_prefix_bytes
+  ∈ {1, 3, 7}` and the per-slice stream-growth invariant (the prefix
+  adds exactly `prefix * slices_x * slices_y` payload bytes; the
+  byte-aligned header's `slice_prefix_bytes` exp-Golomb code may add at
+  most one byte). Crate-wide tests: 453 → 454 (+1).
 - **VC-2 v3 §12.4.4 asymmetric transform through the fragmented path —
   bit-exact verification** (round-299) — round 282 wired the
   asymmetric (horizontal-only) layout into `FragmentedPictureDecoder`
