@@ -32,7 +32,7 @@
 use oxideav_dirac::bits::BitReader;
 use oxideav_dirac::encoder::{
     encode_single_hq_intra_stream, encode_single_ld_intra_stream, make_minimal_sequence,
-    make_minimal_sequence_ld, EncoderParams, LdEncoderParams,
+    make_minimal_sequence_ld, wavelet_index, EncoderParams, LdEncoderParams,
 };
 use oxideav_dirac::fragment::{
     AssemblerError, FragmentAssembler, FragmentEvent, FragmentHeader, FragmentKind,
@@ -133,6 +133,46 @@ struct HqDissectParams {
     slices_y: u32,
     slice_prefix_bytes: u32,
     slice_size_scaler: u32,
+    /// §12 `major_version`. When `>= 3` the `transform_parameters()`
+    /// block carries the §12.4.4 `extended_transform_parameters()`
+    /// flag bits right after `dwt_depth`.
+    major_version: u32,
+    /// §12.4.4 `extended_transform_parameters()` override mirrored from
+    /// the encoder: `(asym_transform_index_flag emitted, wavelet_index_ho,
+    /// dwt_depth_ho)`. `None` means the v3 stream emitted both flags
+    /// `False` (the symmetric-default form). Only consulted when
+    /// `major_version >= 3`.
+    ext: Option<HqExtParams>,
+}
+
+#[derive(Clone, Copy)]
+struct HqExtParams {
+    /// The primary `wavelet_index` — needed to decide whether
+    /// `asym_transform_index_flag` was emitted as `True` (encoder logic:
+    /// `wavelet_index_ho != wavelet_index`).
+    wavelet_index: u32,
+    /// §12.4.4.2 `wavelet_index_ho`.
+    wavelet_index_ho: u32,
+    /// §12.4.4.3 `dwt_depth_ho`.
+    dwt_depth_ho: u32,
+}
+
+impl HqDissectParams {
+    fn symmetric(
+        slices_x: u32,
+        slices_y: u32,
+        slice_prefix_bytes: u32,
+        slice_size_scaler: u32,
+    ) -> Self {
+        Self {
+            slices_x,
+            slices_y,
+            slice_prefix_bytes,
+            slice_size_scaler,
+            major_version: 2,
+            ext: None,
+        }
+    }
 }
 
 /// Run a `BitReader` to the end of the `transform_parameters()` block
@@ -161,13 +201,45 @@ fn locate_hq_tp_end(payload: &[u8], _params: &HqDissectParams) -> usize {
     let mut r = BitReader::new(&payload[4..]);
     let _w = r.read_uint();
     let dwt_depth = r.read_uint();
+    // §12.4.4 `extended_transform_parameters()` — v3 only. Mirror the
+    // encoder's `write_transform_parameters` emission so the byte cursor
+    // lands exactly where the slice data begins.
+    let mut dwt_depth_ho = 0u32;
+    if _params.major_version >= 3 {
+        match _params.ext {
+            None => {
+                let _asym_idx = r.read_bool(); // asym_transform_index_flag
+                let _asym_depth = r.read_bool(); // asym_transform_flag
+            }
+            Some(ext) => {
+                let asym_idx = r.read_bool();
+                if asym_idx {
+                    let _w_ho = r.read_uint(); // wavelet_index_ho
+                }
+                let asym_depth = r.read_bool();
+                if asym_depth {
+                    dwt_depth_ho = r.read_uint();
+                }
+                debug_assert_eq!(asym_idx, ext.wavelet_index_ho != ext.wavelet_index);
+                debug_assert_eq!(asym_depth, ext.dwt_depth_ho != 0);
+                debug_assert_eq!(dwt_depth_ho, if asym_depth { ext.dwt_depth_ho } else { 0 });
+            }
+        }
+    }
     let _sx = r.read_uint();
     let _sy = r.read_uint();
     let _pfx = r.read_uint();
     let _scl = r.read_uint();
     let custom = r.read_bool();
     if custom {
+        // Asymmetric custom matrix (§12.4.5.3): the level-0 L entry, one
+        // H entry per level `1..=dwt_depth_ho`, then HL/LH/HH triplets
+        // for the `dwt_depth` symmetric levels. With `dwt_depth_ho == 0`
+        // this reduces to the symmetric `ll0 + dwt_depth*3` shape.
         let _ll0 = r.read_uint();
+        for _ in 0..dwt_depth_ho {
+            let _h = r.read_uint();
+        }
         for _ in 0..dwt_depth {
             let _hl = r.read_uint();
             let _lh = r.read_uint();
@@ -298,12 +370,12 @@ fn hq_q0_single_data_fragment_bit_exact_vs_non_fragmented() {
     let stream = encode_single_hq_intra_stream(&seq, &params, 7, &y, &u, &v);
     let round = parse_and_decode(&stream);
 
-    let dissect_params = HqDissectParams {
-        slices_x: params.slices_x,
-        slices_y: params.slices_y,
-        slice_prefix_bytes: params.slice_prefix_bytes,
-        slice_size_scaler: params.slice_size_scaler,
-    };
+    let dissect_params = HqDissectParams::symmetric(
+        params.slices_x,
+        params.slices_y,
+        params.slice_prefix_bytes,
+        params.slice_size_scaler,
+    );
     let (picture_number, tp_range, slices) =
         dissect_hq_picture_payload(round.picture_payload, &dissect_params);
     assert_eq!(picture_number, 7);
@@ -374,12 +446,12 @@ fn hq_q0_one_data_fragment_per_slice_bit_exact_vs_non_fragmented() {
     let stream = encode_single_hq_intra_stream(&seq, &params, 42, &y, &u, &v);
     let round = parse_and_decode(&stream);
 
-    let dissect_params = HqDissectParams {
-        slices_x: params.slices_x,
-        slices_y: params.slices_y,
-        slice_prefix_bytes: params.slice_prefix_bytes,
-        slice_size_scaler: params.slice_size_scaler,
-    };
+    let dissect_params = HqDissectParams::symmetric(
+        params.slices_x,
+        params.slices_y,
+        params.slice_prefix_bytes,
+        params.slice_size_scaler,
+    );
     let (picture_number, tp_range, slices) =
         dissect_hq_picture_payload(round.picture_payload, &dissect_params);
     assert_eq!(picture_number, 42);
@@ -552,12 +624,12 @@ fn finish_rejects_incomplete_picture() {
     let params = EncoderParams::default_hq(WaveletFilter::LeGall5_3, 2);
     let stream = encode_single_hq_intra_stream(&seq, &params, 0, &y, &u, &v);
     let round = parse_and_decode(&stream);
-    let dissect_params = HqDissectParams {
-        slices_x: params.slices_x,
-        slices_y: params.slices_y,
-        slice_prefix_bytes: params.slice_prefix_bytes,
-        slice_size_scaler: params.slice_size_scaler,
-    };
+    let dissect_params = HqDissectParams::symmetric(
+        params.slices_x,
+        params.slices_y,
+        params.slice_prefix_bytes,
+        params.slice_size_scaler,
+    );
     let (picture_number, tp_range, slices) =
         dissect_hq_picture_payload(round.picture_payload, &dissect_params);
     let tp_bytes = &round.picture_payload[tp_range.clone()];
@@ -641,12 +713,12 @@ fn two_consecutive_pictures_through_one_decoder() {
     let h: u32 = 16;
     let seq = make_minimal_sequence(w, h, ChromaFormat::Yuv420);
     let params = EncoderParams::default_hq(WaveletFilter::LeGall5_3, 2);
-    let dissect_params = HqDissectParams {
-        slices_x: params.slices_x,
-        slices_y: params.slices_y,
-        slice_prefix_bytes: params.slice_prefix_bytes,
-        slice_size_scaler: params.slice_size_scaler,
-    };
+    let dissect_params = HqDissectParams::symmetric(
+        params.slices_x,
+        params.slices_y,
+        params.slice_prefix_bytes,
+        params.slice_size_scaler,
+    );
 
     let mut dec = FragmentedPictureDecoder::new(&seq);
 
@@ -691,6 +763,154 @@ fn two_consecutive_pictures_through_one_decoder() {
         assert_eq!(frag_pic.y, round.reference.y);
         assert_eq!(frag_pic.u, round.reference.u);
         assert_eq!(frag_pic.v, round.reference.v);
+    }
+}
+
+/// VC-2 v3 §12.4.4 **asymmetric (horizontal-only) transform** through
+/// the fragmented-picture path. The §13.2.2 / §13.2.3 asymmetric
+/// pyramid layout, the §15.4.1 + §15.4.2 `idwt_with_ho`, and the
+/// §13.5.3 / §13.5.4 asymmetric slice unpack were wired into the
+/// non-fragmented decoder in round 282 and into the
+/// `FragmentedPictureDecoder` (`init_pyramid_ho` / `idwt_with_ho`) at
+/// the same time, but no test had yet driven a genuinely asymmetric
+/// (`dwt_depth_ho > 0`) picture through the §14 fragmented path. This
+/// pins that the fragmented driver reproduces the non-fragmented
+/// asymmetric reconstruction bit-exactly at qindex=0, for both the
+/// all-slices-in-one-fragment shape and the one-fragment-per-slice
+/// shape.
+///
+/// The encoder is configured via
+/// [`EncoderParams::with_asymmetric_transform`] (which selects v3,
+/// installs the §12.4.4 override and the §12.4.5.3 all-zero asymmetric
+/// custom quant matrix), exactly as the round-282 non-fragmented
+/// asymmetric round-trip tests in `encoder_roundtrip.rs`. The dissect
+/// helper is told the same `(major_version, dwt_depth, ext)` so it
+/// walks past the `extended_transform_parameters()` flag bits and the
+/// asymmetric-shaped custom matrix to land on slice 0.
+///
+/// Material: `docs/video/vc2/vc2-specification.pdf` §12.4.4
+/// (extended_transform_parameters), §12.4.5.3 (asymmetric quant
+/// matrix), §13.2.2 / §13.2.3 (asymmetric pyramid / subband dims),
+/// §13.5.4 (HQ slice), §14.2 / §14.4 / §14.5 (fragment header / state
+/// machine / trailing kick), §15.4.1 / §15.4.2 (asymmetric IDWT).
+#[test]
+fn hq_q0_asymmetric_transform_bit_exact_vs_non_fragmented() {
+    let w: u32 = 32;
+    let h: u32 = 16;
+    let wavelet = WaveletFilter::LeGall5_3;
+    let wavelet_ho = WaveletFilter::Haar0; // wavelet_index_ho != wavelet_index
+    let dwt_depth: u32 = 2;
+    let dwt_depth_ho: u32 = 1;
+
+    let y = smooth_plane(w as usize, h as usize, 2);
+    let u = smooth_plane((w / 2) as usize, (h / 2) as usize, 7);
+    let v = smooth_plane((w / 2) as usize, (h / 2) as usize, 13);
+
+    let mut seq = make_minimal_sequence(w, h, ChromaFormat::Yuv420);
+    seq.parse_parameters.version_major = 3;
+    let params = EncoderParams::default_hq(wavelet, dwt_depth)
+        .with_asymmetric_transform(wavelet_ho, dwt_depth_ho);
+
+    let stream = encode_single_hq_intra_stream(&seq, &params, 21, &y, &u, &v);
+    let round = parse_and_decode(&stream);
+
+    let dissect_params = HqDissectParams {
+        slices_x: params.slices_x,
+        slices_y: params.slices_y,
+        slice_prefix_bytes: params.slice_prefix_bytes,
+        slice_size_scaler: params.slice_size_scaler,
+        major_version: 3,
+        ext: Some(HqExtParams {
+            wavelet_index: wavelet_index(wavelet),
+            wavelet_index_ho: wavelet_index(wavelet_ho),
+            dwt_depth_ho,
+        }),
+    };
+    let (picture_number, tp_range, slices) =
+        dissect_hq_picture_payload(round.picture_payload, &dissect_params);
+    assert_eq!(picture_number, 21);
+    let total_slices = (params.slices_x * params.slices_y) as usize;
+    assert_eq!(slices.len(), total_slices);
+
+    let tp_bytes = &round.picture_payload[tp_range.clone()];
+
+    // Shape A: all slices in one data fragment.
+    {
+        let setup_payload = setup_fragment_payload(picture_number, tp_bytes);
+        let slice_region_start = slices[0].start;
+        let slice_region_end = slices.last().unwrap().end;
+        let all_slice_bytes = &round.picture_payload[slice_region_start..slice_region_end];
+        let data_payload =
+            data_fragment_payload(picture_number, total_slices as u16, 0, 0, all_slice_bytes);
+
+        let setup_pi = ParseInfo {
+            parse_code: 0xEC,
+            next_parse_offset: (ParseInfo::SIZE + setup_payload.len()) as u32,
+            previous_parse_offset: 0,
+        };
+        let data_pi = ParseInfo {
+            parse_code: 0xEC,
+            next_parse_offset: (ParseInfo::SIZE + data_payload.len()) as u32,
+            previous_parse_offset: 0,
+        };
+
+        let mut dec = FragmentedPictureDecoder::new(&round.sequence);
+        dec.on_setup_fragment(&setup_pi, &setup_payload)
+            .expect("setup");
+        let tp = dec.transform_parameters().expect("tp captured");
+        assert_eq!(
+            tp.dwt_depth_ho, dwt_depth_ho,
+            "asymmetric ho depth captured"
+        );
+        dec.on_data_fragment(&data_pi, &data_payload).expect("data");
+        assert!(dec.assembler().fragmented_picture_done());
+        let frag_pic = dec.finish().expect("finish");
+        assert_eq!(
+            frag_pic.y, round.reference.y,
+            "Y mismatch (single fragment)"
+        );
+        assert_eq!(
+            frag_pic.u, round.reference.u,
+            "U mismatch (single fragment)"
+        );
+        assert_eq!(
+            frag_pic.v, round.reference.v,
+            "V mismatch (single fragment)"
+        );
+    }
+
+    // Shape B: one data fragment per slice.
+    {
+        let setup_payload = setup_fragment_payload(picture_number, tp_bytes);
+        let setup_pi = ParseInfo {
+            parse_code: 0xEC,
+            next_parse_offset: (ParseInfo::SIZE + setup_payload.len()) as u32,
+            previous_parse_offset: 0,
+        };
+        let mut dec = FragmentedPictureDecoder::new(&round.sequence);
+        dec.on_setup_fragment(&setup_pi, &setup_payload)
+            .expect("setup");
+
+        let mut idx = 0;
+        for sy in 0..params.slices_y {
+            for sx in 0..params.slices_x {
+                let slice_bytes = &round.picture_payload[slices[idx].clone()];
+                let payload =
+                    data_fragment_payload(picture_number, 1, sx as u16, sy as u16, slice_bytes);
+                let pi = ParseInfo {
+                    parse_code: 0xEC,
+                    next_parse_offset: (ParseInfo::SIZE + payload.len()) as u32,
+                    previous_parse_offset: 0,
+                };
+                dec.on_data_fragment(&pi, &payload).expect("data");
+                idx += 1;
+            }
+        }
+        assert!(dec.assembler().fragmented_picture_done());
+        let frag_pic = dec.finish().expect("finish");
+        assert_eq!(frag_pic.y, round.reference.y, "Y mismatch (per-slice)");
+        assert_eq!(frag_pic.u, round.reference.u, "U mismatch (per-slice)");
+        assert_eq!(frag_pic.v, round.reference.v, "V mismatch (per-slice)");
     }
 }
 

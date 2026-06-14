@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **VC-2 v3 §12.4.4 asymmetric transform through the fragmented path —
+  bit-exact verification** (round-299) — round 282 wired the
+  asymmetric (horizontal-only) layout into `FragmentedPictureDecoder`
+  (`init_pyramid_ho` / `idwt_with_ho`) but never drove a genuinely
+  asymmetric (`dwt_depth_ho > 0`) picture through SMPTE ST 2042-1:2022
+  §14. The new `hq_q0_asymmetric_transform_bit_exact_vs_non_fragmented`
+  integration test (HQ, LeGall5/3 vertical × Haar0 horizontal-only,
+  `dwt_depth = 2`, `dwt_depth_ho = 1`, `wavelet_index_ho !=
+  wavelet_index`) encodes via `EncoderParams::with_asymmetric_transform`
+  and asserts both fragment shapes (all slices in one data fragment +
+  one data fragment per slice) reconstruct byte-identically to the
+  non-fragmented `decode_picture` reference at qindex=0. The HQ payload
+  dissector helper is made asymmetric-aware: `HqDissectParams` carries
+  `(major_version, ext)` and `locate_hq_tp_end` mirrors the encoder's
+  emission of the §12.4.4 `extended_transform_parameters()` flag bits
+  and the §12.4.5.3 asymmetric custom-matrix shape so the byte cursor
+  lands exactly on slice 0. +1 test.
+
 - **Annex D Table D.9 corrected Fidelity quantisation matrices**
   (round-293) — `QuantMatrix::suggested_custom_fidelity(dwt_depth,
   dwt_depth_ho)` transcribes SMPTE ST 2042-1:2022 Table D.9, the
