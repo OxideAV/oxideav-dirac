@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **§11.3 inter-residue rate-control qindex picker** (round-309) —
+  `encoder_inter::pick_inter_residue_qindex(sequence, params, cur_y/u/v,
+  ref_y/u/v, target_residue_bytes)` and its `(qindex, actual_bytes)`
+  companion `inter_residue_qindex_diagnostic` — the inter §11.3-residue
+  analogue of the HQ/LD intra picture-qindex pickers
+  (`encoder::pick_hq_picture_qindex` / `pick_ld_picture_qindex`). The
+  picker runs the same motion estimation `encode_inter_picture` commits
+  to the bitstream (integer-pel SAD + round-73/80 adaptive int-pel snaps
+  + §15.8.6 OBMC refinement, now factored into a shared `inter_mv_grid`
+  helper so the measured residue matches the eventually-emitted one),
+  reconstructs the §15.8 OBMC prediction once, forward-transforms the
+  residue once, then walks `qindex ∈ rp.qindex.min(127)..=127` and
+  returns the **smallest** qindex whose serialised §11.3 residue payload
+  (transform_parameters + the three length-prefixed AC-coded component
+  subband streams + the ZERO_RESIDUAL=false flag) is `<=
+  target_residue_bytes`; an unsatisfiable budget returns 127. Monotone
+  in the budget — a smaller budget can only raise the chosen qindex. The
+  forward DWT is split out of `forward_and_quantise_residue` into
+  `forward_residue_pyramid` (unquantised) + `quantise_residue_pyramid`
+  so the walk re-quantises one transform. Pure encoder-side rate policy:
+  any qindex is a legal §13.4.4 choice, so every picked stream decodes.
+  Closes the lib.rs "tunable rate-controlled residue qindex" gap for the
+  1-ref inter path. New `tests/encoder_inter_residue_rate.rs` (4 tests)
+  pins: the diagnostic's actual residue bytes fit the budget when a fit
+  exists; budget-monotonicity across an 8-point sweep; the floor /
+  qindex-127 degeneracies; the configured `ResidueParams.qindex` floor
+  is respected; and every chosen qindex yields a stream the production
+  decoder accepts to two frames. Crate-wide tests: 454 → 458 (+4).
 - **HQ §12.4.5.2 `slice_prefix_bytes` encoder support** (round-306) —
   `EncoderParams::with_slice_prefix_bytes(n)` sets the SMPTE ST
   2042-1:2022 §12.4.5.2 `slice_prefix_bytes` count, so every HQ slice is

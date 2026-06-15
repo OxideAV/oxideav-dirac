@@ -106,10 +106,22 @@
 //!   the testsrc V-plane gradient where the AC path keeps a ~1-LSB
 //!   roughness).
 //!
-//! Still unsupported (planned): v3 extended transform parameters
-//! (horizontal-only transforms); per-codeblock partitioning beyond
-//! the single-codeblock-per-subband encoder default; tunable rate-
-//! controlled residue qindex (currently a single `qindex` per picture).
+//! Inter-residue rate control: the §11.3 wavelet-residue qindex for the
+//! 1-ref inter path can be picked against a residue-payload byte budget
+//! via [`encoder_inter::pick_inter_residue_qindex`] (and the
+//! `(qindex, actual_bytes)` companion
+//! [`encoder_inter::inter_residue_qindex_diagnostic`]) — the inter
+//! analogue of the HQ/LD intra picture-qindex pickers. The picker runs
+//! the same motion estimation the emitter commits, reconstructs the OBMC
+//! prediction + forward-transforms the residue once, then walks
+//! `qindex ∈ floor..=127` for the smallest quantiser whose serialised
+//! residue stream fits the budget.
+//!
+//! Still unsupported (planned): per-codeblock partitioning beyond
+//! the single-codeblock-per-subband encoder default for the residue
+//! path; multi-picture rate-controlled inter sequence driver (the
+//! per-picture picker exists; the sequence-level CBR/VBV carry that the
+//! HQ/LD intra drivers have is not yet wired for inter).
 
 #![allow(clippy::needless_range_loop)]
 

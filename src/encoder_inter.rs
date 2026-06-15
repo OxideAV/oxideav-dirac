@@ -499,6 +499,77 @@ pub(crate) fn build_upref_signed(
     (up, up_w, up_h)
 }
 
+/// Run the complete 1-ref motion-estimation pipeline
+/// [`encode_inter_picture`] commits to the bitstream: integer-pel SAD
+/// search, the optional pre-OBMC adaptive int-pel snap (round-73), the
+/// §15.8.6 OBMC-aware refinement (#186), and the optional post-OBMC
+/// adaptive int-pel snap (round-80). Factored out so the residue
+/// rate-control picker ([`pick_inter_residue_qindex`]) reconstructs the
+/// **same** MV grid the encoder will use, guaranteeing the residue it
+/// measures matches the residue it eventually emits.
+fn inter_mv_grid(
+    sequence: &SequenceHeader,
+    params: &InterEncoderParams,
+    cur_y: &[u8],
+    ref_y: &[u8],
+) -> Vec<IntegerMv> {
+    let (_sbx, _sby, blocks_x, blocks_y) = motion_grid(sequence.luma_width, sequence.luma_height);
+    let mut mvs = subpel_search_me(
+        cur_y,
+        ref_y,
+        sequence.luma_width,
+        sequence.luma_height,
+        blocks_x,
+        blocks_y,
+        params.mv_search_range,
+        params.mv_precision,
+    );
+    // Round-73: per-block adaptive sub-pel-vs-integer-pel selection
+    // **before** OBMC refinement. No-op at integer-pel or when disabled.
+    if params.inter_adaptive_int_pel {
+        inter_select_int_pel_per_block(
+            cur_y,
+            ref_y,
+            sequence.luma_width,
+            sequence.luma_height,
+            blocks_x,
+            blocks_y,
+            &mut mvs,
+            params.mv_precision,
+        );
+    }
+    // §15.8.6 OBMC-aware refinement (#186) — minimises the per-block SSE
+    // of the *blended* reconstruction, matching what the decoder will
+    // emit. No-op when `obmc_refine_passes == 0`.
+    obmc_refine_me(
+        cur_y,
+        ref_y,
+        sequence.luma_width,
+        sequence.luma_height,
+        blocks_x,
+        blocks_y,
+        &mut mvs,
+        params.mv_precision,
+        params.obmc_refine_passes,
+    );
+    // Round-80: second per-block adaptive sub-pel-vs-integer-pel
+    // selection **after** OBMC refinement. No-op at integer-pel or when
+    // disabled.
+    if params.inter_adaptive_int_pel_post_obmc {
+        inter_select_int_pel_per_block(
+            cur_y,
+            ref_y,
+            sequence.luma_width,
+            sequence.luma_height,
+            blocks_x,
+            blocks_y,
+            &mut mvs,
+            params.mv_precision,
+        );
+    }
+    mvs
+}
+
 /// Sub-pel motion estimation: integer-pel SAD followed by per-level
 /// 8-neighbor refinement down to `mv_precision` (in `1/(2^p)` pel units).
 ///
@@ -1843,11 +1914,14 @@ fn build_residue_plane(source_u8: &[u8], prediction_signed: &[i32], depth: u32) 
         .collect()
 }
 
-/// Forward-DWT then dead-zone quantise one residue plane. Mirrors
+/// Forward-DWT one residue plane into an **unquantised** coefficient
+/// pyramid. Mirrors the forward-transform half of
 /// [`crate::encoder_intra_core::forward_and_quantise`] but operates on
 /// a pre-signed `i32` source (no `- half` step — the residue is already
-/// in the signed pre-offset domain).
-fn forward_and_quantise_residue(
+/// in the signed pre-offset domain) and stops before quantisation so
+/// the same pyramid can be re-quantised at many candidate qindexes (the
+/// rate-control picker walks qindex over a single forward DWT).
+fn forward_residue_pyramid(
     residue: &[i32],
     comp_w: u32,
     comp_h: u32,
@@ -1864,7 +1938,14 @@ fn forward_and_quantise_residue(
             pic.set(y, x, residue[src_y * comp_w_u + src_x]);
         }
     }
-    let py = dwt(&pic, rp.wavelet, rp.dwt_depth);
+    dwt(&pic, rp.wavelet, rp.dwt_depth)
+}
+
+/// Dead-zone quantise an already-forward-transformed residue pyramid at
+/// `qindex`. Split out of the former `forward_and_quantise_residue` so a
+/// rate-control picker can re-quantise the same [`forward_residue_pyramid`]
+/// output at many candidate qindexes without repeating the DWT.
+fn quantise_residue_pyramid(py: &[[SubbandData; 4]], qindex: u32) -> Vec<[SubbandData; 4]> {
     let mut out: Vec<[SubbandData; 4]> = Vec::with_capacity(py.len());
     for bands in py.iter() {
         let mut level_out: [SubbandData; 4] = [
@@ -1882,13 +1963,27 @@ fn forward_and_quantise_residue(
             for y in 0..src.height {
                 for x in 0..src.width {
                     let v = src.get(y, x);
-                    dst.set(y, x, residue_quantise_coeff(v, rp.qindex));
+                    dst.set(y, x, residue_quantise_coeff(v, qindex));
                 }
             }
         }
         out.push(level_out);
     }
     out
+}
+
+/// Forward-DWT then dead-zone quantise one residue plane. Mirrors
+/// [`crate::encoder_intra_core::forward_and_quantise`] but operates on
+/// a pre-signed `i32` source (no `- half` step — the residue is already
+/// in the signed pre-offset domain).
+fn forward_and_quantise_residue(
+    residue: &[i32],
+    comp_w: u32,
+    comp_h: u32,
+    rp: &ResidueParams,
+) -> Vec<[SubbandData; 4]> {
+    let py = forward_residue_pyramid(residue, comp_w, comp_h, rp);
+    quantise_residue_pyramid(&py, rp.qindex)
 }
 
 /// Dead-zone forward quantisation — same formula as the intra encoder.
@@ -2097,6 +2192,188 @@ fn residue_select_coeff_ctxs(
     (follow, ctx::COEFF_DATA, sign_ctx)
 }
 
+// ---- §11.3 residue rate control --------------------------------------
+
+/// The Y / U / V **unquantised** residue coefficient pyramids for one
+/// inter picture, produced once by [`build_inter_residue_pyramids`] so a
+/// rate-control picker can re-quantise them at many candidate qindexes
+/// without repeating the OBMC reconstruction, the residue subtraction,
+/// or the forward DWT.
+struct InterResiduePyramids {
+    y: Vec<[SubbandData; 4]>,
+    u: Vec<[SubbandData; 4]>,
+    v: Vec<[SubbandData; 4]>,
+}
+
+/// Build the three unquantised residue pyramids for a 1-ref inter
+/// picture: reconstruct the §15.8 OBMC prediction the decoder will
+/// compute from `motion`, subtract it from the source in the signed
+/// pre-offset domain (§11.3), and forward-transform each plane with the
+/// residue wavelet. The MV grid is the same one
+/// [`encode_inter_picture`] commits to the bitstream, so the pyramids
+/// match the eventual decode symbol-for-symbol at any qindex.
+#[allow(clippy::too_many_arguments)]
+fn build_inter_residue_pyramids(
+    sequence: &SequenceHeader,
+    iep: &InterEncoderParams,
+    rp: &ResidueParams,
+    mvs: &[IntegerMv],
+    cur_y: &[u8],
+    cur_u: &[u8],
+    cur_v: &[u8],
+    ref_y: &[u8],
+    ref_u: &[u8],
+    ref_v: &[u8],
+) -> InterResiduePyramids {
+    let (sbx, sby, blocks_x, blocks_y) = motion_grid(sequence.luma_width, sequence.luma_height);
+    let pred = picture_prediction_params_from(sequence, iep, iep.mv_precision);
+    let motion = build_motion_from_mv_grid(sbx, sby, blocks_x, blocks_y, mvs);
+    let (pred_y, pred_u, pred_v) =
+        build_obmc_prediction(sequence, &pred, &motion, false, ref_y, ref_u, ref_v);
+    let res_y = build_residue_plane(cur_y, &pred_y, sequence.luma_depth);
+    let res_u = build_residue_plane(cur_u, &pred_u, sequence.chroma_depth);
+    let res_v = build_residue_plane(cur_v, &pred_v, sequence.chroma_depth);
+    InterResiduePyramids {
+        y: forward_residue_pyramid(&res_y, sequence.luma_width, sequence.luma_height, rp),
+        u: forward_residue_pyramid(&res_u, sequence.chroma_width, sequence.chroma_height, rp),
+        v: forward_residue_pyramid(&res_v, sequence.chroma_width, sequence.chroma_height, rp),
+    }
+}
+
+/// Serialise the §11.3 residue stream for one inter picture at `qindex`
+/// from already-forward-transformed pyramids, returning the byte count.
+///
+/// Counts exactly the bytes [`encode_inter_picture`] emits for the
+/// ZERO_RESIDUAL=false branch: the `transform_parameters` block, then
+/// the three length-prefixed, qindex-tagged, AC-coded component subband
+/// streams. The leading ZERO_RESIDUAL flag bit and the surrounding
+/// byte-alignment are folded in via the same [`BitWriter`] the picture
+/// emitter uses, so the returned count tracks the picture's residue
+/// payload monotonically as qindex rises (the dead-zone forward
+/// quantiser drives more coefficients to zero, which the interleaved
+/// exp-Golomb coder spends fewer bits on).
+fn inter_residue_bytes_at_qindex(
+    rp: &ResidueParams,
+    pyr: &InterResiduePyramids,
+    qindex: u32,
+) -> usize {
+    let mut rp_q = rp.clone();
+    rp_q.qindex = qindex;
+    let qpy_y = quantise_residue_pyramid(&pyr.y, qindex);
+    let qpy_u = quantise_residue_pyramid(&pyr.u, qindex);
+    let qpy_v = quantise_residue_pyramid(&pyr.v, qindex);
+
+    let mut w = BitWriter::new();
+    // Mirror the ZERO_RESIDUAL=false layout from `encode_inter_picture`:
+    // the flag bit, then transform_parameters (no byte-align between),
+    // then a byte-align before the per-component subband bytes.
+    w.write_bool(false);
+    write_residue_transform_parameters(&mut w, &rp_q);
+    w.byte_align();
+    write_residue_component_subbands(&mut w, &rp_q, &qpy_y);
+    write_residue_component_subbands(&mut w, &rp_q, &qpy_u);
+    write_residue_component_subbands(&mut w, &rp_q, &qpy_v);
+    w.byte_align();
+    w.finish().len()
+}
+
+/// 1-ref inter-residue rate-control qindex picker — the inter-residue
+/// analogue of [`crate::encoder::pick_hq_picture_qindex`].
+///
+/// Runs the same motion estimation [`encode_inter_picture`] would
+/// (integer-pel SAD search + the configured sub-pel / OBMC refinement
+/// passes), reconstructs the OBMC prediction once, forward-transforms
+/// the residue once, then walks `rp.qindex.min(127)..=127` and returns
+/// the **smallest** qindex whose serialised §11.3 residue payload is
+/// `<= target_residue_bytes`. If even qindex 127 overflows the budget,
+/// returns 127 (the most aggressive quantiser; residue stays
+/// spec-conformant under §13.4.4 at every qindex).
+///
+/// `target_residue_bytes` is the budget for the residue stream only
+/// (transform_parameters + the three component subband streams + the
+/// ZERO_RESIDUAL=false flag byte), **not** the whole picture: the
+/// picture header, reference deltas, and block_motion_data are fixed by
+/// the MV grid and do not depend on the residue qindex.
+///
+/// Monotone in `target_residue_bytes`: a smaller budget can only push
+/// the chosen qindex up (or leave it). Pure encoder-side rate policy —
+/// any qindex is a legal §13.4.4 choice, so the picked stream is
+/// always decodable.
+///
+/// Source of truth: BBC Dirac Specification v2.2.3 §11.3 (residue
+/// wavelet_transform), §13.4.4 (codeblock entropy coding).
+#[allow(clippy::too_many_arguments)]
+pub fn pick_inter_residue_qindex(
+    sequence: &SequenceHeader,
+    params: &InterEncoderParams,
+    cur_y: &[u8],
+    cur_u: &[u8],
+    cur_v: &[u8],
+    ref_y: &[u8],
+    ref_u: &[u8],
+    ref_v: &[u8],
+    target_residue_bytes: u32,
+) -> u32 {
+    let rp = match params.residue {
+        Some(ref rp) => rp.clone(),
+        // No residue stream is emitted at all when residue is disabled;
+        // the floor qindex is the only meaningful answer.
+        None => return 0,
+    };
+
+    let mvs = inter_mv_grid(sequence, params, cur_y, ref_y);
+    let pyr = build_inter_residue_pyramids(
+        sequence, params, &rp, &mvs, cur_y, cur_u, cur_v, ref_y, ref_u, ref_v,
+    );
+
+    let floor = rp.qindex.min(127);
+    for qindex in floor..=127 {
+        let bytes = inter_residue_bytes_at_qindex(&rp, &pyr, qindex);
+        if bytes <= target_residue_bytes as usize {
+            return qindex;
+        }
+    }
+    127
+}
+
+/// Diagnostic counterpart to [`pick_inter_residue_qindex`]: returns
+/// `(qindex, actual_residue_bytes)` so callers can inspect the chosen
+/// quantiser's actual residue-byte cost relative to the supplied budget.
+#[allow(clippy::too_many_arguments)]
+pub fn inter_residue_qindex_diagnostic(
+    sequence: &SequenceHeader,
+    params: &InterEncoderParams,
+    cur_y: &[u8],
+    cur_u: &[u8],
+    cur_v: &[u8],
+    ref_y: &[u8],
+    ref_u: &[u8],
+    ref_v: &[u8],
+    target_residue_bytes: u32,
+) -> (u32, usize) {
+    let rp = match params.residue {
+        Some(ref rp) => rp.clone(),
+        None => return (0, 0),
+    };
+    let mvs = inter_mv_grid(sequence, params, cur_y, ref_y);
+    let pyr = build_inter_residue_pyramids(
+        sequence, params, &rp, &mvs, cur_y, cur_u, cur_v, ref_y, ref_u, ref_v,
+    );
+    let qindex = pick_inter_residue_qindex(
+        sequence,
+        params,
+        cur_y,
+        cur_u,
+        cur_v,
+        ref_y,
+        ref_u,
+        ref_v,
+        target_residue_bytes,
+    );
+    let bytes = inter_residue_bytes_at_qindex(&rp, &pyr, qindex);
+    (qindex, bytes)
+}
+
 // ---- Picture-level inter emission ------------------------------------
 
 /// Encode one core-syntax 1-ref inter picture, parse code `0x09`. The
@@ -2141,68 +2418,7 @@ pub fn encode_inter_picture(
     // §12.3 block_motion_data. Sub-pel ME degenerates to integer-pel
     // when `mv_precision == 0`.
     let (sbx, sby, blocks_x, blocks_y) = motion_grid(sequence.luma_width, sequence.luma_height);
-    let mut mvs = subpel_search_me(
-        cur_y,
-        ref_y,
-        sequence.luma_width,
-        sequence.luma_height,
-        blocks_x,
-        blocks_y,
-        params.mv_search_range,
-        params.mv_precision,
-    );
-    // Round-73: per-block adaptive sub-pel-vs-integer-pel selection
-    // **before** OBMC refinement (so OBMC's neighbour_sum is built
-    // against the better starting point). No-op at integer-pel
-    // (`mv_precision == 0`) or when disabled.
-    if params.inter_adaptive_int_pel {
-        inter_select_int_pel_per_block(
-            cur_y,
-            ref_y,
-            sequence.luma_width,
-            sequence.luma_height,
-            blocks_x,
-            blocks_y,
-            &mut mvs,
-            params.mv_precision,
-        );
-    }
-    // §15.8.6 OBMC-aware refinement (#186) — minimises the per-block
-    // SSE of the *blended* reconstruction, matching what the decoder
-    // (and ffmpeg) will actually emit. No-op when `obmc_refine_passes
-    // == 0`, which is the explicit "no-OBMC" baseline used by tests.
-    obmc_refine_me(
-        cur_y,
-        ref_y,
-        sequence.luma_width,
-        sequence.luma_height,
-        blocks_x,
-        blocks_y,
-        &mut mvs,
-        params.mv_precision,
-        params.obmc_refine_passes,
-    );
-    // Round-80: second per-block adaptive sub-pel-vs-integer-pel
-    // selection **after** OBMC refinement. `obmc_refine_me` can drift
-    // a block off the integer-pel anchor by ±1 sub-pel units per pass
-    // to help a neighbour's blend; this pass lets such a block snap
-    // back to its integer-pel peer if the post-refinement neighbour
-    // grid no longer rewards the drift. Strict superset of MV
-    // candidates (current sub-pel position vs. its integer-pel peer)
-    // → cannot regress per-block OBMC SSE. No-op at integer-pel
-    // (`mv_precision == 0`) or when disabled.
-    if params.inter_adaptive_int_pel_post_obmc {
-        inter_select_int_pel_per_block(
-            cur_y,
-            ref_y,
-            sequence.luma_width,
-            sequence.luma_height,
-            blocks_x,
-            blocks_y,
-            &mut mvs,
-            params.mv_precision,
-        );
-    }
+    let mvs = inter_mv_grid(sequence, params, cur_y, ref_y);
     encode_block_motion_data(&mut w, sbx, sby, blocks_x, blocks_y, &mvs);
     w.byte_align();
 
