@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Multi-picture rate-controlled inter sequence driver** (round-320) —
+  `encoder_inter::encode_inter_sequence_with_residue_target(sequence,
+  intra_params, inter_params, frames, target_residue_bytes, mode)` and
+  its telemetry companion `encode_inter_sequence_with_residue_target_report`
+  drive the per-picture `pick_inter_residue_qindex` picker across a
+  complete elementary stream: an HQ intra **reference** anchor (`0xEC`)
+  followed by N 1-ref inter pictures (`0x09`), each referencing the
+  anchor (the stream's only reference picture, since `0x09` inter
+  pictures are non-reference). New `InterRateControl` enum
+  (`PerPicture` / `Cbr`) controls the **§11.3 residue-payload byte
+  budget**: `PerPicture` sizes each picture's residue to the bare target;
+  `Cbr` carries a signed `Σ(actual − target)` accumulator into the next
+  picture's request (positive = overshoot debt → tighten; negative =
+  savings → loosen). Per-picture telemetry (`InterPictureRate`) reports
+  requested vs. actual residue bytes, the chosen qindex, and the running
+  surplus. The inter analogue of the HQ/LD intra
+  `encode_*_sequence_with_size_target` drivers — closes the lib.rs
+  "multi-picture rate-controlled inter sequence driver" gap (the
+  per-picture picker existed; this wires the sequence-level carry).
+  Anchor-only input yields a valid one-frame stream (empty report);
+  `residue = None` emits a ZERO_RESIDUAL chain (zero residue bytes,
+  qindex floor). New `tests/encoder_inter_sequence_rate.rs` (4 tests)
+  pins: the full stream decodes to one frame per input picture; every
+  fitting qindex's actual residue stays within budget; the CBR
+  accumulator equals the running `Σ(actual − target)` and each request
+  folds the prior carry; PerPicture requests are the bare target; and
+  the anchor-only / residue-disabled degeneracies.
+
 ## [0.0.8](https://github.com/OxideAV/oxideav-dirac/compare/v0.0.7...v0.0.8) - 2026-06-15
 
 ### Other

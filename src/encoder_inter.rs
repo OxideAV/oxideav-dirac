@@ -3660,6 +3660,259 @@ pub fn encode_intra_then_inter_stream(
     out
 }
 
+// ---- Multi-picture rate-controlled inter sequence driver -------------
+
+/// Rate-control strategy for the multi-picture inter sequence driver
+/// [`encode_inter_sequence_with_residue_target`].
+///
+/// The inter analogue of [`crate::encoder::LdRateControl`] /
+/// [`crate::encoder::HqRateControl`], but the controlled quantity is the
+/// **§11.3 wavelet-residue payload byte budget** rather than the whole
+/// picture: each inter picture's residue qindex is picked per-picture by
+/// [`pick_inter_residue_qindex`] against a per-picture residue-byte
+/// target. The intra anchor and the per-picture motion / header bytes are
+/// not rate-controlled — only the residue stream is, because that is the
+/// one degree of freedom [`pick_inter_residue_qindex`] exposes (any
+/// §13.4.4 qindex is a legal, decodable choice; motion data and headers
+/// are structurally fixed by the preset-1 block grid).
+///
+/// Source of truth: the residue rate policy is a pure encoder-side
+/// shaping choice — the BBC Dirac Specification v2.2.3 §11.3 / §13.4.4
+/// makes any per-picture qindex spec-conformant, so picking the smallest
+/// quantiser that fits a byte budget produces a stream every conformant
+/// decoder accepts. The sequence framing follows §9.6 / §10.4 parse-info
+/// chaining exactly as the single-picture drivers do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterRateControl {
+    /// Each inter picture's residue is independently sized to
+    /// `target_residue_bytes` (the smallest qindex whose serialised
+    /// residue stream fits, via [`pick_inter_residue_qindex`]). No carry
+    /// between pictures — every picture sees the same budget.
+    PerPicture,
+    /// Constant-residue-rate: a signed running accumulator carries the
+    /// over-/under-shoot of every encoded picture's actual residue bytes
+    /// into the next picture's residue budget. A picture that overshoots
+    /// `target_residue_bytes` (its smallest-fitting qindex still ran over,
+    /// or it hit the qindex-127 floor) tightens the following picture's
+    /// budget; an undershoot loosens it. Sign convention matches the LD
+    /// driver: `carry = Σ(actual − target)` (positive = overshot the
+    /// ideal cumulative residue budget so far, so the next request is
+    /// pulled back; negative = headroom to spend).
+    Cbr,
+}
+
+/// Per-picture residue rate-control telemetry returned by
+/// [`encode_inter_sequence_with_residue_target_report`].
+#[derive(Debug, Clone, Copy)]
+pub struct InterPictureRate {
+    /// Picture number written into the inter picture header.
+    pub picture_number: u32,
+    /// Picture number this inter picture references (the previous frame
+    /// in the chain; the intra anchor for the first inter picture).
+    pub ref1_picture_number: u32,
+    /// Residue-payload byte budget actually requested for this picture
+    /// (after the [`InterRateControl::Cbr`] accumulator adjustment, if
+    /// any).
+    pub requested_residue_bytes: u32,
+    /// Actual serialised §11.3 residue-payload bytes for the chosen
+    /// qindex (transform_parameters + the three length-prefixed AC-coded
+    /// component subband streams + the ZERO_RESIDUAL=false flag), as
+    /// measured by [`inter_residue_qindex_diagnostic`].
+    pub actual_residue_bytes: u32,
+    /// qindex chosen by [`pick_inter_residue_qindex`] for this picture.
+    pub qindex: u32,
+    /// Running rate-control surplus *after* this picture has been folded
+    /// in. Sign convention: **positive = overshoot debt** (cumulative
+    /// `Σ(actual − target)`), **negative = savings**. Identical for both
+    /// modes; the modes differ only in whether the next picture's request
+    /// *uses* it ([`InterRateControl::Cbr`] does,
+    /// [`InterRateControl::PerPicture`] does not).
+    pub running_surplus_bytes: i64,
+}
+
+/// Encode a multi-picture core-syntax inter sequence (one HQ intra
+/// anchor `0xEC` followed by N 1-ref inter pictures `0x09`) with
+/// per-picture **residue** rate control driven by
+/// [`pick_inter_residue_qindex`].
+///
+/// `frames[0]` is the intra anchor; `frames[1..]` are the inter pictures.
+/// Every inter picture references the **intra anchor** — the only
+/// *reference* picture in the stream. Inter pictures use parse code
+/// `0x09` (1-ref, **non-reference**), so a decoded inter picture never
+/// enters the decoder's reference buffer; a straight P-chain through the
+/// previous inter picture would therefore reference a picture the decoder
+/// discarded and fail with `MissingReference`. Anchoring every inter to
+/// the intra picture keeps the whole sequence decodable while still
+/// rate-controlling each picture's residue independently. (This is the
+/// same source-referenced convention as [`encode_intra_then_inter_stream`],
+/// extended to N inter pictures.) For each inter picture the driver:
+///   1. derives a per-picture residue-byte budget from
+///      `target_residue_bytes` and the [`InterRateControl`] strategy,
+///   2. picks the smallest residue qindex whose serialised §11.3 residue
+///      stream fits that budget ([`pick_inter_residue_qindex`]),
+///   3. emits the inter picture (`0x09`) at that qindex,
+///   4. (CBR) folds the actual-vs-target residue-byte deviation into the
+///      accumulator for the next picture.
+///
+/// The result is a complete elementary stream — sequence header (`0x00`),
+/// the anchor, the inter pictures, and end-of-sequence (`0x10`) — with
+/// the `next`/`previous` parse-offset chain wired so it round-trips
+/// through [`crate::decoder::DiracDecoder`] to one decoded frame per
+/// input frame. Requires `inter_params.residue` to be `Some(..)`; with
+/// `residue = None` no residue stream exists to rate-control, so the
+/// driver falls back to ZERO_RESIDUAL=true pictures (all telemetry
+/// residue figures are then zero and the qindex is the configured floor).
+///
+/// Returns at least the sequence header + anchor + EOS even when
+/// `frames` carries only the anchor (an empty inter list is legal —
+/// the report is then empty).
+///
+/// Closes the lib.rs "multi-picture rate-controlled inter sequence
+/// driver" gap (the per-picture picker existed; this wires the
+/// sequence-level carry the HQ/LD intra drivers have).
+pub fn encode_inter_sequence_with_residue_target(
+    sequence: &SequenceHeader,
+    intra_params: &crate::encoder::EncoderParams,
+    inter_params: &InterEncoderParams,
+    frames: &[InterInputPicture<'_>],
+    target_residue_bytes: u32,
+    mode: InterRateControl,
+) -> Vec<u8> {
+    let (stream, _report) = encode_inter_sequence_with_residue_target_report(
+        sequence,
+        intra_params,
+        inter_params,
+        frames,
+        target_residue_bytes,
+        mode,
+    );
+    stream
+}
+
+/// [`encode_inter_sequence_with_residue_target`] plus per-picture
+/// telemetry (requested vs. actual residue bytes, chosen qindex, and the
+/// running accumulator for each inter picture). Returns `(stream,
+/// report)`; `report` has one entry per inter picture (i.e.
+/// `frames.len().saturating_sub(1)`).
+pub fn encode_inter_sequence_with_residue_target_report(
+    sequence: &SequenceHeader,
+    intra_params: &crate::encoder::EncoderParams,
+    inter_params: &InterEncoderParams,
+    frames: &[InterInputPicture<'_>],
+    target_residue_bytes: u32,
+    mode: InterRateControl,
+) -> (Vec<u8>, Vec<InterPictureRate>) {
+    let pi_size = 13usize;
+    let sh_payload = crate::encoder::encode_sequence_header(sequence);
+    let sh_unit_len = (pi_size + sh_payload.len()) as u32;
+
+    let mut out = Vec::new();
+    write_parse_info(&mut out, 0x00, sh_unit_len, 0);
+    out.extend_from_slice(&sh_payload);
+    let mut prev_unit_len = sh_unit_len;
+
+    let mut report: Vec<InterPictureRate> = Vec::new();
+
+    let Some((anchor, inters)) = frames.split_first() else {
+        // No anchor at all → sequence header + EOS only.
+        write_parse_info(&mut out, 0x10, 0, prev_unit_len);
+        return (out, report);
+    };
+
+    // HQ intra **reference** anchor (0xEC) — its decoded form lands in
+    // the decoder's reference buffer per §15.4.
+    let anchor_payload = crate::encoder::encode_hq_intra_picture(
+        sequence,
+        intra_params,
+        anchor.picture_number,
+        anchor.y,
+        anchor.u,
+        anchor.v,
+    );
+    let anchor_unit_len = (pi_size + anchor_payload.len()) as u32;
+    write_parse_info(&mut out, 0xEC, anchor_unit_len, prev_unit_len);
+    out.extend_from_slice(&anchor_payload);
+    prev_unit_len = anchor_unit_len;
+
+    // CBR accumulator: signed running Σ(actual − target) residue bytes.
+    let mut carry: i64 = 0;
+
+    // Every inter picture references the intra anchor — the only
+    // reference picture in the stream (0x09 inter pictures are
+    // non-reference and never enter the decoder's reference buffer).
+    let reference: &InterInputPicture<'_> = anchor;
+
+    for pic in inters {
+        // Per-picture residue budget from the strategy.
+        let requested: u32 = match mode {
+            InterRateControl::PerPicture => target_residue_bytes,
+            InterRateControl::Cbr => {
+                // Spend `target` minus whatever we've overshot so far
+                // (carry > 0 ⇒ pull back; carry < 0 ⇒ spend extra).
+                let want = target_residue_bytes as i64 - carry;
+                want.clamp(0, u32::MAX as i64) as u32
+            }
+        };
+
+        // Pick the residue qindex for this picture against the budget,
+        // and measure what it actually costs. With residue disabled the
+        // diagnostic returns `(0, 0)` and the picture is emitted
+        // ZERO_RESIDUAL=true.
+        let (qindex, actual_residue) = inter_residue_qindex_diagnostic(
+            sequence,
+            inter_params,
+            pic.y,
+            pic.u,
+            pic.v,
+            reference.y,
+            reference.u,
+            reference.v,
+            requested,
+        );
+
+        // Emit the inter picture with the chosen residue qindex applied.
+        let mut pic_params = inter_params.clone();
+        if let Some(ref rp) = inter_params.residue {
+            let mut rp = rp.clone();
+            rp.qindex = qindex;
+            pic_params.residue = Some(rp);
+        }
+        let inter_payload = encode_inter_picture(
+            sequence,
+            &pic_params,
+            pic.picture_number,
+            reference.picture_number,
+            pic.y,
+            pic.u,
+            pic.v,
+            reference.y,
+            reference.u,
+            reference.v,
+        );
+        let inter_unit_len = (pi_size + inter_payload.len()) as u32;
+        write_parse_info(&mut out, 0x09, inter_unit_len, prev_unit_len);
+        out.extend_from_slice(&inter_payload);
+        prev_unit_len = inter_unit_len;
+
+        // Fold the actual-vs-target residue deviation into the
+        // accumulator (computed identically for both modes; only Cbr
+        // *uses* it when sizing the next request).
+        carry += actual_residue as i64 - target_residue_bytes as i64;
+
+        report.push(InterPictureRate {
+            picture_number: pic.picture_number,
+            ref1_picture_number: reference.picture_number,
+            requested_residue_bytes: requested,
+            actual_residue_bytes: actual_residue as u32,
+            qindex,
+            running_surplus_bytes: carry,
+        });
+    }
+
+    write_parse_info(&mut out, 0x10, 0, prev_unit_len);
+    (out, report)
+}
+
 /// Two-frame YUV pair for the inter-encoder fixtures.
 pub type TranslatingPair64 = (
     [u8; 64 * 64],

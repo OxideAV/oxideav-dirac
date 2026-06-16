@@ -117,11 +117,25 @@
 //! `qindex ∈ floor..=127` for the smallest quantiser whose serialised
 //! residue stream fits the budget.
 //!
+//! Inter sequence rate control: a multi-picture inter sequence driver
+//! ([`encoder_inter::encode_inter_sequence_with_residue_target`] and its
+//! `_report` companion) wires the per-picture
+//! [`encoder_inter::pick_inter_residue_qindex`] picker across an HQ intra
+//! anchor (`0xEC`) plus N 1-ref inter pictures (`0x09`) with a
+//! [`encoder_inter::InterRateControl::PerPicture`] /
+//! [`encoder_inter::InterRateControl::Cbr`] **residue-byte** accumulator
+//! — the inter analogue of the HQ/LD intra
+//! `encode_*_sequence_with_size_target` drivers. The accumulator carries
+//! `Σ(actual − target)` residue bytes between pictures; every inter
+//! picture references the intra anchor (the stream's only reference
+//! picture, since `0x09` pictures are non-reference) so the whole
+//! sequence round-trips through [`decoder::DiracDecoder`].
+//!
 //! Still unsupported (planned): per-codeblock partitioning beyond
 //! the single-codeblock-per-subband encoder default for the residue
-//! path; multi-picture rate-controlled inter sequence driver (the
-//! per-picture picker exists; the sequence-level CBR/VBV carry that the
-//! HQ/LD intra drivers have is not yet wired for inter).
+//! path; leaky-bucket VBV / VbvHysteresis residue carry for inter (the
+//! HQ/LD intra drivers have those bucket variants; the inter driver
+//! currently offers PerPicture + Cbr).
 
 #![allow(clippy::needless_range_loop)]
 
