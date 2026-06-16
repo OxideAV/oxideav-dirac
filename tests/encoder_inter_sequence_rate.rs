@@ -5,9 +5,10 @@
 //! and its `_report` companion — the sequence-level wiring that drives
 //! the per-picture `pick_inter_residue_qindex` picker across an HQ intra
 //! anchor (`0xEC`) followed by N 1-ref inter pictures (`0x09`), with a
-//! `PerPicture` / `Cbr` residue-byte accumulator. The single-picture
-//! picker is validated separately in `encoder_inter_residue_rate.rs`;
-//! this file pins the multi-picture driver:
+//! `PerPicture` / `Cbr` / `Vbv` / `VbvHysteresis` residue-byte
+//! accumulator. The single-picture picker is validated separately in
+//! `encoder_inter_residue_rate.rs`; this file pins the multi-picture
+//! driver:
 //!
 //!   1. the full stream decodes to one frame per input picture;
 //!   2. every report entry's actual residue bytes fit its requested
@@ -15,7 +16,11 @@
 //!   3. the CBR accumulator equals the running `Σ(actual − target)`;
 //!   4. `PerPicture` requests are the bare target every picture, while
 //!      `Cbr` requests track the carry;
-//!   5. anchor-only and `residue = None` degeneracies behave.
+//!   5. `Vbv` clamps the banked savings at `-buffer_bytes` (peak
+//!      residue-size cap) and `VbvHysteresis` additionally rate-limits
+//!      the per-picture drain (collapsing to plain `Vbv` when
+//!      `max_drain_per_picture >= buffer_bytes`);
+//!   6. anchor-only and `residue = None` degeneracies behave.
 
 use oxideav_core::CodecRegistry;
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
@@ -219,6 +224,191 @@ fn cbr_accumulator_tracks_running_deviation() {
     }
 
     assert_eq!(decode_frame_count(stream), pics.len());
+}
+
+/// VBV: the savings end of the accumulator is clamped at `-buffer_bytes`,
+/// so the next picture's request never exceeds `target + buffer_bytes`.
+/// With `buffer_bytes = 0` the savings side is forfeited entirely, so the
+/// running surplus is always `>= 0` (debt is still tracked) and every
+/// request is `<= target`. The whole stream still decodes.
+#[test]
+fn vbv_clamps_savings_and_caps_request() {
+    let (seq, frames) = fixture();
+    let pics = input_pictures(&frames);
+    let intra = EncoderParams::default_hq(WaveletFilter::LeGall5_3, 3);
+    let inter = InterEncoderParams::default();
+
+    let (_q, floor_bytes) = inter_residue_qindex_diagnostic(
+        &seq,
+        &inter,
+        &frames[3].y,
+        &frames[3].u,
+        &frames[3].v,
+        &frames[0].y,
+        &frames[0].u,
+        &frames[0].v,
+        u32::MAX,
+    );
+    let target = (floor_bytes / 2).max(1) as u32;
+    let buffer_bytes = (floor_bytes / 8).max(1) as u32;
+
+    let (stream, report) = encode_inter_sequence_with_residue_target_report(
+        &seq,
+        &intra,
+        &inter,
+        &pics,
+        target,
+        InterRateControl::Vbv { buffer_bytes },
+    );
+
+    // Reconstruct the clamped accumulator and verify the reported surplus
+    // and each request match, with the savings clamp applied.
+    let mut carry: i64 = 0;
+    for (i, r) in report.iter().enumerate() {
+        let spendable = (-carry).min(buffer_bytes as i64).max(0);
+        let want = target as i64 - carry.max(0) + spendable;
+        let expected_req = want.clamp(0, u32::MAX as i64) as u32;
+        assert_eq!(
+            r.requested_residue_bytes, expected_req,
+            "Vbv request #{i} folds carry with savings clamp"
+        );
+        // The request can never exceed target + buffer_bytes.
+        assert!(
+            r.requested_residue_bytes <= target + buffer_bytes,
+            "Vbv request #{i} bounded by target+buffer"
+        );
+        carry += r.actual_residue_bytes as i64 - target as i64;
+        if carry < -(buffer_bytes as i64) {
+            carry = -(buffer_bytes as i64);
+        }
+        assert_eq!(
+            r.running_surplus_bytes, carry,
+            "Vbv running surplus #{i} clamped at -buffer_bytes"
+        );
+        assert!(
+            r.running_surplus_bytes >= -(buffer_bytes as i64),
+            "savings never exceed buffer_bytes"
+        );
+    }
+
+    assert_eq!(decode_frame_count(stream), pics.len());
+
+    // buffer_bytes == 0: savings forfeited, surplus stays >= 0, requests
+    // never exceed target.
+    let (stream0, report0) = encode_inter_sequence_with_residue_target_report(
+        &seq,
+        &intra,
+        &inter,
+        &pics,
+        target,
+        InterRateControl::Vbv { buffer_bytes: 0 },
+    );
+    for r in &report0 {
+        assert!(
+            r.running_surplus_bytes >= 0,
+            "buffer_bytes=0 forfeits all savings: {r:?}"
+        );
+        assert!(
+            r.requested_residue_bytes <= target,
+            "buffer_bytes=0 request never exceeds target: {r:?}"
+        );
+    }
+    assert_eq!(decode_frame_count(stream0), pics.len());
+}
+
+/// VbvHysteresis: the spent savings per picture are additionally clamped
+/// at `max_drain_per_picture`, while the bucket fill / debt semantics
+/// match plain Vbv. A small drain cap means the request's savings-spend
+/// never exceeds `max_drain_per_picture`; a `max_drain >= buffer_bytes`
+/// cap collapses to byte-identical plain Vbv output.
+#[test]
+fn vbv_hysteresis_limits_drain_and_collapses_to_vbv() {
+    let (seq, frames) = fixture();
+    let pics = input_pictures(&frames);
+    let intra = EncoderParams::default_hq(WaveletFilter::LeGall5_3, 3);
+    let inter = InterEncoderParams::default();
+
+    let (_q, floor_bytes) = inter_residue_qindex_diagnostic(
+        &seq,
+        &inter,
+        &frames[3].y,
+        &frames[3].u,
+        &frames[3].v,
+        &frames[0].y,
+        &frames[0].u,
+        &frames[0].v,
+        u32::MAX,
+    );
+    let target = (floor_bytes / 2).max(1) as u32;
+    let buffer_bytes = (floor_bytes / 4).max(2) as u32;
+    let max_drain = (buffer_bytes / 2).max(1);
+
+    let (stream, report) = encode_inter_sequence_with_residue_target_report(
+        &seq,
+        &intra,
+        &inter,
+        &pics,
+        target,
+        InterRateControl::VbvHysteresis {
+            buffer_bytes,
+            max_drain_per_picture: max_drain,
+        },
+    );
+
+    // Reconstruct with the drain-limited spend and verify each request.
+    let mut carry: i64 = 0;
+    for (i, r) in report.iter().enumerate() {
+        let spendable = (-carry)
+            .min(buffer_bytes as i64)
+            .min(max_drain as i64)
+            .max(0);
+        let want = target as i64 - carry.max(0) + spendable;
+        let expected_req = want.clamp(0, u32::MAX as i64) as u32;
+        assert_eq!(
+            r.requested_residue_bytes, expected_req,
+            "VbvHysteresis request #{i} drain-limited"
+        );
+        // The savings spent above target are capped at max_drain.
+        let savings_spent = r.requested_residue_bytes as i64 - target as i64;
+        if savings_spent > 0 {
+            assert!(
+                savings_spent <= max_drain as i64,
+                "drain per picture #{i} bounded by max_drain"
+            );
+        }
+        carry += r.actual_residue_bytes as i64 - target as i64;
+        if carry < -(buffer_bytes as i64) {
+            carry = -(buffer_bytes as i64);
+        }
+        assert_eq!(r.running_surplus_bytes, carry);
+    }
+    assert_eq!(decode_frame_count(stream), pics.len());
+
+    // max_drain_per_picture >= buffer_bytes collapses to plain Vbv: the
+    // drain cap never bites, so the streams are byte-identical.
+    let collapsed = encode_inter_sequence_with_residue_target(
+        &seq,
+        &intra,
+        &inter,
+        &pics,
+        target,
+        InterRateControl::VbvHysteresis {
+            buffer_bytes,
+            max_drain_per_picture: buffer_bytes,
+        },
+    );
+    let plain_vbv = encode_inter_sequence_with_residue_target(
+        &seq,
+        &intra,
+        &inter,
+        &pics,
+        target,
+        InterRateControl::Vbv { buffer_bytes },
+    );
+    assert_eq!(
+        collapsed, plain_vbv,
+        "max_drain >= buffer_bytes ≡ plain Vbv"
+    );
 }
 
 /// Anchor-only input → sequence header + anchor + EOS, no inter

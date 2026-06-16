@@ -123,19 +123,23 @@
 //! [`encoder_inter::pick_inter_residue_qindex`] picker across an HQ intra
 //! anchor (`0xEC`) plus N 1-ref inter pictures (`0x09`) with a
 //! [`encoder_inter::InterRateControl::PerPicture`] /
-//! [`encoder_inter::InterRateControl::Cbr`] **residue-byte** accumulator
-//! — the inter analogue of the HQ/LD intra
-//! `encode_*_sequence_with_size_target` drivers. The accumulator carries
-//! `Σ(actual − target)` residue bytes between pictures; every inter
-//! picture references the intra anchor (the stream's only reference
-//! picture, since `0x09` pictures are non-reference) so the whole
-//! sequence round-trips through [`decoder::DiracDecoder`].
+//! [`encoder_inter::InterRateControl::Cbr`] /
+//! [`encoder_inter::InterRateControl::Vbv`] (leaky-bucket) /
+//! [`encoder_inter::InterRateControl::VbvHysteresis`] (drain-rate-limited
+//! leaky-bucket) **residue-byte** accumulator — the inter analogue of the
+//! HQ/LD intra `encode_*_sequence_with_size_target` drivers, now with the
+//! same four rate-control variants. The accumulator carries
+//! `Σ(actual − target)` residue bytes between pictures; under the two VBV
+//! variants the savings end of the accumulator is clamped at
+//! `-buffer_bytes` so a run of undershooting inter pictures cannot bank
+//! unbounded headroom (peak residue-size cap). Every inter picture
+//! references the intra anchor (the stream's only reference picture, since
+//! `0x09` pictures are non-reference) so the whole sequence round-trips
+//! through [`decoder::DiracDecoder`].
 //!
 //! Still unsupported (planned): per-codeblock partitioning beyond
 //! the single-codeblock-per-subband encoder default for the residue
-//! path; leaky-bucket VBV / VbvHysteresis residue carry for inter (the
-//! HQ/LD intra drivers have those bucket variants; the inter driver
-//! currently offers PerPicture + Cbr).
+//! path.
 
 #![allow(clippy::needless_range_loop)]
 

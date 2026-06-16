@@ -36,7 +36,7 @@ core syntax, and the VC-2 v3 fragmented-picture path.
 | VC-2 HQ intra | 8/10-bit, 4:2:0/4:2:2/4:4:4, 6 wavelets, all spec-allowed `dwt_depth` (1..=5), optional custom quant matrix, per-slice / picture-level rate control (PerPicture / CBR / VBV / VBV-hysteresis), asymmetric transform emission, slice-prefix bytes |
 | VC-2 LD intra | Same axis + rate-control coverage as HQ; bit-exact at q=0 against the reference oracle |
 | Dirac core-syntax intra | AC-coded (`0x0C`) + VLC (`0x4C`) encoders, near-lossless at q=0, optional §11.3.3 spatial-partition codeblock grid with per-codeblock differential quantiser |
-| Dirac inter | 1-ref P (`0x09`) and 2-ref bipred B (`0x0A`); sub-pel ME (qpel default), OBMC-aware ME refinement, per-block reference-mode + adaptive sub-pel/integer-pel selection, §11.3 wavelet residue (bit-exact self-roundtrip at q=0), inter-residue rate-control qindex picker, **multi-picture inter sequence driver** (HQ intra anchor + N `0x09` pictures, PerPicture / Cbr residue-byte rate control) |
+| Dirac inter | 1-ref P (`0x09`) and 2-ref bipred B (`0x0A`); sub-pel ME (qpel default), OBMC-aware ME refinement, per-block reference-mode + adaptive sub-pel/integer-pel selection, §11.3 wavelet residue (bit-exact self-roundtrip at q=0), inter-residue rate-control qindex picker, **multi-picture inter sequence driver** (HQ intra anchor + N `0x09` pictures, with PerPicture / Cbr / leaky-bucket Vbv / drain-limited VbvHysteresis residue-byte rate control — the full four-variant set the HQ/LD intra drivers carry) |
 | Mixed I+P/B interop | Homogeneous core-syntax chains accepted end-to-end by the external oracle |
 
 ## Codec ID

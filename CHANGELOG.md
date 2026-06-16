@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Inter sequence driver — leaky-bucket VBV + VbvHysteresis residue
+  rate control** (round-326) — `encoder_inter::InterRateControl` grows two
+  variants beyond the round-320 `PerPicture` / `Cbr` pair, so the
+  multi-picture inter sequence driver
+  (`encode_inter_sequence_with_residue_target` / `_report`) now offers the
+  same four rate-control strategies the HQ/LD intra
+  `encode_*_sequence_with_size_target` drivers have:
+  - `InterRateControl::Vbv { buffer_bytes }` — leaky-bucket: identical
+    feedback to `Cbr` (`carry = Σ(actual − target)` residue bytes), but the
+    savings end of the accumulator is clamped at `-buffer_bytes` after each
+    picture, so a run of undershooting inter pictures cannot bank unbounded
+    headroom. The next picture's request `target − carry` is bounded above
+    by `target + buffer_bytes` (an instantaneous peak residue-size cap).
+    Overshoot debt (`carry > 0`) is never clamped — debt repayment is
+    mandatory. `buffer_bytes == 0` forfeits all savings (surplus stays
+    `>= 0`, every request `<= target`).
+  - `InterRateControl::VbvHysteresis { buffer_bytes, max_drain_per_picture }`
+    — drain-rate-limited leaky-bucket: same bucket fill / forfeit semantics
+    as `Vbv`, but the per-picture banked-savings spend is additionally
+    clamped at `max_drain_per_picture`, so a full bucket is emptied
+    gradually rather than in one step. `max_drain_per_picture >=
+    buffer_bytes` collapses to byte-identical plain `Vbv`;
+    `max_drain_per_picture == 0` zeros the spend.
+  Pure encoder-side residue rate policy — any §13.4.4 qindex is a legal,
+  decodable choice, so every picked stream round-trips through
+  `DiracDecoder`. The §11.3 residue analogue of the intra whole-picture
+  byte-budget VBV variants from r146/r149/r159, applied to the residue
+  payload. Closes the lib.rs "leaky-bucket VBV / VbvHysteresis residue
+  carry for inter" gap. New `running_surplus_bytes` telemetry reports the
+  bucket-clamped accumulator. `tests/encoder_inter_sequence_rate.rs`
+  grows 2 tests (4 → 6): `vbv_clamps_savings_and_caps_request` (savings
+  clamp + `buffer_bytes = 0` forfeiture, each request `<= target +
+  buffer_bytes`, whole-stream decode) and
+  `vbv_hysteresis_limits_drain_and_collapses_to_vbv` (per-picture drain
+  cap + byte-identical collapse to plain `Vbv` when `max_drain >=
+  buffer_bytes`). Sourced from `docs/video/dirac/dirac-spec-latest.pdf`
+  §11.3 / §13.4.4 (any qindex legal); the bucket policy is a pure
+  encoder-side shaping choice. No external library source, no web search.
+
 - **Multi-picture rate-controlled inter sequence driver** (round-320) —
   `encoder_inter::encode_inter_sequence_with_residue_target(sequence,
   intra_params, inter_params, frames, target_residue_bytes, mode)` and

@@ -3699,6 +3699,70 @@ pub enum InterRateControl {
     /// ideal cumulative residue budget so far, so the next request is
     /// pulled back; negative = headroom to spend).
     Cbr,
+    /// Leaky-bucket variable-residue-rate: like [`Cbr`] but the spendable
+    /// **savings** (i.e. the negative end of the carry, `max(-carry, 0)`)
+    /// are bounded by `buffer_bytes`. After each picture the carry is
+    /// clamped at `carry >= -buffer_bytes`, so a run of undershooting
+    /// inter pictures cannot bank unbounded headroom: the next request
+    /// `target − carry` is capped above by `target + buffer_bytes`, an
+    /// instantaneous peak residue-size cap. Overshoot debt (`carry > 0`)
+    /// is never clamped — repaying an overshoot is mandatory, exactly as
+    /// in [`Cbr`] — so VBV only governs the upper edge of the request.
+    /// `buffer_bytes == 0` collapses to [`Cbr`] on a smooth fixture (the
+    /// savings side is forced to zero; the debt side is identical).
+    ///
+    /// The residue analogue of [`crate::encoder::LdRateControl::Vbv`] /
+    /// [`crate::encoder::HqRateControl::Vbv`], applied to the §11.3
+    /// residue-payload byte budget instead of the whole-picture budget.
+    ///
+    /// [`Cbr`]: InterRateControl::Cbr
+    Vbv {
+        /// Peak per-picture residue surplus the leaky bucket may hold
+        /// above `target_residue_bytes`. The next request is bounded
+        /// above by `target_residue_bytes + buffer_bytes`.
+        buffer_bytes: u32,
+    },
+    /// Drain-rate hysteresis variant of [`Vbv`] — same bucket fill /
+    /// forfeit semantics, but the spendable savings are additionally
+    /// clamped at `max_drain_per_picture` so a full bucket is emptied
+    /// gradually rather than in one step.
+    ///
+    /// Plain [`Vbv`] lets a single inter picture drain the entire bucket
+    /// the moment savings fill it (its request may equal `target +
+    /// buffer_bytes` immediately). That delivers maximum quality on one
+    /// picture but exposes the next few to a sudden cliff — the bucket
+    /// empties abruptly, then sits at zero until the next undershoot
+    /// refills it. `VbvHysteresis` smooths the drain by spreading the
+    /// banked savings: the spend is `min(savings, buffer_bytes,
+    /// max_drain_per_picture)`, so the remaining savings stay in the
+    /// bucket for the *next* picture. The debt-payback branch
+    /// (`carry > 0`) is unchanged from [`Vbv`] / [`Cbr`] because debt
+    /// repayment is mandatory, not rate-limited — only the spend side is
+    /// hysteretic. `max_drain_per_picture >= buffer_bytes` collapses back
+    /// to plain [`Vbv`] (the drain cap never bites); `max_drain_per_picture
+    /// == 0` zeros the spend so the request becomes `target − max(carry, 0)`.
+    ///
+    /// The residue analogue of
+    /// [`crate::encoder::LdRateControl::VbvHysteresis`] /
+    /// [`crate::encoder::HqRateControl::VbvHysteresis`].
+    ///
+    /// [`Vbv`]: InterRateControl::Vbv
+    /// [`Cbr`]: InterRateControl::Cbr
+    VbvHysteresis {
+        /// Peak per-picture residue surplus the leaky bucket may hold
+        /// above `target_residue_bytes`. Same role as
+        /// [`Vbv::buffer_bytes`].
+        ///
+        /// [`Vbv::buffer_bytes`]: InterRateControl::Vbv::buffer_bytes
+        buffer_bytes: u32,
+        /// Maximum banked savings a single picture may spend above its
+        /// `target_residue_bytes` request. Bounds how aggressively a full
+        /// bucket is emptied per picture. `>= buffer_bytes` collapses to
+        /// plain [`Vbv`].
+        ///
+        /// [`Vbv`]: InterRateControl::Vbv
+        max_drain_per_picture: u32,
+    },
 }
 
 /// Per-picture residue rate-control telemetry returned by
@@ -3722,11 +3786,15 @@ pub struct InterPictureRate {
     /// qindex chosen by [`pick_inter_residue_qindex`] for this picture.
     pub qindex: u32,
     /// Running rate-control surplus *after* this picture has been folded
-    /// in. Sign convention: **positive = overshoot debt** (cumulative
-    /// `Σ(actual − target)`), **negative = savings**. Identical for both
-    /// modes; the modes differ only in whether the next picture's request
-    /// *uses* it ([`InterRateControl::Cbr`] does,
-    /// [`InterRateControl::PerPicture`] does not).
+    /// in (and after the [`InterRateControl::Vbv`] /
+    /// [`InterRateControl::VbvHysteresis`] bucket clamp, if any).
+    /// Sign convention: **positive = overshoot debt** (cumulative
+    /// `Σ(actual − target)`), **negative = savings**. Computed the same
+    /// way for every mode; the modes differ only in whether the next
+    /// picture's request *uses* it ([`InterRateControl::Cbr`] /
+    /// [`InterRateControl::Vbv`] / [`InterRateControl::VbvHysteresis`] do,
+    /// [`InterRateControl::PerPicture`] does not) and, for the VBV
+    /// variants, whether the savings side is clamped at `-buffer_bytes`.
     pub running_surplus_bytes: i64,
 }
 
@@ -3852,6 +3920,35 @@ pub fn encode_inter_sequence_with_residue_target_report(
                 let want = target_residue_bytes as i64 - carry;
                 want.clamp(0, u32::MAX as i64) as u32
             }
+            InterRateControl::Vbv { buffer_bytes } => {
+                // Leaky-bucket: identical to `Cbr` but the spendable
+                // savings (`max(-carry, 0)`) are capped at `buffer_bytes`.
+                // The post-encode clamp keeps `carry >= -buffer_bytes`, so
+                // the request `target - carry` is bounded above by
+                // `target + buffer_bytes`. The explicit `min` here is
+                // belt-and-braces against bucket-cap edge cases; the
+                // post-encode clamp is the load-bearing invariant.
+                let spendable = (-carry).min(buffer_bytes as i64).max(0);
+                let want = target_residue_bytes as i64 - carry.max(0) + spendable;
+                want.clamp(0, u32::MAX as i64) as u32
+            }
+            InterRateControl::VbvHysteresis {
+                buffer_bytes,
+                max_drain_per_picture,
+            } => {
+                // Drain-rate hysteresis: identical bucket fill / forfeit
+                // semantics as `Vbv`, but the spendable savings are
+                // additionally clamped at `max_drain_per_picture`. The
+                // debt-payback branch (`carry > 0`) is unchanged because
+                // debt repayment is mandatory, not rate-limited — only the
+                // spend side of the bucket is hysteretic.
+                let spendable = (-carry)
+                    .min(buffer_bytes as i64)
+                    .min(max_drain_per_picture as i64)
+                    .max(0);
+                let want = target_residue_bytes as i64 - carry.max(0) + spendable;
+                want.clamp(0, u32::MAX as i64) as u32
+            }
         };
 
         // Pick the residue qindex for this picture against the budget,
@@ -3895,9 +3992,26 @@ pub fn encode_inter_sequence_with_residue_target_report(
         prev_unit_len = inter_unit_len;
 
         // Fold the actual-vs-target residue deviation into the
-        // accumulator (computed identically for both modes; only Cbr
-        // *uses* it when sizing the next request).
+        // accumulator (computed identically for every mode; only the
+        // feedback modes *use* it when sizing the next request).
         carry += actual_residue as i64 - target_residue_bytes as i64;
+
+        // VBV: clamp the savings end of the bucket at -buffer_bytes so
+        // the next picture's `target - carry` request stays ≤ target +
+        // buffer_bytes. Overshoot debt (carry > 0) is left untouched — a
+        // peak-size cap governs only the upper edge of the request — and
+        // PerPicture / Cbr leave `carry` alone (PerPicture ignores it
+        // anyway; Cbr is the unbounded-bucket limit).
+        match mode {
+            InterRateControl::Vbv { buffer_bytes }
+            | InterRateControl::VbvHysteresis { buffer_bytes, .. } => {
+                let floor = -(buffer_bytes as i64);
+                if carry < floor {
+                    carry = floor;
+                }
+            }
+            InterRateControl::PerPicture | InterRateControl::Cbr => {}
+        }
 
         report.push(InterPictureRate {
             picture_number: pic.picture_number,
