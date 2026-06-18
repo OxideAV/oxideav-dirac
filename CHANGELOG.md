@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **§15.8.7 `pixel_pred` / §15.8.2 `motion_compensate` global-motion
+  branch coverage** (round-337) — two tests close the lone untested arm
+  of the OBMC prediction chain: the `block.gmode == true` path that
+  switches the per-pixel fetch from the block's own `mv[ref_num - 1]` to
+  the affine-perspective `global_mv(g, x, y)` field. Round-331 unit-tested
+  `global_mv` as a pure function, but every existing
+  `pixel_pred` / `block_mc` / `motion_compensate` test used
+  `gmode: false`, so the §15.8.7 global arm and its propagation through
+  `block_mc` → OBMC weighting → §15.8.2 accumulation was never executed.
+  - `pixel_pred_global_mode_uses_global_mv_not_block_mv` drives an 8×8
+    distinct-per-cell reference through `pixel_pred` with a constant
+    `(2, 0)` global field (zero affine matrix + zero perspective collapses
+    `global_mv` to a uniform translation) and a deliberately wrong block
+    MV `(-4, -4)`; it asserts every interior fetch reads the reference two
+    columns to the right (the global vector) and explicitly rejects the
+    block-MV result.
+  - `motion_compensate_global_mode_shifts_reference_uniformly` runs a full
+    16×16 picture with every block `gmode = true` (and a bogus per-block
+    MV) through §15.8.2; since the §15.8.6 overlap weights sum to 64, the
+    zero-residue reconstruction reproduces the reference uniformly shifted
+    by the constant global field, and the test pins both the exact shift
+    and a non-identity displacement.
+  Sourced exclusively from `docs/video/dirac/dirac-spec-latest.pdf`
+  §15.8.7 / §15.8.8 / §15.8.2 / §15.8.6. No external library source, no
+  web search. Library test count: 239 → 241 (+2).
+
 - **§15.8.8 `global_mv` unit tests** (round-331) — four hand-computed
   cases lock in the affine-perspective global-motion vector field:
   pure pan/tilt (verifying the per-axis `b[0]`/`b[1]` translation),

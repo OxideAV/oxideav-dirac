@@ -756,6 +756,164 @@ mod tests {
         assert_eq!(global_mv(&g, 0, 0), (13, -19));
     }
 
+    /// §15.8.7 `pixel_pred` global-motion branch: when a block's
+    /// `gmode` flag is set, the predictor must fetch from the reference
+    /// using the per-pixel `global_mv(g, x, y)` vector (§15.8.8) and
+    /// **ignore** the block's own `mv[ref_num - 1]`. This pins the
+    /// `block.gmode` arm of `pixel_pred` that the existing
+    /// `motion_compensate_*` tests (all `gmode: false`) never reach.
+    #[test]
+    fn pixel_pred_global_mode_uses_global_mv_not_block_mv() {
+        use crate::picture_inter::{BlockData, GlobalParams, RefPredMode};
+        // 8x8 reference: distinct value per cell so a wrong fetch is
+        // visible. Stored signed (pre-offset), within 8-bit range.
+        let w = 8usize;
+        let h = 8usize;
+        let mut ref_plane = vec![0i32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                ref_plane[y * w + x] = (y as i32) * 8 + (x as i32) - 32;
+            }
+        }
+        // Zero affine matrix + zero perspective → global_mv collapses to
+        // a *constant* translation across the whole plane:
+        //   m = 1; ax = ay = 0; v0 = 1*(0 + 2^ez*b0); round = 2^ez;
+        //   v0 = (2^ez*b0 + 2^ez) >> ez = b0 + 1. Same for v1.
+        // With pan_tilt = (1, -1) the field is exactly (2, 0) everywhere.
+        let g = GlobalParams {
+            pan_tilt: (1, -1),
+            zrs: [[0, 0], [0, 0]],
+            zrs_exp: 0,
+            perspective: (0, 0),
+            persp_exp: 0,
+        };
+        assert_eq!(global_mv(&g, 0, 0), (2, 0));
+        assert_eq!(global_mv(&g, 5, 3), (2, 0), "field must be constant");
+        let global = Some(g);
+        // The block carries a *different* mv to prove gmode overrides it.
+        let block = BlockData {
+            rmode: RefPredMode::Ref1Only,
+            gmode: true,
+            mv: [(-4, -4); 2],
+            dc: [0; 3],
+        };
+        // mv_precision = 0 → integer-pel fetch: pred = ref[(y+dy)*w +
+        // (x+dx)] clamped. With the (2, 0) global field, every interior
+        // column reads two pixels to the right of the reference.
+        for y in 0..h {
+            for x in 0..(w - 2) {
+                let pred = pixel_pred(
+                    &ref_plane, w, h, None, &block, 1, x as i32, y as i32, false, 1, 1, 0, &global,
+                );
+                assert_eq!(
+                    pred,
+                    ref_plane[y * w + (x + 2)],
+                    "global fetch mismatch at ({x}, {y})"
+                );
+            }
+        }
+        // A regression that used block.mv (-4, -4) instead would clamp
+        // to the reference's top-left corner for the whole interior; the
+        // distinct-per-cell reference rejects that.
+        let pred_via_global = pixel_pred(
+            &ref_plane, w, h, None, &block, 1, 4, 4, false, 1, 1, 0, &global,
+        );
+        assert_ne!(pred_via_global, ref_plane[0], "must not use block.mv");
+    }
+
+    /// End-to-end §15.8.2 `motion_compensate` over a fully global-motion
+    /// picture: every block has `gmode = true`, so the reconstructed
+    /// picture (zero residue) is the reference uniformly shifted by the
+    /// constant global field. Exercises the global branch through the
+    /// full `block_mc` → OBMC-weighting → accumulation chain, which the
+    /// `gmode: false` smoke test never covers.
+    #[test]
+    fn motion_compensate_global_mode_shifts_reference_uniformly() {
+        use crate::picture_inter::{BlockData, GlobalParams, PictureMotionData, RefPredMode};
+        let w = 16usize;
+        let h = 16usize;
+        // Smooth horizontal ramp: constant along rows is irrelevant; the
+        // ramp varies with x so a +2 column shift is detectable. Values
+        // stay inside the 8-bit signed range, so no clipping occurs.
+        let mut ref_plane = vec![0i32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                ref_plane[y * w + x] = (x as i32) - 8;
+            }
+        }
+        // Constant (2, 0) global field (see the pixel_pred test).
+        let g = GlobalParams {
+            pan_tilt: (1, -1),
+            zrs: [[0, 0], [0, 0]],
+            zrs_exp: 0,
+            perspective: (0, 0),
+            persp_exp: 0,
+        };
+        assert_eq!(global_mv(&g, 7, 9), (2, 0));
+        let blocks_x = 4;
+        let blocks_y = 4;
+        let mut blocks = Vec::with_capacity((blocks_x * blocks_y) as usize);
+        for _ in 0..blocks_x * blocks_y {
+            blocks.push(BlockData {
+                rmode: RefPredMode::Ref1Only,
+                gmode: true,
+                // Bogus per-block mv; gmode must override it.
+                mv: [(7, 7); 2],
+                dc: [0; 3],
+            });
+        }
+        let motion = PictureMotionData {
+            blocks_x,
+            blocks_y,
+            superblocks_x: 1,
+            superblocks_y: 1,
+            sb_split: vec![2],
+            blocks,
+            global1: Some(g),
+            global2: None,
+        };
+        let params = McParams {
+            len_x: w,
+            len_y: h,
+            xblen: 8,
+            yblen: 8,
+            xbsep: 4,
+            ybsep: 4,
+            blocks_x,
+            blocks_y,
+            mv_precision: 0,
+            is_chroma: false,
+            chroma_h_ratio: 1,
+            chroma_v_ratio: 1,
+            refs_wt_precision: 1,
+            ref1_wt: 1,
+            ref2_wt: 1,
+            luma_depth: 8,
+            chroma_depth: 8,
+        };
+        let mut pic = vec![0i32; w * h];
+        motion_compensate(&mut pic, &params, &motion, Some((&ref_plane, w, h)), None);
+        // Interior pixels: the OBMC weights across overlapping blocks sum
+        // to 64, so a uniform-shift prediction reproduces exactly. Each
+        // interior pixel equals the reference column two to the right.
+        for y in 1..(h - 1) {
+            for x in 1..(w - 3) {
+                assert_eq!(
+                    pic[y * w + x],
+                    ref_plane[y * w + (x + 2)],
+                    "global-shift mismatch at ({x}, {y})"
+                );
+            }
+        }
+        // The result must differ from a plain copy of the reference,
+        // proving the global field actually displaced the fetch.
+        assert_ne!(
+            pic[8 * w + 5],
+            ref_plane[8 * w + 5],
+            "global motion produced no displacement"
+        );
+    }
+
     /// End-to-end MC smoke test: a single-block inter picture with a
     /// zero motion vector and zero residue should reproduce the
     /// reference exactly. We use a single superblock (1x1 split=2 → 4
