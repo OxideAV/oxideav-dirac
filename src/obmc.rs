@@ -268,9 +268,13 @@ pub fn global_mv(g: &GlobalParams, x: i32, y: i32) -> (i32, i32) {
     let m: i64 = (1i64 << ep) - (c.0 as i64 * x as i64 + c.1 as i64 * y as i64);
     let ax = a[0][0] as i64 * x as i64 + a[0][1] as i64 * y as i64;
     let ay = a[1][0] as i64 * x as i64 + a[1][1] as i64 * y as i64;
-    // Spec writes `+ 2^ez * b[0]` for both coords — typo in spec; we
-    // use b[0] for x and b[1] for y as libschro does (matches the
-    // mathematical model described in the note).
+    // The §15.8.8 pseudocode literally writes `2^ez * b[0]` in both the
+    // `v[0]` and `v[1]` lines, but `b` (PAN_TILT) is the two-component
+    // translation vector of the section's own mathematical model
+    // (`v = Ax + b`, with `b = (b[0], b[1])`): the horizontal component
+    // takes `b[0]` and the vertical component takes `b[1]`. Reusing
+    // `b[0]` for the vertical row is a transcription slip in the
+    // pseudocode — we apply the per-axis translation the model requires.
     let v0 = m * (ax + (1i64 << ez) * b.0 as i64);
     let v1 = m * (ay + (1i64 << ez) * b.1 as i64);
     let round = 1i64 << (ez + ep);
@@ -664,6 +668,92 @@ mod tests {
     fn chroma_mv_scale_halves_for_420() {
         assert_eq!(chroma_mv_scale((4, 6), 2, 2), (2, 3));
         assert_eq!(chroma_mv_scale((-3, -1), 2, 2), (-2, -1)); // floor division
+    }
+
+    /// §15.8.8 `global_mv`: the affine-perspective vector field.
+    ///
+    /// Each expected value is computed by hand from the §15.8.8
+    /// pseudocode (`m = 2^ep - c·x`; `v = m * (A·x + 2^ez * b)`; then
+    /// `v = (v + 2^(ez+ep)) >> (ez+ep)`), with the per-axis pan/tilt
+    /// translation `b = (b[0], b[1])` taken from the section's own
+    /// `v = Ax + b` model rather than the pseudocode's duplicated
+    /// `b[0]`.
+    #[test]
+    fn global_mv_pure_translation_uses_per_axis_pan_tilt() {
+        // m = 1 (no perspective), zoom matrix A = 4*I with ez = 2 so the
+        // affine part is unit-zoom (2^-ez * A = I). round = 2^2 = 4.
+        let g = GlobalParams {
+            pan_tilt: (8, -4),
+            zrs: [[4, 0], [0, 4]],
+            zrs_exp: 2,
+            perspective: (0, 0),
+            persp_exp: 0,
+        };
+        // (x, y) = (3, 5):
+        //   m   = 2^0 - 0 = 1
+        //   ax  = 4*3 + 0*5 = 12 ; ay = 0*3 + 4*5 = 20
+        //   v0  = 1 * (12 + 4*8)   = 44 -> (44 + 4) >> 2 = 12
+        //   v1  = 1 * (20 + 4*(-4)) = 4 -> ( 4 + 4) >> 2 =  2
+        assert_eq!(global_mv(&g, 3, 5), (12, 2));
+        // A regression that reused b[0] for the vertical row would give
+        // v1 = (20 + 4*8 + 4) >> 2 = 14, which this case rejects.
+    }
+
+    #[test]
+    fn global_mv_zoom_only_scales_position() {
+        // Pure zoom: A = 8*I with ez = 2 -> effective zoom factor 2.
+        // No pan/tilt, no perspective.
+        let g = GlobalParams {
+            pan_tilt: (0, 0),
+            zrs: [[8, 0], [0, 8]],
+            zrs_exp: 2,
+            perspective: (0, 0),
+            persp_exp: 0,
+        };
+        // (x, y) = (10, -6):
+        //   m  = 1
+        //   ax = 80 -> v0 = 80 -> (80 + 4) >> 2 = 21
+        //   ay = -48 -> v1 = -48 -> (-48 + 4) >> 2 = floor(-44/4) = -11
+        assert_eq!(global_mv(&g, 10, -6), (21, -11));
+    }
+
+    #[test]
+    fn global_mv_perspective_modulates_magnitude() {
+        // Perspective term: ep = 3 -> m = 2^3 - c·x. round = 2^(ez+ep).
+        let g = GlobalParams {
+            pan_tilt: (16, 0),
+            zrs: [[0, 0], [0, 0]],
+            zrs_exp: 1,
+            perspective: (2, 0),
+            persp_exp: 3,
+        };
+        // (x, y) = (2, 0):
+        //   m  = 2^3 - (2*2 + 0*0) = 8 - 4 = 4
+        //   ax = 0 ; v0 = 4 * (0 + 2^1 * 16) = 4 * 32 = 128
+        //   v1 = 4 * (0 + 2^1 * 0)  = 0
+        //   ez + ep = 4 -> round = 16
+        //   v0 = (128 + 16) >> 4 = 144 >> 4 = 9
+        //   v1 = (  0 + 16) >> 4 =  16 >> 4 = 1
+        assert_eq!(global_mv(&g, 2, 0), (9, 1));
+    }
+
+    #[test]
+    fn global_mv_origin_is_pure_pan_tilt() {
+        // At (0, 0) the affine matrix contributes nothing, so the
+        // result is the rounded, perspective-free pan/tilt vector.
+        let g = GlobalParams {
+            pan_tilt: (12, -20),
+            zrs: [[4, 1], [-2, 4]],
+            zrs_exp: 2,
+            perspective: (5, -3),
+            persp_exp: 0,
+        };
+        // (x, y) = (0, 0):
+        //   m  = 2^0 - 0 = 1
+        //   ax = 0 ; ay = 0
+        //   v0 = 1 * (0 + 2^2 * 12)   = 48 -> (48 + 4) >> 2 = 13
+        //   v1 = 1 * (0 + 2^2 * (-20)) = -80 -> (-80 + 4) >> 2 = -19
+        assert_eq!(global_mv(&g, 0, 0), (13, -19));
     }
 
     /// End-to-end MC smoke test: a single-block inter picture with a

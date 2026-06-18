@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **§15.8.8 `global_mv` unit tests** (round-331) — four hand-computed
+  cases lock in the affine-perspective global-motion vector field:
+  pure pan/tilt (verifying the per-axis `b[0]`/`b[1]` translation),
+  pure zoom (including a floor-shift on a negative vertical vector),
+  perspective magnitude modulation (`m = 2^ep − c·x`), and the
+  origin-degenerate case. Closes the lone untested branch in the
+  motion-compensation chain.
+
 - **Inter sequence driver — leaky-bucket VBV + VbvHysteresis residue
   rate control** (round-326) — `encoder_inter::InterRateControl` grows two
   variants beyond the round-320 `PerPicture` / `Cbr` pair, so the
