@@ -32,11 +32,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     *custom* ranges, `preset_idx = 0`) plus depth-aware sequence builders
     `make_minimal_sequence_with_signal_range` /
     `make_minimal_sequence_ld_with_signal_range`.
-  - `tests/encoder_high_bit_depth_roundtrip.rs` (5 tests): HQ 10-bit is
+  - `tests/encoder_high_bit_depth_roundtrip.rs` (7 tests): HQ 10-bit is
     bit-exact across all three chroma formats × six reversible wavelets;
     HQ 12-bit 4:2:0 is bit-exact (four wavelets); a flat mid-grey case
     isolates the §15.10 output offset; LD 10-bit 4:2:0 reconstructs at
-    ≥50 dB through the §13.5.1 DC-prediction slice path.
+    ≥50 dB through the §13.5.1 DC-prediction slice path; HQ 10-bit is
+    bit-exact across every spec-allowed `dwt_depth` (1..=5, depth 5 via a
+    custom matrix) and through the §12.4.4 asymmetric (horizontal-only)
+    transform (`dwt_depth_ho > 0`). The deeper 10-bit coefficient
+    magnitudes need a wider HQ `slice_size_scaler`, which the tests set.
 - **§15.8.7 `pixel_pred` / §15.8.2 `motion_compensate` global-motion
   branch coverage** (round-337) — two tests close the lone untested arm
   of the OBMC prediction chain: the `block.gmode == true` path that

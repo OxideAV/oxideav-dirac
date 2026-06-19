@@ -37,6 +37,7 @@ use oxideav_dirac::encoder::{
     make_minimal_sequence_ld_with_signal_range, make_minimal_sequence_with_signal_range,
     EncoderParams, LdEncoderParams,
 };
+use oxideav_dirac::quant::QuantMatrix;
 use oxideav_dirac::video_format::{ChromaFormat, SignalRange};
 use oxideav_dirac::wavelet::WaveletFilter;
 
@@ -251,6 +252,132 @@ fn hq_10bit_flat_midgrey_offset_is_exact() {
         "flat 10-bit mid-grey must reconstruct to 512 everywhere; got {:?}…",
         &gy[..8.min(gy.len())]
     );
+}
+
+/// Slice grid for a 64×64 4:2:0 picture at `dwt_depth`: each
+/// per-component slice dimension must stay an integer multiple of
+/// `2^dwt_depth` (§15.7). Depths 1..=3 tile 8×8; 4..=5 loosen to 2×2.
+fn slice_grid_64x64(dwt_depth: u32) -> (u32, u32) {
+    if dwt_depth <= 3 {
+        (8, 8)
+    } else {
+        (2, 2)
+    }
+}
+
+/// All-zero custom quant matrix sized to `dwt_depth + 1` levels — the
+/// §11.3.5 requirement for `dwt_depth = 5` (Annex E.1 defaults stop at
+/// depth 4). At qindex 0 every per-band quantiser collapses to the
+/// identity dead-zone, so reconstruction stays bit-exact.
+fn zero_matrix(dwt_depth: u32) -> QuantMatrix {
+    QuantMatrix {
+        dwt_depth,
+        dwt_depth_ho: 0,
+        levels: (0..=dwt_depth).map(|_| [0u32; 4]).collect(),
+    }
+}
+
+/// 10-bit HQ intra must be bit-exact at every spec-allowed `dwt_depth`
+/// (§11.3 range `1..=5`), not just the docs-corpus depths 3/4. Depths
+/// 1..=4 use the Annex E.1 default matrix; depth 5 requires a custom
+/// matrix. This proves the §15.7 multi-level IDWT recursion reconstructs
+/// the wider 10-bit range identically at every recursion depth.
+#[test]
+fn hq_10bit_bit_exact_across_all_dwt_depths() {
+    let (w, h) = (64u32, 64u32);
+    let sr = SignalRange::PRESET_10BIT_FULL;
+    let chroma = ChromaFormat::Yuv420;
+    let (cw, ch) = chroma_dims(w, h, chroma);
+    let seq = make_minimal_sequence_with_signal_range(w, h, chroma, sr);
+
+    for depth in 1u32..=5 {
+        let y = ramp_plane(w as usize, h as usize, 10, depth);
+        let u = ramp_plane(cw as usize, ch as usize, 10, depth + 20);
+        let v = ramp_plane(cw as usize, ch as usize, 10, depth + 40);
+        let (sx, sy) = slice_grid_64x64(depth);
+
+        // 10-bit coefficients are ~4× the 8-bit magnitude, so an HQ
+        // slice's per-component byte run can exceed the 255-unit length
+        // byte at scaler 1. A larger `slice_size_scaler` widens the
+        // length-byte unit (`len_byte * scaler` bytes) without changing
+        // the decoded coefficients — qindex 0 stays bit-exact.
+        let params = if depth <= 4 {
+            let mut p = EncoderParams::default_hq(WaveletFilter::LeGall5_3, depth);
+            p.slices_x = sx;
+            p.slices_y = sy;
+            p.slice_size_scaler = 8;
+            p
+        } else {
+            EncoderParams {
+                wavelet: WaveletFilter::LeGall5_3,
+                dwt_depth: 5,
+                slices_x: sx,
+                slices_y: sy,
+                slice_prefix_bytes: 0,
+                slice_size_scaler: 8,
+                quant_matrix: zero_matrix(5),
+                custom_quant_matrix: true,
+                qindex: 0,
+                slice_size_target: None,
+                major_version: 2,
+                extended_transform_override: None,
+            }
+        };
+
+        let stream = encode_single_hq_intra_stream_u16(&seq, &params, 0, &y, &u, &v);
+        let frame = decode_one(stream);
+        let gy = plane_as_u16(&frame.planes[0].data);
+        let gu = plane_as_u16(&frame.planes[1].data);
+        let gv = plane_as_u16(&frame.planes[2].data);
+        assert_planes_eq(&format!("HQ 10-bit depth {depth} Y"), &gy, &y);
+        assert_planes_eq(&format!("HQ 10-bit depth {depth} U"), &gu, &u);
+        assert_planes_eq(&format!("HQ 10-bit depth {depth} V"), &gv, &v);
+    }
+}
+
+/// 10-bit HQ intra through the §12.4.4 asymmetric (horizontal-only)
+/// transform: `dwt_depth_ho > 0` runs the §15.4.2 `h_synthesis` extra
+/// horizontal-only IDWT levels on top of the symmetric pyramid. The
+/// asymmetric path was decode-verified at 8-bit; this confirms the
+/// horizontal-only recursion also reconstructs the wider 10-bit range
+/// bit-exactly. `with_asymmetric_transform` installs the matching
+/// all-zero quant matrix (identity at qindex 0) and raises the v3 flag.
+#[test]
+fn hq_10bit_asymmetric_transform_bit_exact() {
+    let (w, h) = (64u32, 64u32);
+    let sr = SignalRange::PRESET_10BIT_FULL;
+    let chroma = ChromaFormat::Yuv420;
+    let (cw, ch) = chroma_dims(w, h, chroma);
+    let mut seq = make_minimal_sequence_with_signal_range(w, h, chroma, sr);
+    // The §12.4.4 extended_transform_parameters() block is gated on the
+    // *sequence* version major being 3 (the decoder dispatches on the
+    // header, not the per-picture params), so an asymmetric stream needs
+    // a v3 sequence header.
+    seq.parse_parameters.version_major = 3;
+
+    for (dwt_depth, ho, wavelet_ho) in [
+        (3u32, 1u32, WaveletFilter::LeGall5_3),
+        (2u32, 2u32, WaveletFilter::DeslauriersDubuc9_7),
+    ] {
+        let y = ramp_plane(w as usize, h as usize, 10, ho + 1);
+        let u = ramp_plane(cw as usize, ch as usize, 10, ho + 21);
+        let v = ramp_plane(cw as usize, ch as usize, 10, ho + 41);
+        let mut params = EncoderParams::default_hq(WaveletFilter::LeGall5_3, dwt_depth)
+            .with_asymmetric_transform(wavelet_ho, ho);
+        // Widen the length-byte unit for the deeper 10-bit coefficients
+        // (see `hq_10bit_bit_exact_across_all_dwt_depths`).
+        params.slice_size_scaler = 8;
+
+        let stream = encode_single_hq_intra_stream_u16(&seq, &params, 0, &y, &u, &v);
+        let frame = decode_one(stream);
+        let gy = plane_as_u16(&frame.planes[0].data);
+        let gu = plane_as_u16(&frame.planes[1].data);
+        let gv = plane_as_u16(&frame.planes[2].data);
+        let tag = format!("HQ 10-bit asym depth={dwt_depth} ho={ho} {wavelet_ho:?}");
+        assert_planes_eq(&format!("{tag} Y"), &gy, &y);
+        assert_planes_eq(&format!("{tag} U"), &gu, &u);
+        assert_planes_eq(&format!("{tag} V"), &gv, &v);
+    }
 }
 
 /// The full-range presets must derive the depth the spec's §10.5.2
