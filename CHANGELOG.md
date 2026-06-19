@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **High-bit-depth (10/12-bit) intra encode → decode round-trip
+  coverage** (round-345) — closes the `docs/video/dirac/dirac-fixtures-
+  and-traces.md` "bit depths > 8" corpus gap on the **decode** side. The
+  decoder's §10.5.2 `video_depth`-parameterised reconstruction (§15.9
+  clip + §15.10 output offset + 16-bit LE plane packing) was correct but
+  untested past 8 bits, because every upstream fixture is 8-bit and the
+  encoder API only accepted `&[u8]`.
+  - New `&[u16]` encode entry points so deeper samples reach the forward
+    DWT unclipped: `encode_hq_intra_picture_u16`,
+    `encode_single_hq_intra_stream_u16`, `encode_ld_intra_picture_u16`,
+    `encode_single_ld_intra_stream_u16`. The forward-transform helpers
+    were refactored to share a sample-width-agnostic core
+    (`forward_component_with` / `forward_component_ld_with`) and the
+    slice-packing loops to take pre-built `i32` coefficient pyramids
+    (`encode_hq_intra_picture_from_pyramids` /
+    `encode_ld_intra_picture_from_pyramids`); the existing `&[u8]` paths
+    delegate unchanged.
+  - New full-range signal-range presets `SignalRange::PRESET_10BIT_FULL`
+    / `PRESET_12BIT_FULL` (offset/excursion centred so a full
+    `[0, 2^N-1]` component round-trips symmetrically; emitted as §10.3.8
+    *custom* ranges, `preset_idx = 0`) plus depth-aware sequence builders
+    `make_minimal_sequence_with_signal_range` /
+    `make_minimal_sequence_ld_with_signal_range`.
+  - `tests/encoder_high_bit_depth_roundtrip.rs` (5 tests): HQ 10-bit is
+    bit-exact across all three chroma formats × six reversible wavelets;
+    HQ 12-bit 4:2:0 is bit-exact (four wavelets); a flat mid-grey case
+    isolates the §15.10 output offset; LD 10-bit 4:2:0 reconstructs at
+    ≥50 dB through the §13.5.1 DC-prediction slice path.
 - **§15.8.7 `pixel_pred` / §15.8.2 `motion_compensate` global-motion
   branch coverage** (round-337) — two tests close the lone untested arm
   of the OBMC prediction chain: the `block.gmode == true` path that

@@ -94,6 +94,35 @@ impl SignalRange {
         chroma_excursion: 3584,
     };
 
+    /// Full-range 10-bit signal range — the 10-bit analogue of
+    /// [`Self::PRESET_8BIT_FULL`]. Not one of the four Table 10.5 presets
+    /// (it is emitted as a §10.3.8 *custom* signal range, `preset_idx = 0`,
+    /// carrying the four offset/excursion fields explicitly), but it is
+    /// the natural target for round-tripping a full 10-bit `[0, 1023]`
+    /// component: §10.5.2 `video_depth = intlog2(1023 + 1) = 10`, and the
+    /// `luma_offset = 2^9` / `chroma_offset = 2^9` centring matches the
+    /// §15.10 output offset `2^(bit_depth-1)` exactly, so an unsigned
+    /// `[0, 1023]` input maps symmetrically to the bi-polar internal
+    /// `[-512, 511]` range and reconstructs without bias.
+    pub const PRESET_10BIT_FULL: Self = Self {
+        luma_offset: 512,
+        luma_excursion: 1023,
+        chroma_offset: 512,
+        chroma_excursion: 1023,
+    };
+
+    /// Full-range 12-bit signal range — the 12-bit analogue of
+    /// [`Self::PRESET_8BIT_FULL`]. Emitted as a custom signal range
+    /// (`preset_idx = 0`). §10.5.2 `video_depth = intlog2(4095 + 1) = 12`;
+    /// the `2^11` offsets match the §15.10 output offset so a full
+    /// `[0, 4095]` component round-trips symmetrically.
+    pub const PRESET_12BIT_FULL: Self = Self {
+        luma_offset: 2048,
+        luma_excursion: 4095,
+        chroma_offset: 2048,
+        chroma_excursion: 4095,
+    };
+
     pub fn preset(index: u32) -> Option<Self> {
         match index {
             1 => Some(Self::PRESET_8BIT_FULL),

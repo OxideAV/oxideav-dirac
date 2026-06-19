@@ -317,6 +317,53 @@ pub fn encode_hq_intra_picture(
     u: &[u8],
     v: &[u8],
 ) -> Vec<u8> {
+    let luma_w = sequence.luma_width;
+    let luma_h = sequence.luma_height;
+    let chroma_w = sequence.chroma_width;
+    let chroma_h = sequence.chroma_height;
+    let y_py = forward_component(y, luma_w, luma_h, sequence.luma_depth, params);
+    let u_py = forward_component(u, chroma_w, chroma_h, sequence.chroma_depth, params);
+    let v_py = forward_component(v, chroma_w, chroma_h, sequence.chroma_depth, params);
+    encode_hq_intra_picture_from_pyramids(sequence, params, picture_number, &y_py, &u_py, &v_py)
+}
+
+/// `&[u16]` variant of [`encode_hq_intra_picture`] for 10-/12-bit
+/// streams. The component depths come from `sequence.luma_depth` /
+/// `sequence.chroma_depth` (set from the §10.3.8 signal range by
+/// [`make_minimal_sequence_with_signal_range`]); samples are read as
+/// `u16` and recentred by `2^(depth-1)` before the forward DWT, leaving
+/// the slice-packing path unchanged — coefficients are already `i32`.
+pub fn encode_hq_intra_picture_u16(
+    sequence: &SequenceHeader,
+    params: &EncoderParams,
+    picture_number: u32,
+    y: &[u16],
+    u: &[u16],
+    v: &[u16],
+) -> Vec<u8> {
+    let luma_w = sequence.luma_width;
+    let luma_h = sequence.luma_height;
+    let chroma_w = sequence.chroma_width;
+    let chroma_h = sequence.chroma_height;
+    let y_py = forward_component_u16(y, luma_w, luma_h, sequence.luma_depth, params);
+    let u_py = forward_component_u16(u, chroma_w, chroma_h, sequence.chroma_depth, params);
+    let v_py = forward_component_u16(v, chroma_w, chroma_h, sequence.chroma_depth, params);
+    encode_hq_intra_picture_from_pyramids(sequence, params, picture_number, &y_py, &u_py, &v_py)
+}
+
+/// Slice-packing core shared by [`encode_hq_intra_picture`] and
+/// [`encode_hq_intra_picture_u16`]. Takes the three already-built
+/// *unquantised* forward-DWT coefficient pyramids; everything below the
+/// forward transform (qindex search, HQ slice emission) is sample-width
+/// agnostic.
+fn encode_hq_intra_picture_from_pyramids(
+    sequence: &SequenceHeader,
+    params: &EncoderParams,
+    picture_number: u32,
+    y_py: &[[SubbandData; 4]],
+    u_py: &[[SubbandData; 4]],
+    v_py: &[[SubbandData; 4]],
+) -> Vec<u8> {
     let mut w = BitWriter::new();
 
     // §12.2 picture_header: byte-align then 4-byte picture_number.
@@ -328,17 +375,10 @@ pub fn encode_hq_intra_picture(
     write_transform_parameters(&mut w, params);
     w.byte_align();
 
-    // Per-component coefficient pyramids.
     let luma_w = sequence.luma_width;
     let luma_h = sequence.luma_height;
     let chroma_w = sequence.chroma_width;
     let chroma_h = sequence.chroma_height;
-
-    // Keep the *unquantised* coefficient pyramids — each slice may pick
-    // its own qindex (§13.5.4) and quantise its own region on the fly.
-    let y_py = forward_component(y, luma_w, luma_h, sequence.luma_depth, params);
-    let u_py = forward_component(u, chroma_w, chroma_h, sequence.chroma_depth, params);
-    let v_py = forward_component(v, chroma_w, chroma_h, sequence.chroma_depth, params);
 
     // Precompute per-level subband sizes for each component.
     let luma_dims = component_dims(luma_w, luma_h, params.dwt_depth, params.dwt_depth_ho());
@@ -356,9 +396,9 @@ pub fn encode_hq_intra_picture(
                     params,
                     sx,
                     sy,
-                    &y_py,
-                    &u_py,
-                    &v_py,
+                    y_py,
+                    u_py,
+                    v_py,
                     &luma_dims,
                     &chroma_dims,
                     target,
@@ -370,9 +410,9 @@ pub fn encode_hq_intra_picture(
                 qindex,
                 sx,
                 sy,
-                &y_py,
-                &u_py,
-                &v_py,
+                y_py,
+                u_py,
+                v_py,
                 &luma_dims,
                 &chroma_dims,
             );
@@ -857,6 +897,37 @@ fn forward_component(
     depth: u32,
     params: &EncoderParams,
 ) -> Vec<[SubbandData; 4]> {
+    forward_component_with(comp_w, comp_h, depth, params, |idx| plane[idx] as i32)
+}
+
+/// `&[u16]` variant of [`forward_component`] for streams whose samples
+/// exceed 8 bits (10-/12-bit `signal_range`). The `depth` is the §10.5.2
+/// `LUMA_DEPTH` / `CHROMA_DEPTH` derived from the range's excursion, and
+/// the unsigned `[0, 2^depth - 1]` input is recentred by `2^(depth-1)` —
+/// exactly the §15.10 output offset the decoder adds back — so the
+/// forward DWT sees the same bi-polar signal the inverse DWT will clip.
+fn forward_component_u16(
+    plane: &[u16],
+    comp_w: u32,
+    comp_h: u32,
+    depth: u32,
+    params: &EncoderParams,
+) -> Vec<[SubbandData; 4]> {
+    forward_component_with(comp_w, comp_h, depth, params, |idx| plane[idx] as i32)
+}
+
+/// Shared core of [`forward_component`] / [`forward_component_u16`]:
+/// `fetch(idx)` reads the unsigned sample at the *unpadded* raster index
+/// `idx`, which the caller's slice type widens to `i32`. Edge-extension,
+/// the `2^(depth-1)` recentre, and the (optional asymmetric) forward DWT
+/// are identical regardless of the sample width.
+fn forward_component_with(
+    comp_w: u32,
+    comp_h: u32,
+    depth: u32,
+    params: &EncoderParams,
+    fetch: impl Fn(usize) -> i32,
+) -> Vec<[SubbandData; 4]> {
     let ho = params.dwt_depth_ho();
     let (pw, ph) = padded_component_dims_ho(comp_w, comp_h, params.dwt_depth, ho);
     let half: i32 = 1i32 << (depth - 1);
@@ -865,7 +936,7 @@ fn forward_component(
         for x in 0..pw {
             let src_x = x.min(comp_w as usize - 1);
             let src_y = y.min(comp_h as usize - 1);
-            let v = plane[src_y * comp_w as usize + src_x] as i32 - half;
+            let v = fetch(src_y * comp_w as usize + src_x) - half;
             pic.set(y, x, v);
         }
     }
@@ -1209,6 +1280,38 @@ pub fn encode_single_hq_intra_stream(
     out
 }
 
+/// `&[u16]` variant of [`encode_single_hq_intra_stream`] for a 10-/12-bit
+/// component (`sequence.luma_depth` / `chroma_depth` > 8). Produces the
+/// same `[sequence_header][HQ intra 0xE8][end-of-sequence]` layout; the
+/// only difference is the deeper input samples flow through
+/// [`encode_hq_intra_picture_u16`]. Pair with
+/// [`make_minimal_sequence_with_signal_range`] so the §10.3.8 signal
+/// range the decoder reads back matches the sample depth.
+pub fn encode_single_hq_intra_stream_u16(
+    sequence: &SequenceHeader,
+    params: &EncoderParams,
+    picture_number: u32,
+    y: &[u16],
+    u: &[u16],
+    v: &[u16],
+) -> Vec<u8> {
+    let sh_payload = encode_sequence_header(sequence);
+    let pic_payload = encode_hq_intra_picture_u16(sequence, params, picture_number, y, u, v);
+
+    let pi_size = 13usize;
+    let sh_unit_len = pi_size + sh_payload.len();
+    let pic_unit_len = pi_size + pic_payload.len();
+    let eos_unit_len = pi_size;
+
+    let mut out = Vec::with_capacity(sh_unit_len + pic_unit_len + eos_unit_len);
+    write_parse_info(&mut out, 0x00, sh_unit_len as u32, 0);
+    out.extend_from_slice(&sh_payload);
+    write_parse_info(&mut out, 0xE8, pic_unit_len as u32, sh_unit_len as u32);
+    out.extend_from_slice(&pic_payload);
+    write_parse_info(&mut out, 0x10, 0, pic_unit_len as u32);
+    out
+}
+
 /// Build a minimal sequence header describing an `WxH` progressive
 /// 4:2:0 8-bit stream (or 4:4:4 / 4:2:2 depending on `chroma`).
 ///
@@ -1249,9 +1352,30 @@ fn make_minimal_sequence_for(
     chroma: ChromaFormat,
     profile: u32,
 ) -> SequenceHeader {
+    use crate::video_format::SignalRange;
+    make_minimal_sequence_for_sr(
+        frame_width,
+        frame_height,
+        chroma,
+        profile,
+        SignalRange::PRESET_8BIT_FULL,
+    )
+}
+
+/// `make_minimal_sequence_for` with an explicit §10.3.8 signal range, so
+/// the same custom-format scaffold can describe a 10- or 12-bit stream.
+/// The §10.5.2 luma/chroma depths are derived from the range's
+/// excursions (`intlog2(excursion + 1)`), exactly as the decoder does on
+/// the way back in.
+fn make_minimal_sequence_for_sr(
+    frame_width: u32,
+    frame_height: u32,
+    chroma: ChromaFormat,
+    profile: u32,
+    signal_range: crate::video_format::SignalRange,
+) -> SequenceHeader {
     use crate::sequence::{ParseParameters, PictureCodingMode, VideoParams};
-    use crate::video_format::{ScanFormat, SignalRange};
-    let signal_range = SignalRange::PRESET_8BIT_FULL;
+    use crate::video_format::ScanFormat;
     let vp = VideoParams {
         frame_width,
         frame_height,
@@ -1288,9 +1412,38 @@ fn make_minimal_sequence_for(
         luma_height: frame_height,
         chroma_width: chroma_w,
         chroma_height: chroma_h,
-        luma_depth: 8,
-        chroma_depth: 8,
+        luma_depth: intlog2_ceil_u32(signal_range.luma_excursion + 1),
+        chroma_depth: intlog2_ceil_u32(signal_range.chroma_excursion + 1),
     }
+}
+
+/// [`make_minimal_sequence`] with an explicit §10.3.8 signal range — the
+/// HQ-profile (profile = 3) custom-format scaffold for streams deeper
+/// than 8 bit. Pass [`crate::video_format::SignalRange::PRESET_10BIT_FULL`] /
+/// [`crate::video_format::SignalRange::PRESET_12BIT_FULL`] (or any custom
+/// range) to describe a 10-/12-bit component; the §10.5.2 luma/chroma
+/// depths follow from the excursions. Use the matching `&[u16]` encode
+/// entry [`encode_single_hq_intra_stream_u16`] so the deeper samples reach
+/// the forward DWT unclipped.
+pub fn make_minimal_sequence_with_signal_range(
+    frame_width: u32,
+    frame_height: u32,
+    chroma: ChromaFormat,
+    signal_range: crate::video_format::SignalRange,
+) -> SequenceHeader {
+    make_minimal_sequence_for_sr(frame_width, frame_height, chroma, 3, signal_range)
+}
+
+/// LD-profile (profile = 0) analogue of
+/// [`make_minimal_sequence_with_signal_range`], for deeper-than-8-bit
+/// streams emitted via [`encode_single_ld_intra_stream_u16`].
+pub fn make_minimal_sequence_ld_with_signal_range(
+    frame_width: u32,
+    frame_height: u32,
+    chroma: ChromaFormat,
+    signal_range: crate::video_format::SignalRange,
+) -> SequenceHeader {
+    make_minimal_sequence_for_sr(frame_width, frame_height, chroma, 0, signal_range)
 }
 
 /// Build a sequence header that fits an Annex C preset exactly
@@ -1597,6 +1750,49 @@ pub fn encode_ld_intra_picture(
     u: &[u8],
     v: &[u8],
 ) -> Vec<u8> {
+    let luma_w = sequence.luma_width;
+    let luma_h = sequence.luma_height;
+    let chroma_w = sequence.chroma_width;
+    let chroma_h = sequence.chroma_height;
+    let y_py = forward_component_ld(y, luma_w, luma_h, sequence.luma_depth, params);
+    let u_py = forward_component_ld(u, chroma_w, chroma_h, sequence.chroma_depth, params);
+    let v_py = forward_component_ld(v, chroma_w, chroma_h, sequence.chroma_depth, params);
+    encode_ld_intra_picture_from_pyramids(sequence, params, picture_number, y_py, u_py, v_py)
+}
+
+/// `&[u16]` variant of [`encode_ld_intra_picture`] for 10-/12-bit LD
+/// streams. Mirrors the u8 path exactly below the forward DWT; the
+/// component depths come from `sequence.luma_depth` / `chroma_depth`.
+pub fn encode_ld_intra_picture_u16(
+    sequence: &SequenceHeader,
+    params: &LdEncoderParams,
+    picture_number: u32,
+    y: &[u16],
+    u: &[u16],
+    v: &[u16],
+) -> Vec<u8> {
+    let luma_w = sequence.luma_width;
+    let luma_h = sequence.luma_height;
+    let chroma_w = sequence.chroma_width;
+    let chroma_h = sequence.chroma_height;
+    let y_py = forward_component_ld_u16(y, luma_w, luma_h, sequence.luma_depth, params);
+    let u_py = forward_component_ld_u16(u, chroma_w, chroma_h, sequence.chroma_depth, params);
+    let v_py = forward_component_ld_u16(v, chroma_w, chroma_h, sequence.chroma_depth, params);
+    encode_ld_intra_picture_from_pyramids(sequence, params, picture_number, y_py, u_py, v_py)
+}
+
+/// Slice-packing core shared by [`encode_ld_intra_picture`] and
+/// [`encode_ld_intra_picture_u16`]: forward quantisation, §13.5.1 DC
+/// prediction subtraction, and per-slice emission — all sample-width
+/// agnostic since the pyramids are already `i32`.
+fn encode_ld_intra_picture_from_pyramids(
+    sequence: &SequenceHeader,
+    params: &LdEncoderParams,
+    picture_number: u32,
+    y_py: Vec<[SubbandData; 4]>,
+    u_py: Vec<[SubbandData; 4]>,
+    v_py: Vec<[SubbandData; 4]>,
+) -> Vec<u8> {
     let mut w = BitWriter::new();
 
     // §12.2 picture_header.
@@ -1608,16 +1804,10 @@ pub fn encode_ld_intra_picture(
     write_ld_transform_parameters(&mut w, params);
     w.byte_align();
 
-    // Per-component coefficient pyramids (forward DWT + forward
-    // quantisation + forward DC-prediction subtraction on LL).
     let luma_w = sequence.luma_width;
     let luma_h = sequence.luma_height;
     let chroma_w = sequence.chroma_width;
     let chroma_h = sequence.chroma_height;
-
-    let y_py = forward_component_ld(y, luma_w, luma_h, sequence.luma_depth, params);
-    let u_py = forward_component_ld(u, chroma_w, chroma_h, sequence.chroma_depth, params);
-    let v_py = forward_component_ld(v, chroma_w, chroma_h, sequence.chroma_depth, params);
 
     let q_per_level = slice_quantisers(params.qindex, &params.quant_matrix);
     let mut y_qpy = quantise_pyramid_ld(&y_py, &q_per_level);
@@ -2478,6 +2668,30 @@ fn forward_component_ld(
     depth: u32,
     params: &LdEncoderParams,
 ) -> Vec<[SubbandData; 4]> {
+    forward_component_ld_with(comp_w, comp_h, depth, params, |idx| plane[idx] as i32)
+}
+
+/// `&[u16]` variant of [`forward_component_ld`] for 10-/12-bit LD streams.
+fn forward_component_ld_u16(
+    plane: &[u16],
+    comp_w: u32,
+    comp_h: u32,
+    depth: u32,
+    params: &LdEncoderParams,
+) -> Vec<[SubbandData; 4]> {
+    forward_component_ld_with(comp_w, comp_h, depth, params, |idx| plane[idx] as i32)
+}
+
+/// Shared core of [`forward_component_ld`] / [`forward_component_ld_u16`]
+/// — the LD analogue of [`forward_component_with`]. Sample-width agnostic
+/// below the `fetch` accessor.
+fn forward_component_ld_with(
+    comp_w: u32,
+    comp_h: u32,
+    depth: u32,
+    params: &LdEncoderParams,
+    fetch: impl Fn(usize) -> i32,
+) -> Vec<[SubbandData; 4]> {
     let ho = params.dwt_depth_ho();
     let (pw, ph) = padded_component_dims_ho(comp_w, comp_h, params.dwt_depth, ho);
     let half: i32 = 1i32 << (depth - 1);
@@ -2486,7 +2700,7 @@ fn forward_component_ld(
         for x in 0..pw {
             let src_x = x.min(comp_w as usize - 1);
             let src_y = y.min(comp_h as usize - 1);
-            let v = plane[src_y * comp_w as usize + src_x] as i32 - half;
+            let v = fetch(src_y * comp_w as usize + src_x) - half;
             pic.set(y, x, v);
         }
     }
@@ -2780,6 +2994,36 @@ pub fn encode_single_ld_intra_stream(
     write_parse_info(&mut out, 0x00, sh_unit_len as u32, 0);
     out.extend_from_slice(&sh_payload);
     // 0xC8 — LD non-reference intra picture.
+    write_parse_info(&mut out, 0xC8, pic_unit_len as u32, sh_unit_len as u32);
+    out.extend_from_slice(&pic_payload);
+    write_parse_info(&mut out, 0x10, 0, pic_unit_len as u32);
+    out
+}
+
+/// `&[u16]` variant of [`encode_single_ld_intra_stream`] for a 10-/12-bit
+/// LD stream (`sequence.luma_depth` / `chroma_depth` > 8). Same
+/// `[sequence_header][LD intra 0xC8][end-of-sequence]` layout; the deeper
+/// samples flow through [`encode_ld_intra_picture_u16`]. Pair with
+/// [`make_minimal_sequence_ld_with_signal_range`].
+pub fn encode_single_ld_intra_stream_u16(
+    sequence: &SequenceHeader,
+    params: &LdEncoderParams,
+    picture_number: u32,
+    y: &[u16],
+    u: &[u16],
+    v: &[u16],
+) -> Vec<u8> {
+    let sh_payload = encode_sequence_header(sequence);
+    let pic_payload = encode_ld_intra_picture_u16(sequence, params, picture_number, y, u, v);
+
+    let pi_size = 13usize;
+    let sh_unit_len = pi_size + sh_payload.len();
+    let pic_unit_len = pi_size + pic_payload.len();
+    let eos_unit_len = pi_size;
+
+    let mut out = Vec::with_capacity(sh_unit_len + pic_unit_len + eos_unit_len);
+    write_parse_info(&mut out, 0x00, sh_unit_len as u32, 0);
+    out.extend_from_slice(&sh_payload);
     write_parse_info(&mut out, 0xC8, pic_unit_len as u32, sh_unit_len as u32);
     out.extend_from_slice(&pic_payload);
     write_parse_info(&mut out, 0x10, 0, pic_unit_len as u32);

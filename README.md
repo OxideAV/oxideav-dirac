@@ -26,6 +26,7 @@ core syntax, and the VC-2 v3 fragmented-picture path.
 | Arithmetic decoder | Binary multi-context engine + probability LUT (Annex B) |
 | Wavelet transforms | Inverse DWT (all 7 filters) + §13.3 intra DC prediction + §15.4 asymmetric (horizontal-only) IDWT (`idwt_with_ho`) |
 | VC-2 / Dirac intra **decode** | Full coefficient decode, bit-exact on the intra-only docs-corpus fixtures (LD + core-syntax, 4:2:0 + 4:2:2, depth 3 + 4). The §12.4.4 asymmetric transform decodes end-to-end (custom and Annex D default quant matrices) |
+| High-bit-depth intra **decode** | §10.5.2 `video_depth`-parameterised reconstruction proven end-to-end at 10-bit (HQ, all 3 chromas × 6 reversible wavelets, bit-exact) and 12-bit (HQ 4:2:0, bit-exact) via full-range `&[u16]` encode → decode round-trips — closes the docs-corpus "bit depths > 8" gap on the decode side |
 | Dirac core-syntax inter **decode** | OBMC motion compensation + §11.3 residue; the two inter ReportOnly fixtures are bit-exact, interlaced LeGall-5,3 inter at ~99.7% pixel-exact |
 | VC-2 v3 fragmented pictures | §14.2 fragment headers, §14.3/§14.4 reassembly, §14.5 trailing DC kick, and the `FragmentedPictureDecoder` driver — bit-exact-equivalent to the non-fragmented path on LD and HQ, including the asymmetric transform |
 
@@ -33,7 +34,7 @@ core syntax, and the VC-2 v3 fragmented-picture path.
 
 | Area | State |
 |------|-------|
-| VC-2 HQ intra | 8/10-bit, 4:2:0/4:2:2/4:4:4, 6 wavelets, all spec-allowed `dwt_depth` (1..=5), optional custom quant matrix, per-slice / picture-level rate control (PerPicture / CBR / VBV / VBV-hysteresis), asymmetric transform emission, slice-prefix bytes |
+| VC-2 HQ intra | 8/10/12-bit (deeper samples via the `&[u16]` `encode_single_hq_intra_stream_u16` entry + `PRESET_{10,12}BIT_FULL` signal ranges), 4:2:0/4:2:2/4:4:4, 6 wavelets, all spec-allowed `dwt_depth` (1..=5), optional custom quant matrix, per-slice / picture-level rate control (PerPicture / CBR / VBV / VBV-hysteresis), asymmetric transform emission, slice-prefix bytes |
 | VC-2 LD intra | Same axis + rate-control coverage as HQ; bit-exact at q=0 against the reference oracle |
 | Dirac core-syntax intra | AC-coded (`0x0C`) + VLC (`0x4C`) encoders, near-lossless at q=0, optional §11.3.3 spatial-partition codeblock grid with per-codeblock differential quantiser |
 | Dirac inter | 1-ref P (`0x09`) and 2-ref bipred B (`0x0A`); sub-pel ME (qpel default), OBMC-aware ME refinement, per-block reference-mode + adaptive sub-pel/integer-pel selection, §11.3 wavelet residue (bit-exact self-roundtrip at q=0), inter-residue rate-control qindex picker, **multi-picture inter sequence driver** (HQ intra anchor + N `0x09` pictures, with PerPicture / Cbr / leaky-bucket Vbv / drain-limited VbvHysteresis residue-byte rate control — the full four-variant set the HQ/LD intra drivers carry) |
