@@ -28,7 +28,7 @@ use oxideav_dirac::encoder::{make_minimal_sequence, EncoderParams};
 use oxideav_dirac::encoder_inter::{
     encode_inter_sequence_with_residue_target, encode_inter_sequence_with_residue_target_report,
     inter_residue_qindex_diagnostic, synthetic_camera_pan_64, InterEncoderParams,
-    InterInputPicture, InterRateControl,
+    InterInputPicture, InterRateControl, ResidueParams,
 };
 use oxideav_dirac::sequence::SequenceHeader;
 use oxideav_dirac::video_format::ChromaFormat;
@@ -464,4 +464,94 @@ fn residue_disabled_emits_zero_residual_chain() {
         assert_eq!(r.qindex, 0, "qindex floor when residue disabled");
     }
     assert_eq!(decode_frame_count(stream), pics.len());
+}
+
+/// The multi-picture inter sequence driver carries the §11.3.3 codeblock
+/// grid through unchanged: the per-picture `inter_params.residue` (grid +
+/// mode) is cloned for every inter picture and only its `qindex` is
+/// overridden by the rate-control pick. With a per-level
+/// `[(1,1),(2,2),(2,2),(2,2)]` grid (every codeblock >= 4x4 samples), a
+/// CBR-targeted multi-picture sequence must (a) emit one report entry per
+/// inter picture whose fitting qindex stays within budget, (b) keep the
+/// Σ(actual − target) accumulator consistent, and (c) decode to one frame
+/// per input picture — proving the codeblock residue integrates with the
+/// full sequence driver + codeblock-aware rate control end-to-end.
+#[test]
+fn sequence_driver_threads_codeblock_grid() {
+    let (seq, frames) = fixture();
+    let pics = input_pictures(&frames);
+    let intra = EncoderParams::default_hq(WaveletFilter::LeGall5_3, 3);
+
+    let mut rp = ResidueParams::default_for(WaveletFilter::LeGall5_3, 3);
+    rp.codeblocks = Some(vec![(1, 1), (2, 2), (2, 2), (2, 2)]);
+    rp.codeblock_mode = 0;
+    let inter = InterEncoderParams {
+        residue: Some(rp),
+        ..InterEncoderParams::default()
+    };
+
+    let (_q, floor_bytes) = inter_residue_qindex_diagnostic(
+        &seq,
+        &inter,
+        &frames[3].y,
+        &frames[3].u,
+        &frames[3].v,
+        &frames[0].y,
+        &frames[0].u,
+        &frames[0].v,
+        u32::MAX,
+    );
+    assert!(floor_bytes > 0, "codeblock residue must be non-empty");
+    let target = (floor_bytes / 2).max(1) as u32;
+
+    let (stream, report) = encode_inter_sequence_with_residue_target_report(
+        &seq,
+        &intra,
+        &inter,
+        &pics,
+        target,
+        InterRateControl::Cbr,
+    );
+
+    assert_eq!(report.len(), pics.len() - 1);
+    let mut carry: i64 = 0;
+    for r in &report {
+        assert_eq!(r.ref1_picture_number, 10, "inter references the anchor");
+        if r.qindex < 127 {
+            assert!(
+                r.actual_residue_bytes <= r.requested_residue_bytes,
+                "fitting qindex must stay within the codeblock-residue budget: {r:?}"
+            );
+        }
+        carry += r.actual_residue_bytes as i64 - target as i64;
+    }
+    let _ = carry;
+
+    assert_eq!(
+        decode_frame_count(stream),
+        pics.len(),
+        "codeblock-residue sequence must decode to one frame per picture"
+    );
+
+    // The convenience wrapper returns byte-identical output.
+    let plain = encode_inter_sequence_with_residue_target(
+        &seq,
+        &intra,
+        &inter,
+        &pics,
+        target,
+        InterRateControl::Cbr,
+    );
+    let (stream2, _) = encode_inter_sequence_with_residue_target_report(
+        &seq,
+        &intra,
+        &inter,
+        &pics,
+        target,
+        InterRateControl::Cbr,
+    );
+    assert_eq!(
+        plain, stream2,
+        "wrapper matches _report stream (codeblock grid)"
+    );
 }

@@ -67,6 +67,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (previously it always measured the flat single-codeblock layout, which
   would mis-size a codeblock-partitioned residue). New regression:
   `tests/encoder_inter_residue_rate.rs::picker_accounts_for_codeblock_grid`.
+  The multi-picture inter sequence driver
+  (`encode_inter_sequence_with_residue_target[_report]`) already threads
+  `ResidueParams.codeblocks` + `codeblock_mode` through every inter
+  picture (it clones the residue config and overrides only `qindex`), so
+  codeblock residue now integrates end-to-end with the four-variant
+  (PerPicture / Cbr / Vbv / VbvHysteresis) rate control — pinned by
+  `tests/encoder_inter_sequence_rate.rs::sequence_driver_threads_codeblock_grid`.
 
 - **High-bit-depth (10/12-bit) intra encode → decode round-trip
   coverage** (round-345) — closes the `docs/video/dirac/dirac-fixtures-
