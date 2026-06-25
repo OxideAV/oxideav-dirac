@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **§11.3.3 spatial-partition (codeblock grid) for the inter-residue
+  encoder** (round-370) — closes the lib-doc "still unsupported:
+  per-codeblock partitioning for the residue path" gap. The §11.3
+  wavelet-residue path now accepts an optional per-level
+  `(codeblocks_x, codeblocks_y)` grid (`ResidueParams::codeblocks`) plus
+  `ResidueParams::codeblock_mode`, the inter-residue analogue of the
+  core-intra encoder's spatial partition. Each HL/LH/HH subband splits
+  into a grid of codeblocks, each carrying a §13.4.3.3 `ZERO_BLOCK` skip
+  flag and, under `codeblock_mode == 1`, a §13.4.3.4 differential
+  quantiser offset; the running quantiser accumulates by reference only
+  across non-skipped codeblocks (§13.4.3.2). The emitter
+  (`write_residue_transform_parameters` now serialises the grid + mode;
+  the new codeblock walk requantises each codeblock in place at its
+  running quantiser) is a **byte-for-byte mirror** of the proven
+  core-intra `encode_subband_ac` — a new lib unit test
+  (`cb_residue_bytes_match_intra_core_byte_for_byte`) asserts the two
+  emit identical AC bytes on an identical band + grid. The decoder reads
+  it through the shared `picture_core::decode_subband` walk
+  (`spatial_partition_flag` already round-tripped on the decode side).
+  With reversible LeGall 5/3 at `qindex = 0` the residue round-trips
+  bit-exactly whenever every codeblock is ≥ 4×4 samples; sub-4×4-sample
+  codeblocks carry the same near-lossless §B.2.7.1 AC-terminator
+  roughness the core-intra path documents (an encoder-terminator
+  boundary effect, not a decode bug — verified by the byte-equivalence
+  unit test).
+  - `tests/encoder_inter_residue_codeblocks.rs` (5 tests): mode-0 2×2
+    grid bit-exact (Y/U/V); mode-1 running-quantiser lockstep; the
+    partitioned stream differs from the single-codeblock stream yet
+    reconstructs identically at q=0; a realistic per-level
+    `[(1,1),(2,2),(2,2),(2,2)]` grid bit-exact (mode 0) + lockstep
+    (mode 1).
+
 - **High-bit-depth (10/12-bit) intra encode → decode round-trip
   coverage** (round-345) — closes the `docs/video/dirac/dirac-fixtures-
   and-traces.md` "bit depths > 8" corpus gap on the **decode** side. The

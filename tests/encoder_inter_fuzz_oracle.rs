@@ -286,6 +286,8 @@ fn residue_wavelet_depth_qindex_sweep_never_panics() {
                     wavelet,
                     dwt_depth: depth,
                     qindex: 32,
+                    codeblocks: None,
+                    codeblock_mode: 0,
                 }),
                 ..InterEncoderParams::default()
             };
@@ -303,6 +305,8 @@ fn residue_wavelet_depth_qindex_sweep_never_panics() {
                 wavelet: WaveletFilter::LeGall5_3,
                 dwt_depth: 3,
                 qindex,
+                codeblocks: None,
+                codeblock_mode: 0,
             }),
             ..InterEncoderParams::default()
         };
@@ -489,6 +493,8 @@ fn high_qindex_residue_still_round_trips() {
             wavelet: WaveletFilter::LeGall5_3,
             dwt_depth: 3,
             qindex: 127,
+            codeblocks: None,
+            codeblock_mode: 0,
         }),
         ..InterEncoderParams::default()
     };

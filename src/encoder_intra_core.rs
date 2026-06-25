@@ -454,7 +454,7 @@ fn codeblock_offset(nonskip_index: u32) -> i32 {
 /// (and downstream subbands' parent lookups). The merged single walk keeps
 /// the skip decision, the running quantiser and the emitted symbols
 /// self-consistent with the decoder's `decode_subband_ac` read order.
-fn encode_subband_ac(
+pub(crate) fn encode_subband_ac(
     pyramid: &mut [[SubbandData; 4]],
     level: u32,
     orient: Orient,

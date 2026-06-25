@@ -226,17 +226,55 @@ pub struct ResidueParams {
     /// for small coefficients; the encoder + decoder use the same
     /// dead-zone forward / inverse pair as the intra path.
     pub qindex: u32,
+
+    /// Optional §11.3.3 spatial partition. `None` ⇒
+    /// `spatial_partition_flag = 0` (one codeblock per subband — the
+    /// pre-round-370 behaviour, kept bit-exact). `Some` holds the
+    /// per-level `(codeblocks_x, codeblocks_y)` counts for the residue
+    /// transform; the level-0 LL band is always forced to a single
+    /// codeblock, matching
+    /// [`crate::encoder_intra_core::CoreIntraEncoderParams::codeblocks`].
+    pub codeblocks: Option<Vec<(u32, u32)>>,
+
+    /// `CODEBLOCK_MODE` (§11.3.3): `0` = single quantiser across the
+    /// subband; `1` = per-codeblock differential quantiser offset
+    /// (§13.4.3.4). Only meaningful when `codeblocks` is `Some`.
+    pub codeblock_mode: u32,
 }
 
 impl ResidueParams {
     /// Default residue parameters: LeGall 5/3 at depth 3 with
     /// `qindex = 0` (near-lossless on small residues, matches the
-    /// intra encoder's default).
+    /// intra encoder's default), single codeblock per subband.
     pub fn default_for(wavelet: WaveletFilter, dwt_depth: u32) -> Self {
         Self {
             wavelet,
             dwt_depth,
             qindex: 0,
+            codeblocks: None,
+            codeblock_mode: 0,
+        }
+    }
+
+    /// The effective per-level codeblock grid. `(1, 1)` for every level
+    /// when `codeblocks` is `None`; otherwise the caller's grid clamped
+    /// to `>= 1` with the level-0 LL band forced to `(1, 1)`. Mirrors
+    /// [`crate::encoder_intra_core::CoreIntraEncoderParams::codeblock_grid`].
+    fn codeblock_grid(&self) -> Vec<(u32, u32)> {
+        match &self.codeblocks {
+            None => vec![(1, 1); self.dwt_depth as usize + 1],
+            Some(grid) => {
+                let mut g: Vec<(u32, u32)> = (0..=self.dwt_depth as usize)
+                    .map(|lvl| {
+                        grid.get(lvl)
+                            .copied()
+                            .map(|(x, y)| (x.max(1), y.max(1)))
+                            .unwrap_or((1, 1))
+                    })
+                    .collect();
+                g[0] = (1, 1);
+                g
+            }
         }
     }
 }
@@ -1942,9 +1980,9 @@ fn forward_residue_pyramid(
 }
 
 /// Dead-zone quantise an already-forward-transformed residue pyramid at
-/// `qindex`. Split out of the former `forward_and_quantise_residue` so a
-/// rate-control picker can re-quantise the same [`forward_residue_pyramid`]
-/// output at many candidate qindexes without repeating the DWT.
+/// `qindex`. Kept split from [`forward_residue_pyramid`] so a
+/// rate-control picker can re-quantise the same forward-DWT output at
+/// many candidate qindexes without repeating the DWT.
 fn quantise_residue_pyramid(py: &[[SubbandData; 4]], qindex: u32) -> Vec<[SubbandData; 4]> {
     let mut out: Vec<[SubbandData; 4]> = Vec::with_capacity(py.len());
     for bands in py.iter() {
@@ -1972,20 +2010,6 @@ fn quantise_residue_pyramid(py: &[[SubbandData; 4]], qindex: u32) -> Vec<[Subban
     out
 }
 
-/// Forward-DWT then dead-zone quantise one residue plane. Mirrors
-/// [`crate::encoder_intra_core::forward_and_quantise`] but operates on
-/// a pre-signed `i32` source (no `- half` step — the residue is already
-/// in the signed pre-offset domain).
-fn forward_and_quantise_residue(
-    residue: &[i32],
-    comp_w: u32,
-    comp_h: u32,
-    rp: &ResidueParams,
-) -> Vec<[SubbandData; 4]> {
-    let py = forward_residue_pyramid(residue, comp_w, comp_h, rp);
-    quantise_residue_pyramid(&py, rp.qindex)
-}
-
 /// Dead-zone forward quantisation — same formula as the intra encoder.
 fn residue_quantise_coeff(x: i32, q: u32) -> i32 {
     if x == 0 {
@@ -2007,9 +2031,25 @@ fn residue_quantise_coeff(x: i32, q: u32) -> i32 {
 fn write_residue_transform_parameters(w: &mut BitWriter, rp: &ResidueParams) {
     w.write_uint(wavelet_index(rp.wavelet));
     w.write_uint(rp.dwt_depth);
-    // §11.3.3 codeblock_parameters: spatial_partition_flag = 0 →
-    // single codeblock per subband at every level.
-    w.write_bool(false);
+    // §11.3.3 codeblock_parameters. With no partition every level gets a
+    // single codeblock (1, 1) and we emit `spatial_partition_flag = 0`;
+    // with a partition we emit the flag, the per-level counts, then the
+    // codeblock_mode — mirroring
+    // `picture_core::parse_codeblock_parameters` (the decoder's residue
+    // path uses the identical reader, so the inter and intra codeblock
+    // grids are read by the same code).
+    match &rp.codeblocks {
+        None => w.write_bool(false),
+        Some(_) => {
+            w.write_bool(true);
+            let grid = rp.codeblock_grid();
+            for (x, y) in &grid {
+                w.write_uint(*x);
+                w.write_uint(*y);
+            }
+            w.write_uint(rp.codeblock_mode);
+        }
+    }
 }
 
 fn wavelet_index(filter: WaveletFilter) -> u32 {
@@ -2072,6 +2112,36 @@ fn write_residue_subband_block(
     w.write_bytes(&bytes);
 }
 
+/// Emit all three residue components (Y/U/V) for one inter picture from
+/// their pre-built **raw** forward-transform pyramids. Dispatches on
+/// `rp.codeblocks`: `None` ⇒ the flat single-codeblock path (quantise
+/// the whole pyramid at `rp.qindex`, then the byte-identical
+/// `write_residue_component_subbands`); `Some` ⇒ the §11.3.3
+/// codeblock walk that requantises per codeblock in place.
+fn emit_residue_components(
+    w: &mut BitWriter,
+    rp: &ResidueParams,
+    raw_y: &[[SubbandData; 4]],
+    raw_u: &[[SubbandData; 4]],
+    raw_v: &[[SubbandData; 4]],
+) {
+    if rp.codeblocks.is_none() {
+        let qpy_y = quantise_residue_pyramid(raw_y, rp.qindex);
+        let qpy_u = quantise_residue_pyramid(raw_u, rp.qindex);
+        let qpy_v = quantise_residue_pyramid(raw_v, rp.qindex);
+        write_residue_component_subbands(w, rp, &qpy_y);
+        write_residue_component_subbands(w, rp, &qpy_u);
+        write_residue_component_subbands(w, rp, &qpy_v);
+    } else {
+        let mut qpy_y = raw_y.to_vec();
+        let mut qpy_u = raw_u.to_vec();
+        let mut qpy_v = raw_v.to_vec();
+        write_residue_component_subbands_cb(w, rp, &mut qpy_y);
+        write_residue_component_subbands_cb(w, rp, &mut qpy_u);
+        write_residue_component_subbands_cb(w, rp, &mut qpy_v);
+    }
+}
+
 /// Encode one residue subband under the §13.4.4 AC contexts — same
 /// raster walk and same `parent_zero / nhood_zero / sign_predict`
 /// helpers as the intra path.
@@ -2100,6 +2170,220 @@ fn encode_residue_subband_ac(pyramid: &[[SubbandData; 4]], level: u32, orient: O
                 residue_select_coeff_ctxs(parent_zero, nhood_zero, sign_pred);
             let qc = band.get(y, x);
             enc.write_sint(&mut bank, follow, data_ctx, sign_ctx, qc);
+        }
+    }
+    enc.finish()
+}
+
+// ---- §11.3.3 spatial-partition (codeblock) residue path -------------
+//
+// When `ResidueParams::codeblocks` is `Some`, the residue subbands are
+// split into a per-level grid of codeblocks. Each codeblock carries a
+// §13.4.3.3 `zero_flag` skip and, under `codeblock_mode == 1`, a
+// §13.4.3.4 differential quantiser offset. The decoder reads this with
+// the same `picture_core::decode_subband` walk it uses for intra, so the
+// emission here mirrors `encoder_intra_core::{encode_subband_ac,
+// codeblock_offset, cb_bounds}` exactly — only the LL DC-prediction and
+// the pre-quantisation of the LL band differ (the inter residue has no
+// DC prediction, and the LL band is quantised in place at the base
+// `qindex` like every other inter-residue band).
+//
+// These functions operate on the **raw** (unquantised) forward-transform
+// pyramid, requantising each codeblock at its running quantiser, so they
+// take `&mut [[SubbandData; 4]]` and write the quantised values back to
+// keep the neighbourhood / sign / parent contexts consistent with what
+// the decoder reconstructs — identical to the intra-core in-place walk.
+
+/// The per-codeblock differential quantiser offset (§13.4.3.4): `0` for
+/// the first non-skipped codeblock of a subband, `+1` for each later
+/// non-skipped codeblock, giving a strictly increasing running quantiser
+/// across the non-skipped codeblocks in raster order. Mirrors
+/// [`crate::encoder_intra_core`]'s `codeblock_offset`.
+fn residue_codeblock_offset(nonskip_index: u32) -> i32 {
+    if nonskip_index == 0 {
+        0
+    } else {
+        1
+    }
+}
+
+/// Codeblock pixel bounds inside a subband (§12.4.5.2 partitioning):
+/// `(left, right, top, bottom)`. Mirrors `encoder_intra_core::cb_bounds`
+/// / `picture_core::codeblock_bounds`.
+fn residue_cb_bounds(
+    cx: u32,
+    cy: u32,
+    cbx: u32,
+    cby: u32,
+    band_w: usize,
+    band_h: usize,
+) -> (usize, usize, usize, usize) {
+    let left = (band_w * cx as usize) / cbx as usize;
+    let right = (band_w * (cx as usize + 1)) / cbx as usize;
+    let top = (band_h * cy as usize) / cby as usize;
+    let bottom = (band_h * (cy as usize + 1)) / cby as usize;
+    (left, right, top, bottom)
+}
+
+/// Emit one component's **raw** residue pyramid as length-prefixed
+/// AC-coded subband blocks, walking each subband codeblock-by-codeblock
+/// per `rp.codeblock_grid()`. Mirrors
+/// [`crate::encoder_intra_core::write_component_subbands`]; `qpy` is
+/// requantised in place per codeblock.
+fn write_residue_component_subbands_cb(
+    w: &mut BitWriter,
+    rp: &ResidueParams,
+    qpy: &mut [[SubbandData; 4]],
+) {
+    let grid = rp.codeblock_grid();
+    write_residue_subband_block_cb(w, rp, qpy, 0, Orient::LL, grid[0]);
+    for level in 1..=rp.dwt_depth {
+        for orient in [Orient::HL, Orient::LH, Orient::HH] {
+            write_residue_subband_block_cb(w, rp, qpy, level, orient, grid[level as usize]);
+        }
+    }
+}
+
+/// Emit one subband block under the codeblock walk: byte-align, length,
+/// qindex, byte-align, AC bytes. Empty bands emit `length = 0` only.
+fn write_residue_subband_block_cb(
+    w: &mut BitWriter,
+    rp: &ResidueParams,
+    qpy: &mut [[SubbandData; 4]],
+    level: u32,
+    orient: Orient,
+    codeblocks: (u32, u32),
+) {
+    w.byte_align();
+    let band = &qpy[level as usize][orient.as_index()];
+    if band.width == 0 || band.height == 0 {
+        w.write_uint(0);
+        w.byte_align();
+        return;
+    }
+    let bytes = encode_residue_subband_ac_cb(qpy, level, orient, codeblocks, rp);
+    if bytes.is_empty() {
+        w.write_uint(0);
+        w.byte_align();
+        return;
+    }
+    w.write_uint(bytes.len() as u32);
+    w.write_uint(rp.qindex);
+    w.byte_align();
+    w.write_bytes(&bytes);
+}
+
+/// Encode one residue subband under the §13.4.4 AC contexts, walking
+/// codeblock-by-codeblock. For a single codeblock (`(1, 1)`, e.g. the LL
+/// band) this emits neither a skip flag nor a quant offset and is
+/// byte-identical to [`encode_residue_subband_ac`]; for a partitioned
+/// subband it emits the §13.4.3.3 `ZERO_BLOCK` skip flag per codeblock
+/// and, under `codeblock_mode == 1`, the §13.4.3.4 differential quant
+/// offset. `qpy` is requantised in place at each codeblock's running
+/// quantiser. Mirrors `encoder_intra_core::encode_subband_ac` minus the
+/// LL DC-prediction (the inter residue carries no DC prediction).
+pub(crate) fn encode_residue_subband_ac_cb(
+    pyramid: &mut [[SubbandData; 4]],
+    level: u32,
+    orient: Orient,
+    codeblocks: (u32, u32),
+    rp: &ResidueParams,
+) -> Vec<u8> {
+    let mut bank = ContextBank::new(ctx::NUM_CONTEXTS);
+    let mut enc = ArithEncoder::new();
+
+    let level_idx = level as usize;
+    let orient_idx = orient.as_index();
+    let band_w = pyramid[level_idx][orient_idx].width;
+    let band_h = pyramid[level_idx][orient_idx].height;
+    let (cbx, cby) = (codeblocks.0.max(1), codeblocks.1.max(1));
+    let single_cb = cbx * cby == 1;
+
+    // Running quantiser advances by `residue_codeblock_offset` ONLY for
+    // non-skipped codeblocks under mode 1, and the offset symbol counts
+    // non-skipped codeblocks so encoder and decoder stay in lockstep:
+    // §13.4.3.2 modifies `quant_idx` inside the `if skipped == False`
+    // branch.
+    let mut q = rp.qindex as i32;
+    let mut nonskip_index = 0u32;
+    for cy in 0..cby {
+        for cx in 0..cbx {
+            let (left, right, top, bottom) = residue_cb_bounds(cx, cy, cbx, cby, band_w, band_h);
+
+            let tentative_q = if rp.codeblock_mode == 1 {
+                (q + residue_codeblock_offset(nonskip_index)).max(0)
+            } else {
+                q
+            };
+
+            // Requantise this codeblock's raw coefficients at the
+            // tentative quantiser, writing them back. A codeblock is a
+            // skip candidate when every quantised coefficient is zero.
+            let mut all_zero = true;
+            {
+                let band = &mut pyramid[level_idx][orient_idx];
+                for y in top..bottom {
+                    for x in left..right {
+                        let raw = band.get(y, x);
+                        let qc = residue_quantise_coeff(raw, tentative_q as u32);
+                        band.set(y, x, qc);
+                        if qc != 0 {
+                            all_zero = false;
+                        }
+                    }
+                }
+            }
+
+            // §13.4.3.3: the skip flag is only present when the subband
+            // has more than one codeblock.
+            let skipped = !single_cb && all_zero;
+            if !single_cb {
+                enc.write_bool(&mut bank, ctx::ZERO_BLOCK, skipped);
+            }
+            if skipped {
+                // §13.4.3.2: a skipped codeblock emits no quant offset and
+                // does NOT advance the running quantiser.
+                continue;
+            }
+
+            if rp.codeblock_mode == 1 {
+                enc.write_sint(
+                    &mut bank,
+                    &[ctx::Q_OFFSET_FOLLOW],
+                    ctx::Q_OFFSET_DATA,
+                    ctx::Q_OFFSET_SIGN,
+                    residue_codeblock_offset(nonskip_index),
+                );
+                q = tentative_q;
+            }
+            nonskip_index += 1;
+
+            // Re-borrow the parent band (level >= 2) plus the current band
+            // for the context derivation, splitting so the parent borrow
+            // doesn't overlap the mutable quantise pass above.
+            let (parent, band): (Option<&SubbandData>, &SubbandData) = if level >= 2 {
+                let (lower, upper) = pyramid.split_at(level_idx);
+                (
+                    Some(&lower[level_idx - 1][orient_idx]),
+                    &upper[0][orient_idx],
+                )
+            } else {
+                (None, &pyramid[level_idx][orient_idx])
+            };
+            for y in top..bottom {
+                for x in left..right {
+                    let parent_zero = match parent {
+                        Some(p) => p.get(y / 2, x / 2) == 0,
+                        None => true,
+                    };
+                    let nhood_zero = residue_zero_nhood(band, x, y);
+                    let sign_pred = residue_sign_predict(band, orient, x, y);
+                    let (follow, data_ctx, sign_ctx) =
+                        residue_select_coeff_ctxs(parent_zero, nhood_zero, sign_pred);
+                    let qc = band.get(y, x);
+                    enc.write_sint(&mut bank, follow, data_ctx, sign_ctx, qc);
+                }
+            }
         }
     }
     enc.finish()
@@ -2444,27 +2728,21 @@ pub fn encode_inter_picture(
         write_residue_transform_parameters(&mut w, residue);
         w.byte_align();
 
-        let qpy_y = forward_and_quantise_residue(
-            &res_y,
-            sequence.luma_width,
-            sequence.luma_height,
-            residue,
-        );
-        let qpy_u = forward_and_quantise_residue(
+        let raw_y =
+            forward_residue_pyramid(&res_y, sequence.luma_width, sequence.luma_height, residue);
+        let raw_u = forward_residue_pyramid(
             &res_u,
             sequence.chroma_width,
             sequence.chroma_height,
             residue,
         );
-        let qpy_v = forward_and_quantise_residue(
+        let raw_v = forward_residue_pyramid(
             &res_v,
             sequence.chroma_width,
             sequence.chroma_height,
             residue,
         );
-        write_residue_component_subbands(&mut w, residue, &qpy_y);
-        write_residue_component_subbands(&mut w, residue, &qpy_u);
-        write_residue_component_subbands(&mut w, residue, &qpy_v);
+        emit_residue_components(&mut w, residue, &raw_y, &raw_u, &raw_v);
         w.byte_align();
     } else {
         // ZERO_RESIDUAL = true so we skip the entire transform_parameters
@@ -3574,27 +3852,21 @@ pub fn encode_bipred_inter_picture(
         write_residue_transform_parameters(&mut w, residue);
         w.byte_align();
 
-        let qpy_y = forward_and_quantise_residue(
-            &res_y,
-            sequence.luma_width,
-            sequence.luma_height,
-            residue,
-        );
-        let qpy_u = forward_and_quantise_residue(
+        let raw_y =
+            forward_residue_pyramid(&res_y, sequence.luma_width, sequence.luma_height, residue);
+        let raw_u = forward_residue_pyramid(
             &res_u,
             sequence.chroma_width,
             sequence.chroma_height,
             residue,
         );
-        let qpy_v = forward_and_quantise_residue(
+        let raw_v = forward_residue_pyramid(
             &res_v,
             sequence.chroma_width,
             sequence.chroma_height,
             residue,
         );
-        write_residue_component_subbands(&mut w, residue, &qpy_y);
-        write_residue_component_subbands(&mut w, residue, &qpy_u);
-        write_residue_component_subbands(&mut w, residue, &qpy_v);
+        emit_residue_components(&mut w, residue, &raw_y, &raw_u, &raw_v);
         w.byte_align();
     } else {
         w.write_bool(true);
@@ -4121,6 +4393,70 @@ mod tests {
     use super::*;
     use crate::picture_inter::{decode_block_motion_data, parse_picture_prediction_parameters};
     use crate::sequence::parse_sequence_header;
+
+    #[test]
+    fn cb_residue_bytes_match_intra_core_byte_for_byte() {
+        // Build a 3-level pyramid with a non-trivial L2 HL band + L1 HL
+        // parent, then encode the L2 HL subband with a (2,2) codeblock
+        // grid through BOTH the inter-residue cb encoder and the proven
+        // intra-core encoder. The emitted AC bytes must be identical —
+        // any divergence is a replica bug in the inter walk.
+        use crate::encoder_intra_core::{encode_subband_ac, CoreIntraEncoderParams};
+        let mut pyramid: Vec<[SubbandData; 4]> = (0..=3)
+            .map(|_| {
+                [
+                    SubbandData::new(0, 0),
+                    SubbandData::new(0, 0),
+                    SubbandData::new(0, 0),
+                    SubbandData::new(0, 0),
+                ]
+            })
+            .collect();
+        // L1 HL parent (4x4) + L2 HL band (8x8) with scattered values.
+        pyramid[1][Orient::HL.as_index()] = SubbandData::new(4, 4);
+        let mut l2 = SubbandData::new(8, 8);
+        for y in 0..8 {
+            for x in 0..8 {
+                let v = ((x as i32 * 7 + y as i32 * 13) % 11) - 5;
+                l2.set(y, x, v);
+            }
+        }
+        // Seed the parent so parent_zero contexts vary.
+        let par = &mut pyramid[1][Orient::HL.as_index()];
+        for y in 0..4 {
+            for x in 0..4 {
+                par.set(y, x, ((x + y) % 2) as i32);
+            }
+        }
+        pyramid[2][Orient::HL.as_index()] = l2;
+
+        let mut p_intra = pyramid.clone();
+        let mut p_inter = pyramid.clone();
+
+        let intra_params = CoreIntraEncoderParams {
+            wavelet: WaveletFilter::LeGall5_3,
+            dwt_depth: 3,
+            qindex: 0,
+            codeblocks: Some(vec![(1, 1), (2, 2), (2, 2), (2, 2)]),
+            codeblock_mode: 0,
+        };
+        let residue_params = ResidueParams {
+            wavelet: WaveletFilter::LeGall5_3,
+            dwt_depth: 3,
+            qindex: 0,
+            codeblocks: Some(vec![(1, 1), (2, 2), (2, 2), (2, 2)]),
+            codeblock_mode: 0,
+        };
+
+        let intra_bytes = encode_subband_ac(&mut p_intra, 2, Orient::HL, (2, 2), &intra_params);
+        let inter_bytes =
+            encode_residue_subband_ac_cb(&mut p_inter, 2, Orient::HL, (2, 2), &residue_params);
+        assert_eq!(
+            intra_bytes, inter_bytes,
+            "inter-residue cb encoder bytes diverge from the proven \
+             intra-core encoder on an identical L2 HL band + grid"
+        );
+    }
 
     #[test]
     fn round_mv_to_int_pel_at_precision_0_is_noop() {

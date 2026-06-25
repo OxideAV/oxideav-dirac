@@ -137,9 +137,21 @@
 //! `0x09` pictures are non-reference) so the whole sequence round-trips
 //! through [`decoder::DiracDecoder`].
 //!
-//! Still unsupported (planned): per-codeblock partitioning beyond
-//! the single-codeblock-per-subband encoder default for the residue
-//! path.
+//! Inter-residue spatial partition: the §11.3 wavelet-residue path now
+//! supports the §11.3.3 codeblock grid (an optional
+//! [`encoder_inter::ResidueParams::codeblocks`] per-level
+//! `(codeblocks_x, codeblocks_y)` plus
+//! [`encoder_inter::ResidueParams::codeblock_mode`]), the inter-residue
+//! analogue of the core-intra encoder's spatial partition. Each
+//! HL/LH/HH subband splits into a grid of codeblocks carrying a
+//! §13.4.3.3 `ZERO_BLOCK` skip flag and, under `codeblock_mode == 1`, a
+//! §13.4.3.4 differential quantiser offset; the emitter is a
+//! byte-for-byte mirror of the proven core-intra codeblock encoder (the
+//! decoder reads it through the shared `picture_core::decode_subband`
+//! walk). With reversible LeGall 5/3 at `qindex = 0` the residue
+//! round-trips bit-exactly whenever every codeblock is at least 4×4
+//! samples; sub-4×4-sample codeblocks carry the same near-lossless
+//! §B.2.7.1 AC-terminator roughness the core-intra path documents.
 
 #![allow(clippy::needless_range_loop)]
 
