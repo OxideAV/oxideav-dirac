@@ -189,3 +189,60 @@ fn floor_qindex_is_respected() {
     assert!(q >= 20, "picker must not go below the residue floor: q={q}");
     assert_eq!(encode_decode_at(seq, &params, q, &fix), 64 * 64);
 }
+
+/// The rate-control byte estimate must **account for the §11.3.3
+/// codeblock grid** (round-370). A codeblock-partitioned residue carries
+/// extra header bytes (the per-level grid + mode) plus per-codeblock skip
+/// flags, so at the same qindex its `inter_residue_qindex_diagnostic`
+/// byte count differs from the single-codeblock estimate. If the picker
+/// still measured the flat layout it would mis-size the codeblock
+/// payload; this test pins that the diagnostic tracks the actual emitted
+/// layout (the byte estimate dispatches through the same
+/// `emit_residue_components` the picture emitter uses) and that the
+/// picked qindex still fits a tight budget and decodes.
+#[test]
+fn picker_accounts_for_codeblock_grid() {
+    let fix = fixture();
+    let (seq, y0, u0, v0, y1, u1, v1) = &fix;
+
+    let flat = InterEncoderParams::default();
+    let mut rp = ResidueParams::default_for(WaveletFilter::LeGall5_3, 3);
+    rp.codeblocks = Some(vec![(1, 1), (2, 2), (2, 2), (2, 2)]);
+    rp.codeblock_mode = 0;
+    let partitioned = InterEncoderParams {
+        residue: Some(rp),
+        ..InterEncoderParams::default()
+    };
+
+    // Same qindex floor (0), generous budget → both pick qindex 0; compare
+    // the diagnostic byte counts. They must differ because the partitioned
+    // layout adds the grid header + per-codeblock skip flags.
+    let (q_flat, bytes_flat) =
+        inter_residue_qindex_diagnostic(seq, &flat, y1, u1, v1, y0, u0, v0, u32::MAX);
+    let (q_part, bytes_part) =
+        inter_residue_qindex_diagnostic(seq, &partitioned, y1, u1, v1, y0, u0, v0, u32::MAX);
+    assert_eq!(q_flat, 0, "flat floor qindex");
+    assert_eq!(q_part, 0, "partitioned floor qindex");
+    assert_ne!(
+        bytes_flat, bytes_part,
+        "the codeblock-grid byte estimate must differ from the \
+         single-codeblock estimate (grid header + skip flags)"
+    );
+
+    // A tight budget against the partitioned layout must still pick a
+    // qindex whose actual estimate fits (when q < 127) and decode cleanly.
+    let target = (bytes_part * 3 / 4) as u32;
+    let (q, actual) =
+        inter_residue_qindex_diagnostic(seq, &partitioned, y1, u1, v1, y0, u0, v0, target);
+    if q < 127 {
+        assert!(
+            actual <= target as usize,
+            "partitioned q={q} actual={actual} must fit target={target}"
+        );
+    }
+    assert_eq!(
+        encode_decode_at(seq, &partitioned, q, &fix),
+        64 * 64,
+        "partitioned rate-controlled stream must decode to 2 frames"
+    );
+}

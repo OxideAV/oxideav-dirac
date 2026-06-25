@@ -2543,20 +2543,22 @@ fn inter_residue_bytes_at_qindex(
 ) -> usize {
     let mut rp_q = rp.clone();
     rp_q.qindex = qindex;
-    let qpy_y = quantise_residue_pyramid(&pyr.y, qindex);
-    let qpy_u = quantise_residue_pyramid(&pyr.u, qindex);
-    let qpy_v = quantise_residue_pyramid(&pyr.v, qindex);
 
     let mut w = BitWriter::new();
     // Mirror the ZERO_RESIDUAL=false layout from `encode_inter_picture`:
     // the flag bit, then transform_parameters (no byte-align between),
-    // then a byte-align before the per-component subband bytes.
+    // then a byte-align before the per-component subband bytes. Dispatch
+    // through `emit_residue_components` so the byte count reflects the
+    // §11.3.3 codeblock grid (skip flags + per-codeblock requantise) when
+    // `rp.codeblocks` is `Some` — otherwise the picker would mis-estimate
+    // the payload for codeblock-partitioned residue. `emit_residue_*`
+    // takes the **raw** pyramids and quantises internally (flat at
+    // `qindex` when no grid, per-codeblock when a grid is set), so we hand
+    // it the unquantised `pyr` rather than a pre-quantised clone.
     w.write_bool(false);
     write_residue_transform_parameters(&mut w, &rp_q);
     w.byte_align();
-    write_residue_component_subbands(&mut w, &rp_q, &qpy_y);
-    write_residue_component_subbands(&mut w, &rp_q, &qpy_u);
-    write_residue_component_subbands(&mut w, &rp_q, &qpy_v);
+    emit_residue_components(&mut w, &rp_q, &pyr.y, &pyr.u, &pyr.v);
     w.byte_align();
     w.finish().len()
 }

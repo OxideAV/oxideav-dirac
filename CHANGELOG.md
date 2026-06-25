@@ -55,6 +55,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     zeroes codeblocks) × {LeGall 5/3, Haar}. Every combination decodes to
     exactly 2 frames with no panic and no arithmetic-coder desync.
 
+### Changed
+
+- **Inter-residue rate control now accounts for the §11.3.3 codeblock
+  grid** (round-370). `inter_residue_bytes_at_qindex` (the byte-cost
+  estimator behind `pick_inter_residue_qindex` /
+  `inter_residue_qindex_diagnostic`) now dispatches through the same
+  `emit_residue_components` the picture emitter uses, so the estimate
+  reflects the codeblock grid header + per-codeblock skip flags +
+  per-codeblock requantise when `ResidueParams.codeblocks` is `Some`
+  (previously it always measured the flat single-codeblock layout, which
+  would mis-size a codeblock-partitioned residue). New regression:
+  `tests/encoder_inter_residue_rate.rs::picker_accounts_for_codeblock_grid`.
+
 - **High-bit-depth (10/12-bit) intra encode → decode round-trip
   coverage** (round-345) — closes the `docs/video/dirac/dirac-fixtures-
   and-traces.md` "bit depths > 8" corpus gap on the **decode** side. The
