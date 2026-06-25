@@ -46,6 +46,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `tests/encoder_bipred_roundtrip.rs::bipred_with_codeblock_residue_recovers_b_frame`
     confirms the bipred B-frame round-trips bit-exactly through the
     per-level codeblock grid at qindex 0.
+  - `tests/encoder_inter_fuzz_oracle.rs::residue_codeblock_grid_sweep_never_panics`
+    — a 60-combination robustness sweep over codeblock grids (uniform
+    2×2 / 4×4, a per-level split, an asymmetric `(4,1)` grid, and a
+    pathologically fine `(8,8)` grid that drives 1×1-sample and
+    empty codeblocks at the deepest levels) × both `codeblock_mode`
+    values × qindex {0, 24, 96} (so the skip path fires as the quantiser
+    zeroes codeblocks) × {LeGall 5/3, Haar}. Every combination decodes to
+    exactly 2 frames with no panic and no arithmetic-coder desync.
 
 - **High-bit-depth (10/12-bit) intra encode → decode round-trip
   coverage** (round-345) — closes the `docs/video/dirac/dirac-fixtures-

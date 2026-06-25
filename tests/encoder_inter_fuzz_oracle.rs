@@ -327,6 +327,68 @@ fn residue_wavelet_depth_qindex_sweep_never_panics() {
     assert_decodes_to(&stream, 2, "residue=None (legacy ZERO_RESIDUAL path)");
 }
 
+/// §11.3.3 codeblock-grid residue robustness sweep (round-370). Drives a
+/// matrix of codeblock grids — uniform `(2,2)` / `(4,4)`, a realistic
+/// per-level split, an asymmetric `(4,1)` grid, and a pathologically
+/// fine `(8,8)` grid that drives sub-1-sample codeblocks at the deepest
+/// levels (the `residue_cb_bounds` integer-division tiling must produce
+/// empty-but-valid codeblocks there) — across both `codeblock_mode`
+/// values, a few qindexes (so the §13.4.3.3 skip path fires as the
+/// quantiser zeroes codeblocks), and a couple of wavelets. Every
+/// combination must decode to 2 frames with no panic and no
+/// arithmetic-coder desync. This hardens the new codeblock walk against
+/// the empty / tiny / heavily-skipped codeblock edge cases the bit-exact
+/// round-trip tests don't reach.
+#[test]
+fn residue_codeblock_grid_sweep_never_panics() {
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let intra_p = intra_params();
+    let (y0, u0, v0, y1, u1, v1) = synthetic_translating_pair_64(3, -2);
+    let pair = (
+        (y0.to_vec(), u0.to_vec(), v0.to_vec()),
+        (y1.to_vec(), u1.to_vec(), v1.to_vec()),
+    );
+    let (intra, inter) = pair_inputs(&pair.0, &pair.1);
+
+    let depth = 3u32;
+    let grids: [Vec<(u32, u32)>; 5] = [
+        vec![(2, 2); depth as usize + 1],
+        vec![(4, 4); depth as usize + 1],
+        vec![(1, 1), (2, 2), (2, 2), (2, 2)],
+        vec![(1, 1), (4, 1), (4, 1), (4, 1)],
+        vec![(8, 8); depth as usize + 1],
+    ];
+
+    for grid in &grids {
+        for mode in [0u32, 1] {
+            for qindex in [0u32, 24, 96] {
+                for wavelet in [WaveletFilter::LeGall5_3, WaveletFilter::Haar0] {
+                    let params = InterEncoderParams {
+                        residue: Some(ResidueParams {
+                            wavelet,
+                            dwt_depth: depth,
+                            qindex,
+                            codeblocks: Some(grid.clone()),
+                            codeblock_mode: mode,
+                        }),
+                        ..InterEncoderParams::default()
+                    };
+                    let stream =
+                        encode_intra_then_inter_stream(&seq, &intra_p, &params, &intra, &inter);
+                    assert_decodes_to(
+                        &stream,
+                        2,
+                        &format!(
+                            "codeblock grid={grid:?} mode={mode} qindex={qindex} \
+                             wavelet={wavelet:?}"
+                        ),
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn adaptive_flag_combinations_never_panic() {
     let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
