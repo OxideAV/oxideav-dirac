@@ -23,7 +23,9 @@
 use oxideav_core::CodecRegistry;
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
 use oxideav_dirac::encoder::make_minimal_sequence;
-use oxideav_dirac::encoder_inter::{bipred_select_modes, InterEncoderParams, InterInputPicture};
+use oxideav_dirac::encoder_inter::{
+    bipred_select_modes, InterEncoderParams, InterInputPicture, ResidueParams,
+};
 use oxideav_dirac::encoder_intra_core::{
     encode_core_intra_then_bipred_stream, encode_core_intra_then_inter_stream,
     CoreIntraEncoderParams,
@@ -210,6 +212,75 @@ fn bipred_self_roundtrip_with_residue_recovers_midpoint_b_frame() {
         py >= 60.0,
         "bipred B-frame Y PSNR {py:.2} dB below 60 dB target — residue \
          path failed to close the prediction loop"
+    );
+}
+
+/// **Bipred with the §11.3.3 codeblock-grid residue.** The round-370
+/// codeblock spatial partition is wired into the bipred (`0x0A`) residue
+/// emission site too (`emit_residue_components` dispatches both the 1-ref
+/// and 2-ref paths). A per-level `[(1,1),(2,2),(2,2),(2,2)]` grid keeps
+/// every codeblock ≥ 4×4 samples, so at qindex 0 the bipred B-frame
+/// reconstructs at the same near-lossless quality as the
+/// single-codeblock residue path — proving the codeblock skip / running
+/// quantiser bookkeeping decodes in lockstep on the bipred path as well.
+#[test]
+fn bipred_with_codeblock_residue_recovers_b_frame() {
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let intra_params = CoreIntraEncoderParams::default_intra(WaveletFilter::LeGall5_3, 3);
+    let mut rp = ResidueParams::default_for(WaveletFilter::LeGall5_3, 3);
+    rp.codeblocks = Some(vec![(1, 1), (2, 2), (2, 2), (2, 2)]);
+    rp.codeblock_mode = 0;
+    let inter_params = InterEncoderParams {
+        residue: Some(rp),
+        ..InterEncoderParams::default()
+    };
+
+    let (y0, u0, v0, y1, u1, v1, ym, um, vm) = synthetic_bipred_triplet();
+    let intra_a = InterInputPicture {
+        picture_number: 0,
+        y: &y0,
+        u: &u0,
+        v: &v0,
+    };
+    let intra_b = InterInputPicture {
+        picture_number: 2,
+        y: &y1,
+        u: &u1,
+        v: &v1,
+    };
+    let bipred = InterInputPicture {
+        picture_number: 1,
+        y: &ym,
+        u: &um,
+        v: &vm,
+    };
+    let stream = encode_core_intra_then_bipred_stream(
+        &seq,
+        &intra_params,
+        &inter_params,
+        &intra_a,
+        &intra_b,
+        &bipred,
+    );
+
+    let frames = decode_stream(stream);
+    assert!(frames.len() >= 3, "expected 3 frames, got {}", frames.len());
+    assert_eq!(
+        frames[0].planes[0].data,
+        y0.to_vec(),
+        "intra-A Y bit-exact at qindex=0"
+    );
+    assert_eq!(
+        frames[1].planes[0].data,
+        y1.to_vec(),
+        "intra-B Y bit-exact at qindex=0"
+    );
+    let py = psnr(&frames[2].planes[0].data, &ym);
+    eprintln!("bipred B-frame codeblock-residue Y PSNR: {py:.2} dB");
+    assert!(
+        py >= 60.0,
+        "bipred B-frame Y PSNR {py:.2} dB below 60 dB — codeblock residue \
+         failed to close the prediction loop on the bipred path"
     );
 }
 

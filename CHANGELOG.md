@@ -40,6 +40,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     reconstructs identically at q=0; a realistic per-level
     `[(1,1),(2,2),(2,2),(2,2)]` grid bit-exact (mode 0) + lockstep
     (mode 1).
+  - The codeblock grid is wired into **both** inter residue emission
+    sites — the 1-ref (`0x09`) path and the 2-ref bipred (`0x0A`) path —
+    via the shared `emit_residue_components` dispatch.
+    `tests/encoder_bipred_roundtrip.rs::bipred_with_codeblock_residue_recovers_b_frame`
+    confirms the bipred B-frame round-trips bit-exactly through the
+    per-level codeblock grid at qindex 0.
 
 - **High-bit-depth (10/12-bit) intra encode → decode round-trip
   coverage** (round-345) — closes the `docs/video/dirac/dirac-fixtures-
