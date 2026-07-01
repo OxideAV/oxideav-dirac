@@ -35,7 +35,7 @@ use crate::encoder::write_parse_info;
 use crate::obmc::{interp2by2, spatial_wt, subpel_predict, McParams};
 use crate::picture_core::ctx;
 use crate::picture_inter::{
-    mvctx, BlockData, PictureMotionData, PicturePredictionParams, RefPredMode,
+    mvctx, BlockData, GlobalParams, PictureMotionData, PicturePredictionParams, RefPredMode,
 };
 use crate::quant::quant_factor;
 use crate::sequence::SequenceHeader;
@@ -206,6 +206,59 @@ pub struct InterEncoderParams {
     /// Defaults to `true`; set to `false` for A/B testing against the
     /// pre-round-95 behaviour.
     pub bipred_post_obmc_refine: bool,
+    /// **§11.2.6 global motion** (round-382).
+    ///
+    /// When `Some`, the picture signals `state[USING GLOBAL] = True`,
+    /// emits the affine-perspective [`GlobalParams`] for ref1 (and ref2
+    /// on 2-ref pictures), and marks the configured blocks as global
+    /// (§12.3.3.2 `block_global_mode`). Global blocks carry **no** motion
+    /// vector residual — their per-pixel prediction is derived entirely
+    /// from the §15.8.8 `global_mv` affine field, and the encoder builds
+    /// its OBMC prediction / residue from that same field so the
+    /// round-trip is bit-exact at `qindex = 0`.
+    ///
+    /// `None` (the default) keeps the pre-round-382 behaviour:
+    /// `using_global = false`, every block uses block motion.
+    pub global_motion: Option<GlobalMotionConfig>,
+}
+
+/// §11.2.6 global-motion encoder configuration (round-382).
+#[derive(Debug, Clone)]
+pub struct GlobalMotionConfig {
+    /// Affine-perspective global parameters for reference 1.
+    pub global1: GlobalParams,
+    /// Affine-perspective global parameters for reference 2. Only emitted
+    /// (and only meaningful) on 2-reference pictures (parse code `0x0A`).
+    pub global2: Option<GlobalParams>,
+    /// Optional per-block global-mode grid, row-major
+    /// `[by * blocks_x + bx]`. `None` ⇒ **every** non-intra block is a
+    /// global block (the common "whole picture follows the global model"
+    /// case). When `Some`, the slice length must equal
+    /// `blocks_x * blocks_y`; `true` marks a global block. A block that
+    /// is `true` here still requires a non-intra reference mode — the
+    /// §12.3.3.2 process forces `gmode = false` on intra blocks — so the
+    /// encoder only honours `true` on `Ref1Only` / `Ref2Only` /
+    /// `Ref1And2` blocks.
+    pub block_gmode: Option<Vec<bool>>,
+}
+
+impl GlobalMotionConfig {
+    /// A whole-picture global model against reference 1 with a pure
+    /// pan/tilt translation (`pan_tilt` in `1/(2^mv_precision)` luma-pel
+    /// units, matching the block-MV convention). Every block is global.
+    pub fn pan_tilt_all(dx: i32, dy: i32) -> Self {
+        Self {
+            global1: GlobalParams {
+                pan_tilt: (dx, dy),
+                zrs: [[1, 0], [0, 1]],
+                zrs_exp: 0,
+                perspective: (0, 0),
+                persp_exp: 0,
+            },
+            global2: None,
+            block_gmode: None,
+        }
+    }
 }
 
 /// Wavelet residue encoder parameters. Mirrors
@@ -335,6 +388,10 @@ impl Default for InterEncoderParams {
             // metric) and "OBMC SSE against source" (the decoder's
             // actual cost).
             bipred_post_obmc_refine: true,
+            // Round-382: global motion off by default — every block uses
+            // block motion, `using_global = false`. Opt in with a
+            // `GlobalMotionConfig`.
+            global_motion: None,
         }
     }
 }
@@ -1882,18 +1939,33 @@ fn build_obmc_prediction_one(
 /// `params.bipred_mv_precision` while the 1-ref path uses `params.mv_precision`.
 fn picture_prediction_params_from(
     sequence: &SequenceHeader,
-    _iep: &InterEncoderParams,
+    iep: &InterEncoderParams,
     mv_precision: u32,
+    num_refs: u32,
 ) -> PicturePredictionParams {
     let (sbx, sby, blocks_x, blocks_y) = motion_grid(sequence.luma_width, sequence.luma_height);
     let (xblen, yblen, xbsep, ybsep) = PRESET1;
+    let (using_global, global1, global2) = match &iep.global_motion {
+        None => (false, None, None),
+        Some(cfg) => {
+            let g1 = Some(effective_global_params(&cfg.global1));
+            let g2 = if num_refs == 2 {
+                Some(effective_global_params(
+                    &cfg.global2.clone().unwrap_or_default(),
+                ))
+            } else {
+                None
+            };
+            (true, g1, g2)
+        }
+    };
     PicturePredictionParams {
         luma_xblen: xblen,
         luma_yblen: yblen,
         luma_xbsep: xbsep,
         luma_ybsep: ybsep,
         mv_precision,
-        using_global: false,
+        using_global,
         prediction_mode: 0,
         superblocks_x: sbx,
         superblocks_y: sby,
@@ -1902,8 +1974,8 @@ fn picture_prediction_params_from(
         refs_wt_precision: 1,
         ref1_wt: 1,
         ref2_wt: 1,
-        global1: None,
-        global2: None,
+        global1,
+        global2,
     }
 }
 
@@ -2510,7 +2582,7 @@ fn build_inter_residue_pyramids(
     ref_v: &[u8],
 ) -> InterResiduePyramids {
     let (sbx, sby, blocks_x, blocks_y) = motion_grid(sequence.luma_width, sequence.luma_height);
-    let pred = picture_prediction_params_from(sequence, iep, iep.mv_precision);
+    let pred = picture_prediction_params_from(sequence, iep, iep.mv_precision, 1);
     let motion = build_motion_from_mv_grid(sbx, sby, blocks_x, blocks_y, mvs);
     let (pred_y, pred_u, pred_v) =
         build_obmc_prediction(sequence, &pred, &motion, false, ref_y, ref_u, ref_v);
@@ -2698,7 +2770,7 @@ pub fn encode_inter_picture(
     w.byte_align();
 
     // §11.2 picture_prediction_parameters.
-    write_picture_prediction_parameters(&mut w, params, params.mv_precision);
+    write_picture_prediction_parameters(&mut w, params, params.mv_precision, 1);
     w.byte_align();
 
     // §12.3 block_motion_data. Sub-pel ME degenerates to integer-pel
@@ -2714,7 +2786,7 @@ pub fn encode_inter_picture(
         // component subbands. Build the same `PictureMotionData` the
         // decoder will reconstruct from the bytes we just wrote so the
         // OBMC prediction matches symbol-for-symbol.
-        let pred = picture_prediction_params_from(sequence, params, params.mv_precision);
+        let pred = picture_prediction_params_from(sequence, params, params.mv_precision, 1);
         let motion = build_motion_from_mv_grid(sbx, sby, blocks_x, blocks_y, &mvs);
         let (pred_y, pred_u, pred_v) =
             build_obmc_prediction(sequence, &pred, &motion, false, ref_y, ref_u, ref_v);
@@ -2759,8 +2831,9 @@ pub fn encode_inter_picture(
 
 fn write_picture_prediction_parameters(
     w: &mut BitWriter,
-    _params: &InterEncoderParams,
+    params: &InterEncoderParams,
     mv_precision: u32,
+    num_refs: u32,
 ) {
     // §11.2.2 block_parameters: index 1 (preset 8x8 / 4x4).
     w.write_uint(1);
@@ -2768,13 +2841,86 @@ fn write_picture_prediction_parameters(
     // 3=eighth pel; spec caps at 3).
     debug_assert!(mv_precision <= 3, "mv_precision must be 0..=3");
     w.write_uint(mv_precision);
-    // §11.2.6 global_motion: not used.
-    w.write_bool(false);
+    // §11.2.6 global_motion. `state[USING GLOBAL] = read_bool()`; when
+    // set, one `global_motion_parameters` block per reference.
+    match &params.global_motion {
+        None => w.write_bool(false),
+        Some(cfg) => {
+            w.write_bool(true);
+            write_global_motion_parameters(&mut *w, &effective_global_params(&cfg.global1));
+            if num_refs == 2 {
+                let g2 = cfg.global2.clone().unwrap_or_default();
+                write_global_motion_parameters(&mut *w, &effective_global_params(&g2));
+            }
+        }
+    }
     // §11.2.7 picture_prediction_mode: 0 (default).
     w.write_uint(0);
     // §11.2.8 reference_picture_weights_flag: false → defaults
     // refs_wt_precision=1, ref1_wt=ref2_wt=1.
     w.write_bool(false);
+}
+
+/// §11.2.6 `global_motion_parameters` writer — the exact bitstream
+/// inverse of `parse_global_motion_parameters` (the decoder's proven
+/// reader). Emits the `pan_tilt` / `zoom_rotate_shear` / `perspective`
+/// triple for one reference. `g` should be the *effective* parameters
+/// (see [`effective_global_params`]) so what is emitted round-trips
+/// byte-exactly to the value fed into [`crate::obmc::global_mv`].
+fn write_global_motion_parameters(w: &mut BitWriter, g: &GlobalParams) {
+    // pan_tilt(): a nonzero_pan_tilt_flag, then two sints when set.
+    if g.pan_tilt != (0, 0) {
+        w.write_bool(true);
+        w.write_sint(g.pan_tilt.0);
+        w.write_sint(g.pan_tilt.1);
+    } else {
+        w.write_bool(false);
+    }
+    // zoom_rotate_shear(): a nontrivial_zrs_flag, then a scaling exponent
+    // and the four matrix elements when set. The identity matrix
+    // [[1,0],[0,1]] at exponent 0 is the trivial default the decoder
+    // fills in when the flag is False.
+    if g.zrs == [[1, 0], [0, 1]] && g.zrs_exp == 0 {
+        w.write_bool(false);
+    } else {
+        w.write_bool(true);
+        w.write_uint(g.zrs_exp);
+        w.write_sint(g.zrs[0][0]);
+        w.write_sint(g.zrs[0][1]);
+        w.write_sint(g.zrs[1][0]);
+        w.write_sint(g.zrs[1][1]);
+    }
+    // perspective(): a nonzero_perspective_flag, then an exponent and two
+    // sints when set.
+    if g.perspective != (0, 0) {
+        w.write_bool(true);
+        w.write_uint(g.persp_exp);
+        w.write_sint(g.perspective.0);
+        w.write_sint(g.perspective.1);
+    } else {
+        w.write_bool(false);
+    }
+}
+
+/// Canonicalise a caller-supplied [`GlobalParams`] to the exact value the
+/// decoder reconstructs from [`write_global_motion_parameters`]'s output.
+///
+/// The §11.2.6 flags are omission-encoded: when a component is at its
+/// trivial default the flag is `False` and the trailing sub-fields are
+/// *not* on the wire, so the decoder leaves them at the struct default
+/// (`0`). The only field that can differ between "what the caller put in
+/// the struct" and "what the decoder reads back" is a non-zero
+/// `persp_exp` paired with a zero `perspective` vector (the flag is
+/// `False` so `persp_exp` never reaches the wire). Because
+/// [`crate::obmc::global_mv`] consumes `persp_exp` unconditionally, the
+/// encoder must build its OBMC prediction from these *effective*
+/// parameters, or its reconstruction would diverge from the decoder's.
+fn effective_global_params(g: &GlobalParams) -> GlobalParams {
+    let mut e = g.clone();
+    if e.perspective == (0, 0) {
+        e.persp_exp = 0;
+    }
+    e
 }
 
 // ---- 2-reference bipred encoding (#190 follow-up) --------------------
@@ -3791,7 +3937,7 @@ pub fn encode_bipred_inter_picture(
     let bmp = params.bipred_mv_precision;
 
     // §11.2 picture_prediction_parameters.
-    write_picture_prediction_parameters(&mut w, params, bmp);
+    write_picture_prediction_parameters(&mut w, params, bmp, 2);
     w.byte_align();
 
     // §12.3 block_motion_data — 2-ref bipred path.
@@ -3841,7 +3987,7 @@ pub fn encode_bipred_inter_picture(
 
     // §11.3 wavelet_transform.
     if let Some(ref residue) = params.residue {
-        let pred = picture_prediction_params_from(sequence, params, bmp);
+        let pred = picture_prediction_params_from(sequence, params, bmp, 2);
         let motion = build_motion_from_bipred_grid(sbx, sby, blocks_x, blocks_y, &decisions);
         let (pred_y, pred_u, pred_v) = build_obmc_prediction_bipred(
             sequence, &pred, &motion, ref1_y, ref1_u, ref1_v, ref2_y, ref2_u, ref2_v,
@@ -4716,7 +4862,7 @@ mod tests {
                 mv_precision,
                 ..InterEncoderParams::default()
             };
-            write_picture_prediction_parameters(&mut w, &params, mv_precision);
+            write_picture_prediction_parameters(&mut w, &params, mv_precision, 1);
             w.byte_align();
             let bytes = w.finish();
 
@@ -4735,6 +4881,147 @@ mod tests {
             assert_eq!(pred.refs_wt_precision, 1);
             assert_eq!(pred.ref1_wt, 1);
             assert_eq!(pred.ref2_wt, 1);
+        }
+    }
+
+    /// §11.2.6 `write_global_motion_parameters` must be the exact
+    /// bitstream inverse of the decoder's `parse_global_motion_parameters`.
+    /// Sweep pan_tilt / zrs / perspective on and off to exercise every
+    /// omission-flag branch, and assert the parsed-back parameters equal
+    /// the *effective* input.
+    #[test]
+    fn global_motion_parameters_roundtrip() {
+        use crate::picture_inter::parse_global_motion_parameters;
+        let cases = [
+            // Trivial: identity everywhere.
+            GlobalParams::default(),
+            // Pure pan/tilt.
+            GlobalParams {
+                pan_tilt: (7, -3),
+                zrs: [[1, 0], [0, 1]],
+                zrs_exp: 0,
+                perspective: (0, 0),
+                persp_exp: 0,
+            },
+            // Non-trivial ZRS (zoom) at exponent 2.
+            GlobalParams {
+                pan_tilt: (0, 0),
+                zrs: [[5, 1], [-1, 5]],
+                zrs_exp: 2,
+                perspective: (0, 0),
+                persp_exp: 0,
+            },
+            // Perspective set.
+            GlobalParams {
+                pan_tilt: (2, 2),
+                zrs: [[1, 0], [0, 1]],
+                zrs_exp: 0,
+                perspective: (3, -4),
+                persp_exp: 6,
+            },
+            // Full affine + perspective combined.
+            GlobalParams {
+                pan_tilt: (-11, 13),
+                zrs: [[9, -2], [3, 8]],
+                zrs_exp: 3,
+                perspective: (1, 1),
+                persp_exp: 4,
+            },
+            // Non-zero persp_exp but zero perspective vector: the flag is
+            // omitted, so the decoder reads persp_exp back as 0. The
+            // `effective_global_params` normalisation must match.
+            GlobalParams {
+                pan_tilt: (1, 0),
+                zrs: [[1, 0], [0, 1]],
+                zrs_exp: 0,
+                perspective: (0, 0),
+                persp_exp: 9,
+            },
+        ];
+        for g in &cases {
+            let eff = effective_global_params(g);
+            let mut w = BitWriter::new();
+            write_global_motion_parameters(&mut w, &eff);
+            let bytes = w.finish();
+            let mut r = crate::bits::BitReader::new(&bytes);
+            let parsed = parse_global_motion_parameters(&mut r);
+            assert_eq!(parsed.pan_tilt, eff.pan_tilt, "pan_tilt for {g:?}");
+            assert_eq!(parsed.zrs, eff.zrs, "zrs for {g:?}");
+            assert_eq!(parsed.zrs_exp, eff.zrs_exp, "zrs_exp for {g:?}");
+            assert_eq!(parsed.perspective, eff.perspective, "perspective for {g:?}");
+            assert_eq!(parsed.persp_exp, eff.persp_exp, "persp_exp for {g:?}");
+        }
+    }
+
+    /// §11.2.1 `picture_prediction_parameters` with global motion must
+    /// round-trip through the decoder's parser: `using_global = true`,
+    /// the ref1 global params for a 1-ref picture, and both refs' params
+    /// for a 2-ref picture.
+    #[test]
+    fn picture_prediction_parameters_global_roundtrips() {
+        let seq = crate::encoder::make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+        let g1 = GlobalParams {
+            pan_tilt: (6, -2),
+            zrs: [[5, 0], [0, 5]],
+            zrs_exp: 2,
+            perspective: (0, 0),
+            persp_exp: 0,
+        };
+        let g2 = GlobalParams {
+            pan_tilt: (-4, 4),
+            zrs: [[1, 0], [0, 1]],
+            zrs_exp: 0,
+            perspective: (1, -1),
+            persp_exp: 3,
+        };
+        // 1-ref: only global1 is on the wire.
+        {
+            let params = InterEncoderParams {
+                mv_precision: 2,
+                global_motion: Some(GlobalMotionConfig {
+                    global1: g1.clone(),
+                    global2: None,
+                    block_gmode: None,
+                }),
+                ..InterEncoderParams::default()
+            };
+            let mut w = BitWriter::new();
+            write_picture_prediction_parameters(&mut w, &params, 2, 1);
+            w.byte_align();
+            let bytes = w.finish();
+            let mut r = crate::bits::BitReader::new(&bytes);
+            let pred = parse_picture_prediction_parameters(&mut r, &seq, 1).expect("parse PPP");
+            assert!(pred.using_global);
+            let p1 = pred.global1.expect("global1 present");
+            assert_eq!(p1.pan_tilt, g1.pan_tilt);
+            assert_eq!(p1.zrs, g1.zrs);
+            assert_eq!(p1.zrs_exp, g1.zrs_exp);
+            assert!(pred.global2.is_none());
+        }
+        // 2-ref: both global1 and global2 on the wire.
+        {
+            let params = InterEncoderParams {
+                bipred_mv_precision: 2,
+                global_motion: Some(GlobalMotionConfig {
+                    global1: g1.clone(),
+                    global2: Some(g2.clone()),
+                    block_gmode: None,
+                }),
+                ..InterEncoderParams::default()
+            };
+            let mut w = BitWriter::new();
+            write_picture_prediction_parameters(&mut w, &params, 2, 2);
+            w.byte_align();
+            let bytes = w.finish();
+            let mut r = crate::bits::BitReader::new(&bytes);
+            let pred = parse_picture_prediction_parameters(&mut r, &seq, 2).expect("parse PPP");
+            assert!(pred.using_global);
+            let p1 = pred.global1.expect("global1 present");
+            let p2 = pred.global2.expect("global2 present");
+            assert_eq!(p1.pan_tilt, g1.pan_tilt);
+            assert_eq!(p2.pan_tilt, g2.pan_tilt);
+            assert_eq!(p2.perspective, g2.perspective);
+            assert_eq!(p2.persp_exp, g2.persp_exp);
         }
     }
 
@@ -4891,12 +5178,12 @@ mod tests {
                 ..InterEncoderParams::default()
             };
             let mut w = BitWriter::new();
-            write_picture_prediction_parameters(&mut w, &iep, mv_precision);
+            write_picture_prediction_parameters(&mut w, &iep, mv_precision, 1);
             w.byte_align();
             let bytes = w.finish();
             let mut r = crate::bits::BitReader::new(&bytes);
             let parsed = parse_picture_prediction_parameters(&mut r, &seq, 1).expect("PPP");
-            let synthesised = picture_prediction_params_from(&seq, &iep, mv_precision);
+            let synthesised = picture_prediction_params_from(&seq, &iep, mv_precision, 1);
             assert_eq!(parsed.luma_xblen, synthesised.luma_xblen);
             assert_eq!(parsed.luma_yblen, synthesised.luma_yblen);
             assert_eq!(parsed.luma_xbsep, synthesised.luma_xbsep);

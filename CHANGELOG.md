@@ -9,7 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **§11.3.3 spatial-partition (codeblock grid) for the inter-residue
+- **§11.2.6 global-motion encoder path** (round-382) — closes the
+  `docs/video/dirac/dirac-fixtures-and-traces.md` "Global motion
+  compensation (`globalmc_flag=1`)" corpus gap on the **encode** side.
+  The decoder already parsed global motion parameters (§11.2.6), the
+  per-block global-mode flag (§12.3.3.2), and reconstructed via the
+  §15.8.8 `global_mv` affine-perspective field; the inter encoder now
+  emits streams that exercise all of it.
+  - `write_global_motion_parameters` — the exact bitstream inverse of
+    the decoder's `parse_global_motion_parameters`: the `pan_tilt` /
+    `zoom_rotate_shear` / `perspective` omission-flag triple. Paired
+    with `effective_global_params`, which canonicalises a caller's
+    [`GlobalParams`] to the value the decoder reads back (a non-zero
+    `persp_exp` with a zero perspective vector never reaches the wire,
+    so the encoder builds its prediction from the effective value).
+    Round-tripped by `global_motion_parameters_roundtrip` across every
+    flag combination.
+  - `InterEncoderParams::global_motion: Option<GlobalMotionConfig>` (a
+    new `GlobalParams` pair + optional per-block gmode grid; default
+    `None`). `write_picture_prediction_parameters` /
+    `picture_prediction_params_from` gained a `num_refs` argument and
+    now emit `using_global = true` + one `global_motion_parameters`
+    block per reference. Pinned by
+    `picture_prediction_parameters_global_roundtrips` (1-ref emits
+    global1 only; 2-ref emits both).
   encoder** (round-370) — closes the lib-doc "still unsupported:
   per-codeblock partitioning for the residue path" gap. The §11.3
   wavelet-residue path now accepts an optional per-level

@@ -234,7 +234,7 @@ pub fn parse_picture_prediction_parameters(
 }
 
 /// §11.2.6 global motion parameters for one reference.
-fn parse_global_motion_parameters(r: &mut BitReader<'_>) -> GlobalParams {
+pub(crate) fn parse_global_motion_parameters(r: &mut BitReader<'_>) -> GlobalParams {
     let mut g = GlobalParams::default();
     // pan_tilt
     if r.read_bool() {
