@@ -555,3 +555,86 @@ fn sequence_driver_threads_codeblock_grid() {
         "wrapper matches _report stream (codeblock grid)"
     );
 }
+
+/// **§11.2.6 global motion threads through the sequence driver**
+/// (round-382). The driver clones `inter_params` per picture (overriding
+/// only the residue qindex), so a `GlobalMotionConfig` must reach every
+/// `0x09` picture — the emitted PPPs signal `using_global` with the
+/// caller's field, all blocks go global, and the whole rate-controlled
+/// chain still decodes to one frame per input with the residue budget
+/// respected.
+#[test]
+fn sequence_driver_threads_global_motion() {
+    use oxideav_dirac::encoder_inter::GlobalMotionConfig;
+
+    let (seq, frames) = fixture();
+    let inputs = input_pictures(&frames);
+    let intra_params = EncoderParams::default_hq(WaveletFilter::LeGall5_3, 3);
+    let inter_params = InterEncoderParams {
+        mv_precision: 0,
+        residue: Some(ResidueParams::default_for(WaveletFilter::LeGall5_3, 3)),
+        // Zero-translation global field: pan_tilt (-1, -1) ⇒ (0, 0)
+        // after the §15.8.8 rounding bias. The camera-pan content is
+        // absorbed by the residue; what's pinned is the plumbing.
+        global_motion: Some(GlobalMotionConfig::pan_tilt_all(-1, -1)),
+        ..InterEncoderParams::default()
+    };
+
+    let target = 900u32;
+    let (stream, report) = encode_inter_sequence_with_residue_target_report(
+        &seq,
+        &intra_params,
+        &inter_params,
+        &inputs,
+        target,
+        InterRateControl::PerPicture,
+    );
+
+    // Every inter picture's PPP signals using_global with our field.
+    use oxideav_dirac::bits::BitReader;
+    use oxideav_dirac::parse_info::ParseInfo;
+    use oxideav_dirac::picture_inter::parse_picture_prediction_parameters;
+    let mut pos = 0usize;
+    let mut inter_units = 0usize;
+    while let Some(pi) = ParseInfo::parse(&stream, pos) {
+        if pi.parse_code == 0x09 {
+            let payload = &stream[pos + 13..pos + pi.next_parse_offset as usize];
+            let mut r = BitReader::new(payload);
+            r.byte_align();
+            let _pic_num = r.read_uint_lit(4);
+            let _d1 = r.read_sint();
+            r.byte_align();
+            let pred = parse_picture_prediction_parameters(&mut r, &seq, 1).expect("PPP");
+            assert!(pred.using_global, "inter picture must signal using_global");
+            let g1 = pred.global1.expect("global1 present");
+            assert_eq!(g1.pan_tilt, (-1, -1), "pan_tilt reaches the wire");
+            inter_units += 1;
+        }
+        if pi.next_parse_offset == 0 {
+            break;
+        }
+        pos += pi.next_parse_offset as usize;
+        if pos >= stream.len() {
+            break;
+        }
+    }
+    assert_eq!(inter_units, 3, "three 0x09 pictures in the chain");
+
+    // The whole stream still decodes to one frame per input picture.
+    assert_eq!(decode_frame_count(stream), inputs.len());
+
+    // Rate control still functions: every satisfiable request fits.
+    assert_eq!(report.len(), 3);
+    for e in &report {
+        assert_eq!(e.requested_residue_bytes, target, "PerPicture request");
+        if e.qindex < 127 {
+            assert!(
+                e.actual_residue_bytes <= e.requested_residue_bytes,
+                "pic {}: residue {} bytes over budget {}",
+                e.picture_number,
+                e.actual_residue_bytes,
+                e.requested_residue_bytes
+            );
+        }
+    }
+}

@@ -102,6 +102,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     {0, 2}` × residue {q0, q64, off}. Every combination encodes and
     round-trips to exactly 2 frames — no panic, no arith desync, no
     livelock.
+  - **Sequence-driver integration**
+    (`tests/encoder_inter_sequence_rate.rs::sequence_driver_threads_global_motion`):
+    the multi-picture rate-controlled driver clones `inter_params` per
+    picture, so a `GlobalMotionConfig` reaches every `0x09` unit — the
+    test parses each emitted PPP back (`using_global` + the caller's
+    `pan_tilt` on the wire on all 3 inter pictures), the chain decodes
+    one frame per input, and every satisfiable PerPicture residue
+    request stays within budget. The `inter_residue_bytes_at_qindex`
+    estimator resolves the same gmode grid + effective global params the
+    emitter uses (`build_inter_residue_pyramids`), so rate control
+    measures the true global-motion residue.
 
 - **§11.3.3 spatial-partition (codeblock grid) for the inter-residue
   encoder** (round-370) — closes the lib-doc "still unsupported:
