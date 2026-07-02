@@ -92,6 +92,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     ≥ 60 dB). Discovering that the first two plateaued at the exact
     no-residue PSNR while 15-of-16-global closed bit-exactly is what
     exposed the §B.2.7.1 terminator bug.
+  - **Global-motion fuzz arm**
+    (`tests/encoder_inter_fuzz_oracle.rs::global_motion_parameter_sweep_never_panics`):
+    120 combinations of field shape (pure pan / zoom ramp / huge
+    out-of-frame rotation-shear that lands every fetch on the §15.8.9
+    edge clamp / active perspective with per-pixel sign-varying `m` /
+    extreme `zrs_exp = 12` magnitudes) × per-block gmode grid
+    (all-global, half, sparse 1-in-7, alternating) × `mv_precision
+    {0, 2}` × residue {q0, q64, off}. Every combination encodes and
+    round-trips to exactly 2 frames — no panic, no arith desync, no
+    livelock.
 
 - **§11.3.3 spatial-partition (codeblock grid) for the inter-residue
   encoder** (round-370) — closes the lib-doc "still unsupported:

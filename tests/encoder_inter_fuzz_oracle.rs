@@ -571,3 +571,117 @@ fn high_qindex_residue_still_round_trips() {
     let stream = encode_intra_then_inter_stream(&seq, &intra_p, &params, &intra, &inter);
     assert_decodes_to(&stream, 2, "residue qindex=127 (max quantiser)");
 }
+
+/// **§11.2.6 global-motion parameter-surface sweep** (round-382). Walks
+/// the global-motion config axes — field shape (pure pan / zoom ramp /
+/// perspective / combined, including extreme exponents and magnitudes
+/// that fling the field far out of frame so the §15.8.9 edge clamp
+/// fires everywhere) × per-block grid (all-global, half, sparse,
+/// alternating) × `mv_precision {0, 2}` × residue {on(q0), on(q64),
+/// off} — and asserts every combination encodes and round-trips to
+/// exactly 2 frames with no panic and no arith desync.
+#[test]
+fn global_motion_parameter_sweep_never_panics() {
+    use oxideav_dirac::encoder_inter::GlobalMotionConfig;
+    use oxideav_dirac::picture_inter::GlobalParams;
+
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let ip = intra_params();
+    let (y0, u0, v0, y1, u1, v1) = synthetic_translating_pair_64(4, 0);
+    let intra = (y0.to_vec(), u0.to_vec(), v0.to_vec());
+    let inter = (y1.to_vec(), u1.to_vec(), v1.to_vec());
+
+    let fields = [
+        // Pure translation.
+        GlobalParams {
+            pan_tilt: (-5, -1),
+            zrs: [[0, 0], [0, 0]],
+            zrs_exp: 0,
+            perspective: (0, 0),
+            persp_exp: 0,
+        },
+        // Gentle zoom ramp.
+        GlobalParams {
+            pan_tilt: (0, 0),
+            zrs: [[1, 0], [0, 1]],
+            zrs_exp: 4,
+            perspective: (0, 0),
+            persp_exp: 0,
+        },
+        // Rotation/shear with a huge magnitude — every pixel's fetch
+        // lands on the §15.8.9 edge clamp.
+        GlobalParams {
+            pan_tilt: (997, -1203),
+            zrs: [[93, -41], [57, 88]],
+            zrs_exp: 1,
+            perspective: (0, 0),
+            persp_exp: 0,
+        },
+        // Perspective active (m varies per pixel, can go negative).
+        GlobalParams {
+            pan_tilt: (3, 3),
+            zrs: [[1, 0], [0, 1]],
+            zrs_exp: 0,
+            perspective: (5, -7),
+            persp_exp: 8,
+        },
+        // Extreme exponents: zrs_exp near the top of what read_uint
+        // round-trips comfortably; perspective exponent 0 with non-zero
+        // vector (aggressive per-pixel modulation).
+        GlobalParams {
+            pan_tilt: (-2, 9),
+            zrs: [[1023, 511], [-511, 1023]],
+            zrs_exp: 12,
+            perspective: (1, 1),
+            persp_exp: 0,
+        },
+    ];
+
+    let n = 16 * 16;
+    let grids: [Option<Vec<bool>>; 4] = [
+        None,
+        Some((0..n).map(|i| (i % 16) < 8).collect()),
+        Some((0..n).map(|i| i % 7 == 0).collect()),
+        Some((0..n).map(|i| i % 2 == 0).collect()),
+    ];
+
+    let mut count = 0u32;
+    for field in &fields {
+        for grid in &grids {
+            for mv_precision in [0u32, 2] {
+                for residue in [
+                    Some(ResidueParams::default_for(WaveletFilter::LeGall5_3, 3)),
+                    Some({
+                        let mut r = ResidueParams::default_for(WaveletFilter::LeGall5_3, 3);
+                        r.qindex = 64;
+                        r
+                    }),
+                    None,
+                ] {
+                    let params = InterEncoderParams {
+                        mv_precision,
+                        residue,
+                        global_motion: Some(GlobalMotionConfig {
+                            global1: field.clone(),
+                            global2: None,
+                            block_gmode: grid.clone(),
+                        }),
+                        ..InterEncoderParams::default()
+                    };
+                    let (pa, pb) = pair_inputs(&intra, &inter);
+                    let stream = encode_intra_then_inter_stream(&seq, &ip, &params, &pa, &pb);
+                    count += 1;
+                    assert_decodes_to(
+                        &stream,
+                        2,
+                        &format!(
+                            "global sweep #{count}: field {field:?} grid {:?} prec {mv_precision}",
+                            grid.as_ref().map(|g| g.iter().filter(|&&b| b).count())
+                        ),
+                    );
+                }
+            }
+        }
+    }
+    assert_eq!(count, 120, "sweep should cover 5 × 4 × 2 × 3 combinations");
+}
