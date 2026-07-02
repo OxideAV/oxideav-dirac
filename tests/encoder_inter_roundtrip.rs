@@ -12,8 +12,9 @@ use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
 use oxideav_dirac::encoder::{make_minimal_sequence, EncoderParams};
 use oxideav_dirac::encoder_inter::{
     encode_intra_then_inter_stream, synthetic_camera_pan_64, synthetic_translating_pair_64,
-    InterEncoderParams, InterInputPicture, ResidueParams,
+    GlobalMotionConfig, InterEncoderParams, InterInputPicture, ResidueParams,
 };
+use oxideav_dirac::picture_inter::GlobalParams;
 use oxideav_dirac::video_format::ChromaFormat;
 use oxideav_dirac::wavelet::WaveletFilter;
 
@@ -1004,4 +1005,91 @@ fn post_obmc_selector_monotonic_at_pipeline_endpoint() {
             );
         }
     }
+}
+
+/// **§11.2.6 global-motion P-picture end-to-end** (round-382). Encode a
+/// 1-ref inter picture whose motion is described entirely by the global
+/// affine field (every block is a §12.3.3.2 global block, no per-block
+/// MV residual), then decode through the full pipeline and confirm the
+/// picture reconstructs.
+///
+/// A zero affine matrix collapses `global_mv` to a constant translation
+/// `t = pan_tilt + 1` (the +1 is the §15.8.8 rounding bias with
+/// `zrs_exp = perspective = 0`). We pick `pan_tilt = (-5, -1)` so the
+/// field is a pure `(-4, 0)` translation, exactly matching a reference
+/// that was shifted +4 horizontally to make the current frame. The
+/// §11.3 wavelet residue (LeGall 5/3, qindex 0) then closes the
+/// prediction-error loop, so the reconstruction is at least as good as
+/// the block-motion path — and the global-motion decode path is
+/// exercised end-to-end for the first time.
+#[test]
+fn intra_then_inter_global_motion_p_picture_roundtrips() {
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let intra_params = EncoderParams::default_hq(WaveletFilter::LeGall5_3, 3);
+
+    // Frame 0: square at (24, 24); Frame 1: square at (28, 24).
+    let (y0, u0, v0, y1, u1, v1) = synthetic_translating_pair_64(4, 0);
+
+    // Zero affine matrix → constant translation `pan_tilt + 1`.
+    // pan_tilt (-5, -1) ⇒ field (-4, 0), matching the +4 shift.
+    let global1 = GlobalParams {
+        pan_tilt: (-5, -1),
+        zrs: [[0, 0], [0, 0]],
+        zrs_exp: 0,
+        perspective: (0, 0),
+        persp_exp: 0,
+    };
+    let inter_params = InterEncoderParams {
+        mv_precision: 0,
+        global_motion: Some(GlobalMotionConfig {
+            global1,
+            global2: None,
+            block_gmode: None,
+        }),
+        ..InterEncoderParams::default()
+    };
+
+    let intra = InterInputPicture {
+        picture_number: 10,
+        y: &y0,
+        u: &u0,
+        v: &v0,
+    };
+    let inter = InterInputPicture {
+        picture_number: 11,
+        y: &y1,
+        u: &u1,
+        v: &v1,
+    };
+    let stream = encode_intra_then_inter_stream(&seq, &intra_params, &inter_params, &intra, &inter);
+
+    let mut reg = CodecRegistry::new();
+    oxideav_dirac::register_codecs(&mut reg);
+    let cp = CodecParameters::video(CodecId::new("dirac"));
+    let mut dec = reg.first_decoder(&cp).expect("make decoder");
+    let packet = Packet::new(0, TimeBase::new(1, 25), stream);
+    dec.send_packet(&packet).expect("send_packet");
+
+    // Intra anchor bit-exact at qindex 0.
+    let frame0 = match dec.receive_frame().expect("intra frame") {
+        Frame::Video(vf) => vf,
+        other => panic!("expected video, got {other:?}"),
+    };
+    assert_eq!(frame0.planes[0].data, y0.to_vec(), "intra anchor bit-exact");
+
+    // Inter global-motion picture reconstructs against ground truth.
+    let frame1 = match dec.receive_frame().expect("inter frame") {
+        Frame::Video(vf) => vf,
+        other => panic!("expected video, got {other:?}"),
+    };
+    let psnr_y = psnr(&frame1.planes[0].data, &y1);
+    let psnr_u = psnr(&frame1.planes[1].data, &u1);
+    let psnr_v = psnr(&frame1.planes[2].data, &v1);
+    eprintln!("global-motion inter PSNR: Y={psnr_y:.2} U={psnr_u:.2} V={psnr_v:.2}");
+    assert!(
+        psnr_y > 30.0,
+        "global-motion inter Y PSNR {psnr_y:.2} dB below 30 dB"
+    );
+    assert!(psnr_u >= 40.0, "U PSNR {psnr_u:.2} dB below 40 dB");
+    assert!(psnr_v >= 40.0, "V PSNR {psnr_v:.2} dB below 40 dB");
 }

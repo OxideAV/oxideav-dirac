@@ -49,6 +49,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     16-block grid recovers every `gmode` flag through
     `decode_block_motion_data`, and the non-global blocks recover their
     MVs.
+  - **End-to-end global-motion P-picture** (parse code `0x09`).
+    `encode_inter_picture` threads the global config through the block
+    motion data **and** the §11.3 residue: the OBMC prediction the
+    encoder subtracts is built from a [`PictureMotionData`] carrying
+    `gmode` blocks + `global1`, so it reconstructs the same §15.8.8
+    `global_mv` affine field the decoder does.
+    `tests/encoder_inter_roundtrip.rs::intra_then_inter_global_motion_p_picture_roundtrips`
+    encodes a whole-picture global model (zero affine matrix ⇒ constant
+    `pan_tilt + 1` translation) matching a +4 shift and decodes it
+    through the full registered pipeline: intra anchor bit-exact,
+    global-motion inter frame Y ≈ 35.8 dB / chroma ≈ 70 dB — the first
+    time the §11.2.6/§12.3.3.2/§15.8.8 global-motion decode path is
+    exercised by an oxideav-produced stream.
+  - New `GlobalMotionConfig::pan_tilt_all(dx, dy)` convenience
+    constructor (whole-picture pure-translation global model against
+    ref1).
   encoder** (round-370) — closes the lib-doc "still unsupported:
   per-codeblock partitioning for the residue path" gap. The §11.3
   wavelet-residue path now accepts an optional per-level
