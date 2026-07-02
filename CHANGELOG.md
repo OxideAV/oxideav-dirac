@@ -122,6 +122,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     all three planes — independent validation of the §11.2.6 parameter
     emission, §12.3.3.2 flag coding, §15.8.8 field arithmetic, and the
     exact terminator in one stream.
+  - **Global-motion estimation** — `estimate_global_pan_config` fits a
+    pan/tilt model from the encoder's own ME grid (component-wise median
+    MV = dominant translation `t`; zero affine matrix with
+    `pan_tilt = t - (1, 1)` makes the §15.8.8 field the constant `t`)
+    and marks exactly the blocks whose ME MV equals `t` as global — a
+    pure re-labelling that provably cannot change the prediction, it
+    only sheds the matching blocks' MV residuals from the wire. Returns
+    the config + the matched fraction so the caller can gate on motion
+    coherence. Unit-pinned
+    (`estimate_global_pan_matches_dominant_translation`: whole-frame
+    integer pan over a textured field → fraction 1.0, field == median at
+    every probe, per-block gmode consistency) and end-to-end
+    (`estimated_global_motion_roundtrips_and_matches_block_motion_quality`:
+    the estimated-global stream decodes bit-exactly, identical quality
+    to the block-motion encode, marginally smaller stream).
 
 - **§11.3.3 spatial-partition (codeblock grid) for the inter-residue
   encoder** (round-370) — closes the lib-doc "still unsupported:

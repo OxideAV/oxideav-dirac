@@ -266,6 +266,58 @@ impl GlobalMotionConfig {
     }
 }
 
+/// **Estimate a pan/tilt global-motion model from the encoder's own ME**
+/// (round-382). Runs the same motion search [`encode_inter_picture`]
+/// will run (`inter_mv_grid` — sub-pel search + the round-73 adaptive
+/// int-pel snap), takes the component-wise median MV as the dominant
+/// translation `t`, and builds a [`GlobalMotionConfig`] whose §15.8.8
+/// field equals `t` at every pixel:
+///
+/// * zero affine matrix + `zrs_exp = persp_exp = 0` collapses
+///   `global_mv` to the constant `pan_tilt + (1, 1)` (the rounding bias
+///   at shift 0), so `pan_tilt = t - (1, 1)`;
+/// * a block is marked global **iff** its ME MV equals `t` exactly —
+///   for those blocks the field reproduces the block MV, so switching
+///   them to global mode changes *nothing* about the prediction (and
+///   therefore nothing about the §11.3 residue); it only removes their
+///   per-block MV residuals from the wire;
+/// * blocks whose MV differs keep block motion with their own MV.
+///
+/// Returns the config plus the global fraction (`0.0..=1.0` share of
+/// blocks that matched `t`). The caller decides the threshold — on
+/// whole-frame pans the fraction approaches 1.0 and the config is a
+/// clear win; on scattered motion it approaches `0` and block motion
+/// alone is better (the config would spend `using_global` header bits +
+/// one gmode flag per block for nothing).
+pub fn estimate_global_pan_config(
+    sequence: &SequenceHeader,
+    params: &InterEncoderParams,
+    cur_y: &[u8],
+    ref_y: &[u8],
+) -> (GlobalMotionConfig, f64) {
+    let mvs = inter_mv_grid(sequence, params, cur_y, ref_y);
+    let mut xs: Vec<i32> = mvs.iter().map(|m| m.0).collect();
+    let mut ys: Vec<i32> = mvs.iter().map(|m| m.1).collect();
+    let t = (median(&mut xs), median(&mut ys));
+    let gmode: Vec<bool> = mvs.iter().map(|m| (m.0, m.1) == t).collect();
+    let matched = gmode.iter().filter(|&&b| b).count();
+    let fraction = matched as f64 / gmode.len().max(1) as f64;
+    (
+        GlobalMotionConfig {
+            global1: GlobalParams {
+                pan_tilt: (t.0 - 1, t.1 - 1),
+                zrs: [[0, 0], [0, 0]],
+                zrs_exp: 0,
+                perspective: (0, 0),
+                persp_exp: 0,
+            },
+            global2: None,
+            block_gmode: Some(gmode),
+        },
+        fraction,
+    )
+}
+
 /// Wavelet residue encoder parameters. Mirrors
 /// [`crate::encoder_intra_core::CoreIntraEncoderParams`] but for the
 /// inter-residue path: same `WaveletFilter` and `dwt_depth` knobs, plus
@@ -5262,6 +5314,66 @@ mod tests {
             assert_eq!(p2.pan_tilt, g2.pan_tilt);
             assert_eq!(p2.perspective, g2.perspective);
             assert_eq!(p2.persp_exp, g2.persp_exp);
+        }
+    }
+
+    /// [`estimate_global_pan_config`] on a translating fixture: the
+    /// dominant translation is the median ME MV, blocks matching it are
+    /// global, non-matching blocks stay block-motion, and the §15.8.8
+    /// field reproduces the median exactly (`pan_tilt = t - 1` under the
+    /// zero affine matrix).
+    #[test]
+    fn estimate_global_pan_matches_dominant_translation() {
+        use crate::obmc::global_mv;
+        let seq = crate::encoder::make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+        let params = InterEncoderParams {
+            mv_precision: 0,
+            ..InterEncoderParams::default()
+        };
+        // Whole-frame integer pan over a textured field: a deterministic
+        // pseudo-random reference shifted left by 3 pels (edge columns
+        // replicated). Every interior block's ME lands on exactly
+        // (+3, 0); only right-edge blocks (whose true content left the
+        // frame) can disagree.
+        let mut y0 = vec![0u8; 64 * 64];
+        let mut state = 0x2468_ace1u32;
+        for px in y0.iter_mut() {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            *px = 40 + (state % 160) as u8;
+        }
+        let mut y1 = vec![0u8; 64 * 64];
+        for r in 0..64usize {
+            for c in 0..64usize {
+                y1[r * 64 + c] = y0[r * 64 + (c + 3).min(63)];
+            }
+        }
+        let (cfg, fraction) = estimate_global_pan_config(&seq, &params, &y1, &y0);
+        assert!(
+            fraction >= 0.8,
+            "whole-frame integer pan should mark ≥ 80% of blocks global, got {fraction}"
+        );
+        let grid = cfg.block_gmode.as_ref().expect("per-block grid");
+        assert_eq!(grid.len(), 16 * 16);
+        // The field must equal the dominant MV at every pixel: recompute
+        // the median from the same ME the estimator ran. On this fixture
+        // the dominant translation is exactly (+3, 0).
+        let mvs = inter_mv_grid(&seq, &params, &y1, &y0);
+        let mut xs: Vec<i32> = mvs.iter().map(|m| m.0).collect();
+        let mut ys: Vec<i32> = mvs.iter().map(|m| m.1).collect();
+        let t = (median(&mut xs), median(&mut ys));
+        for (x, y) in [(0, 0), (13, 7), (63, 63)] {
+            assert_eq!(
+                global_mv(&cfg.global1, x, y),
+                t,
+                "field must be the constant median translation"
+            );
+        }
+        // Every marked block's ME MV equals the field; every unmarked
+        // block's differs.
+        for (i, &g) in grid.iter().enumerate() {
+            assert_eq!((mvs[i].0, mvs[i].1) == t, g, "block {i} gmode consistency");
         }
     }
 

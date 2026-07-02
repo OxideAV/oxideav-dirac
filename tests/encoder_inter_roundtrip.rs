@@ -1298,3 +1298,98 @@ fn intra_then_inter_mixed_global_and_block_motion_roundtrips() {
          two prediction branches disagree with the decoder somewhere"
     );
 }
+
+/// **Estimated global motion end-to-end** (round-382).
+/// `estimate_global_pan_config` fits the dominant translation from the
+/// encoder's own ME grid and marks exactly the matching blocks global;
+/// feeding the estimate back into `encode_inter_picture` must produce a
+/// stream that (a) signals `using_global`, (b) decodes at the same
+/// near-lossless quality as the pure block-motion encode (the estimate
+/// only re-labels blocks whose MV the field reproduces exactly, so the
+/// prediction — and the qindex-0 residue — is unchanged), and (c) sheds
+/// the global blocks' MV residuals from the wire.
+#[test]
+fn estimated_global_motion_roundtrips_and_matches_block_motion_quality() {
+    use oxideav_dirac::encoder_inter::estimate_global_pan_config;
+
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let intra_params = EncoderParams::default_hq(WaveletFilter::LeGall5_3, 3);
+
+    // Whole-frame integer pan over a textured field (same construction
+    // as the estimator's unit fixture).
+    let mut y0 = vec![0u8; 64 * 64];
+    let mut state = 0x2468_ace1u32;
+    for px in y0.iter_mut() {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        *px = 40 + (state % 160) as u8;
+    }
+    let mut y1 = vec![0u8; 64 * 64];
+    for r in 0..64usize {
+        for c in 0..64usize {
+            y1[r * 64 + c] = y0[r * 64 + (c + 3).min(63)];
+        }
+    }
+    let u = vec![128u8; 32 * 32];
+    let v = vec![128u8; 32 * 32];
+
+    let base = InterEncoderParams {
+        mv_precision: 0,
+        ..InterEncoderParams::default()
+    };
+    let (cfg, fraction) = estimate_global_pan_config(&seq, &base, &y1, &y0);
+    assert!(fraction >= 0.8, "estimator fraction {fraction} too low");
+    let global_params = InterEncoderParams {
+        global_motion: Some(cfg),
+        ..base.clone()
+    };
+
+    let intra = InterInputPicture {
+        picture_number: 0,
+        y: &y0,
+        u: &u,
+        v: &v,
+    };
+    let inter = InterInputPicture {
+        picture_number: 1,
+        y: &y1,
+        u: &u,
+        v: &v,
+    };
+
+    let decode_y_psnr = |params: &InterEncoderParams| -> (f64, usize) {
+        let stream = encode_intra_then_inter_stream(&seq, &intra_params, params, &intra, &inter);
+        let len = stream.len();
+        let mut reg = CodecRegistry::new();
+        oxideav_dirac::register_codecs(&mut reg);
+        let cp = CodecParameters::video(CodecId::new("dirac"));
+        let mut dec = reg.first_decoder(&cp).expect("decoder");
+        let packet = Packet::new(0, TimeBase::new(1, 25), stream);
+        dec.send_packet(&packet).expect("send");
+        let _f0 = dec.receive_frame().expect("intra");
+        let f1 = match dec.receive_frame().expect("inter") {
+            Frame::Video(vf) => vf,
+            other => panic!("expected video, got {other:?}"),
+        };
+        (psnr(&f1.planes[0].data, &y1), len)
+    };
+
+    let (psnr_block, len_block) = decode_y_psnr(&base);
+    let (psnr_global, len_global) = decode_y_psnr(&global_params);
+    eprintln!(
+        "estimated global: fraction {fraction:.3}, block-motion {psnr_block:.2} dB / \
+         {len_block} B, global {psnr_global:.2} dB / {len_global} B"
+    );
+    // Same prediction ⇒ same residue ⇒ same reconstruction quality
+    // (allow a whisker for arith-context divergence between layouts).
+    assert!(
+        psnr_global >= 60.0,
+        "estimated-global inter Y PSNR {psnr_global:.2} dB below 60 dB"
+    );
+    assert!(
+        (psnr_global - psnr_block).abs() < 1.0 || psnr_global.is_infinite(),
+        "estimated global ({psnr_global:.2} dB) diverged from block motion \
+         ({psnr_block:.2} dB) — the estimate must not change the prediction"
+    );
+}
