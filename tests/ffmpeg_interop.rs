@@ -1230,3 +1230,112 @@ fn ffmpeg_cross_decodes_inter_residue_beats_no_residue() {
          and add it to its OBMC prediction"
     );
 }
+
+/// **§11.2.6 global-motion cross-decode** (round-382). The external
+/// oracle decodes a whole-picture global-motion 1-ref P stream (core
+/// intra `0x0C` anchor + `0x09` inter; zero affine matrix ⇒ constant
+/// `(-4, 0)` field matching the fixture's +4 shift; every block a
+/// §12.3.3.2 global block so no MV residuals are on the wire) and the
+/// inter frame reconstructs **bit-exactly** against the encoder input —
+/// third-party validation of the global-motion parameter emission, the
+/// per-block global-flag coding, the §15.8.8 field arithmetic, and the
+/// round-382 exact §B.2.7.1 arith terminator, in one stream.
+#[test]
+fn ffmpeg_decodes_our_global_motion_p_stream_bit_exact() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg not available; skipping global-motion cross-decode");
+        return;
+    }
+    use oxideav_dirac::encoder::make_minimal_sequence;
+    use oxideav_dirac::encoder_inter::{
+        synthetic_translating_pair_64, GlobalMotionConfig, InterEncoderParams, InterInputPicture,
+    };
+    use oxideav_dirac::encoder_intra_core::{
+        encode_core_intra_then_inter_stream, CoreIntraEncoderParams,
+    };
+    use oxideav_dirac::picture_inter::GlobalParams;
+    use oxideav_dirac::wavelet::WaveletFilter;
+
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let intra_params = CoreIntraEncoderParams::default_intra(WaveletFilter::LeGall5_3, 3);
+    let (y0, u0, v0, y1, u1, v1) = synthetic_translating_pair_64(4, 0);
+    let global1 = GlobalParams {
+        pan_tilt: (-5, -1),
+        zrs: [[0, 0], [0, 0]],
+        zrs_exp: 0,
+        perspective: (0, 0),
+        persp_exp: 0,
+    };
+    let inter_params = InterEncoderParams {
+        mv_precision: 0,
+        global_motion: Some(GlobalMotionConfig {
+            global1,
+            global2: None,
+            block_gmode: None,
+        }),
+        ..InterEncoderParams::default()
+    };
+    let intra = InterInputPicture {
+        picture_number: 0,
+        y: &y0,
+        u: &u0,
+        v: &v0,
+    };
+    let inter = InterInputPicture {
+        picture_number: 1,
+        y: &y1,
+        u: &u1,
+        v: &v1,
+    };
+    let stream =
+        encode_core_intra_then_inter_stream(&seq, &intra_params, &inter_params, &intra, &inter);
+
+    let drc = std::env::temp_dir().join("oxideav_dirac_global_motion_p.drc");
+    let yuv = std::env::temp_dir().join("oxideav_dirac_global_motion_p.yuv");
+    std::fs::write(&drc, &stream).expect("write drc");
+    let s = std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "dirac",
+            "-i",
+        ])
+        .arg(&drc)
+        .args(["-f", "rawvideo", "-pix_fmt", "yuv420p"])
+        .arg(&yuv)
+        .status()
+        .expect("run ffmpeg");
+    assert!(
+        s.success(),
+        "external oracle rejected the global-motion stream — see {drc:?}"
+    );
+
+    let out = std::fs::read(&yuv).expect("read decoded yuv");
+    let frame_size = 64 * 64 + 2 * 32 * 32;
+    assert_eq!(
+        out.len(),
+        2 * frame_size,
+        "expected exactly 2 decoded frames"
+    );
+    // Intra anchor bit-exact (q=0 core intra).
+    assert_eq!(&out[..64 * 64], &y0[..], "anchor Y bit-exact");
+    // Global-motion inter picture bit-exact.
+    assert_eq!(
+        &out[frame_size..frame_size + 64 * 64],
+        &y1[..],
+        "global-motion inter Y bit-exact through the external oracle"
+    );
+    assert_eq!(
+        &out[frame_size + 64 * 64..frame_size + 64 * 64 + 32 * 32],
+        &u1[..],
+        "global-motion inter U bit-exact"
+    );
+    assert_eq!(
+        &out[frame_size + 64 * 64 + 32 * 32..2 * frame_size],
+        &v1[..],
+        "global-motion inter V bit-exact"
+    );
+}

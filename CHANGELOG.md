@@ -113,6 +113,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     estimator resolves the same gmode grid + effective global params the
     emitter uses (`build_inter_residue_pyramids`), so rate control
     measures the true global-motion residue.
+  - **External-oracle cross-decode**
+    (`tests/ffmpeg_interop.rs::ffmpeg_decodes_our_global_motion_p_stream_bit_exact`,
+    gated on validator availability): a whole-picture global-motion
+    1-ref P stream (core `0x0C` anchor + `0x09` inter, constant
+    `(-4, 0)` field, no MV residuals on the wire) is accepted by the
+    external oracle and the inter frame reconstructs **bit-exactly** on
+    all three planes — independent validation of the §11.2.6 parameter
+    emission, §12.3.3.2 flag coding, §15.8.8 field arithmetic, and the
+    exact terminator in one stream.
 
 - **§11.3.3 spatial-partition (codeblock grid) for the inter-residue
   encoder** (round-370) — closes the lib-doc "still unsupported:
