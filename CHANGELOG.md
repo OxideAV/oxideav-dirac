@@ -33,6 +33,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     block per reference. Pinned by
     `picture_prediction_parameters_global_roundtrips` (1-ref emits
     global1 only; 2-ref emits both).
+  - **§12.3.3.2 per-block global-mode emission.** `encode_prediction_modes`
+    now emits the block-global flag for every non-intra block under
+    global motion, coded as a residual against the §12.3.6.4
+    neighbour-majority prediction (`block_global_prediction_enc` +
+    `propagate_gmode` mirror the decoder). Global blocks carry **no** MV
+    residual — `encode_vector_elements` already skipped them, and now
+    also carries each block's `gmode` in its MV-prediction context so the
+    §12.3.6.1 neighbour median matches the decoder exactly (previously
+    the local context always saw `gmode = false`). `encode_block_motion_data`
+    / `encode_block_motion_data_bipred` gained a `gmode: Option<&[bool]>`
+    grid; `resolve_gmode_grid` derives it from the config (whole-picture
+    global by default). Pinned by
+    `block_motion_data_global_flags_roundtrip`: a mixed global/block-motion
+    16-block grid recovers every `gmode` flag through
+    `decode_block_motion_data`, and the non-global blocks recover their
+    MVs.
   encoder** (round-370) — closes the lib-doc "still unsupported:
   per-codeblock partitioning for the residue path" gap. The §11.3
   wavelet-residue path now accepts an optional per-level

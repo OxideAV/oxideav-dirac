@@ -1338,6 +1338,19 @@ pub fn inter_select_int_pel_per_block(
 /// picture with all-Ref1Only blocks at the bottom of the superblock
 /// hierarchy (split=2 → 4x4 = 16 blocks per superblock, the maximum).
 /// `mvs` is a `blocks_x * blocks_y` row-major array of integer-pel MVs.
+/// Resolve the per-block global-mode grid for a `blocks_x * blocks_y`
+/// motion field from the encoder config. Returns a `bool` per block:
+/// `true` marks a §12.3.3.2 global block. A caller-supplied
+/// `block_gmode` grid is used when its length matches; otherwise the
+/// whole picture is global (every block `true`).
+fn resolve_gmode_grid(cfg: &GlobalMotionConfig, blocks_x: u32, blocks_y: u32) -> Vec<bool> {
+    let n = (blocks_x * blocks_y) as usize;
+    match &cfg.block_gmode {
+        Some(g) if g.len() == n => g.clone(),
+        _ => vec![true; n],
+    }
+}
+
 pub fn encode_block_motion_data(
     w: &mut BitWriter,
     superblocks_x: u32,
@@ -1345,14 +1358,19 @@ pub fn encode_block_motion_data(
     blocks_x: u32,
     blocks_y: u32,
     mvs: &[IntegerMv],
+    gmode: Option<&[bool]>,
 ) {
     // Reconstruct what the decoder will end up with so we can match its
     // spatial-prediction / propagation behaviour symbol-for-symbol.
     let sb_split = vec![2u32; (superblocks_x * superblocks_y) as usize];
+    let using_global = gmode.is_some();
     let mut blocks: Vec<BlockData> = (0..blocks_x * blocks_y)
         .map(|i| BlockData {
             rmode: RefPredMode::Ref1Only,
-            gmode: false,
+            // §12.3.3.2: a block is global only when the picture uses
+            // global motion and the caller marked it. Ref1Only is
+            // non-intra so the gmode flag reaches the wire.
+            gmode: gmode.map(|g| g[i as usize]).unwrap_or(false),
             mv: [(mvs[i as usize].0, mvs[i as usize].1), (0, 0)],
             dc: [0; 3],
         })
@@ -1362,10 +1380,18 @@ pub fn encode_block_motion_data(
     let split_block = encode_sb_splits(superblocks_x, superblocks_y, &sb_split);
     write_uint_then_bytes(w, &split_block);
 
-    // 2) Prediction modes — Ref1Only everywhere, no global. num_refs=1
-    //    means we only emit the ref1 bit per block.
-    let pmode_block =
-        encode_prediction_modes(superblocks_x, superblocks_y, &sb_split, &blocks, bx, 1);
+    // 2) Prediction modes — Ref1Only everywhere, plus the §12.3.3.2
+    //    per-block global flag when the picture uses global motion.
+    //    num_refs=1 means we only emit the ref1 bit per block.
+    let pmode_block = encode_prediction_modes(
+        superblocks_x,
+        superblocks_y,
+        &sb_split,
+        &blocks,
+        bx,
+        1,
+        using_global,
+    );
     write_uint_then_bytes(w, &pmode_block);
 
     // 3) Motion vectors — ref 1, dirn 0 then dirn 1.
@@ -1437,14 +1463,19 @@ pub fn encode_block_motion_data_bipred(
     blocks_x: u32,
     blocks_y: u32,
     decisions: &[BipredBlock],
+    gmode: Option<&[bool]>,
 ) {
     let sb_split = vec![2u32; (superblocks_x * superblocks_y) as usize];
+    let using_global = gmode.is_some();
     let mut blocks: Vec<BlockData> = (0..blocks_x * blocks_y)
         .map(|i| {
             let d = decisions[i as usize];
             BlockData {
                 rmode: d.rmode,
-                gmode: false,
+                // §12.3.3.2: honoured only on non-intra blocks; the
+                // bipred selector never emits Intra, so the flag reaches
+                // the wire on every marked block.
+                gmode: gmode.map(|g| g[i as usize]).unwrap_or(false),
                 mv: [(d.mv1.0, d.mv1.1), (d.mv2.0, d.mv2.1)],
                 dc: [0; 3],
             }
@@ -1455,9 +1486,17 @@ pub fn encode_block_motion_data_bipred(
     let split_block = encode_sb_splits(superblocks_x, superblocks_y, &sb_split);
     write_uint_then_bytes(w, &split_block);
 
-    // 2) Prediction modes — num_refs = 2 emits both bits per block.
-    let pmode_block =
-        encode_prediction_modes(superblocks_x, superblocks_y, &sb_split, &blocks, bx, 2);
+    // 2) Prediction modes — num_refs = 2 emits both bits per block, plus
+    //    the §12.3.3.2 per-block global flag under global motion.
+    let pmode_block = encode_prediction_modes(
+        superblocks_x,
+        superblocks_y,
+        &sb_split,
+        &blocks,
+        bx,
+        2,
+        using_global,
+    );
     write_uint_then_bytes(w, &pmode_block);
 
     // 3a) ref1 vectors — dirn 0 then dirn 1. Skip blocks whose rmode
@@ -1566,12 +1605,15 @@ fn encode_prediction_modes(
     blocks: &[BlockData],
     bx: u32,
     num_refs: u32,
+    using_global: bool,
 ) -> Vec<u8> {
     let mut enc = ArithEncoder::new();
     let mut bank = ContextBank::new(3);
     // Track which blocks have been "filled" by a top-level decode for
     // the prediction context (matches decoder propagation).
     let mut current_rmode = vec![RefPredMode::Intra; blocks.len()];
+    // Parallel gmode grid for §12.3.6.4 block-global-flag prediction.
+    let mut current_gmode = vec![false; blocks.len()];
     for ysb in 0..sby {
         for xsb in 0..sbx {
             let split = sb_split[(ysb * sbx + xsb) as usize];
@@ -1593,13 +1635,57 @@ fn encode_prediction_modes(
                         // `num_refs == 2`.
                         enc.write_bool(&mut bank, mvctx::PMODE_REF2, ((bits >> 1) & 1) == 1);
                     }
-                    // No global block emit (using_global=false everywhere).
+                    // The decoder propagates rmode across the superblock
+                    // *before* reading the global-mode flag, so the
+                    // current block's rmode is visible to
+                    // block_global_mode.
                     propagate_rmode(&mut current_rmode, bx, blkx, blky, step, target);
+
+                    // §12.3.3.2 block_global_mode. Only emitted when the
+                    // picture uses global motion AND this block is not
+                    // intra (intra blocks are forced non-global). The
+                    // flag is coded as a residual against the §12.3.6.4
+                    // neighbour-majority prediction.
+                    let target_g = using_global
+                        && target != RefPredMode::Intra
+                        && blocks[(blky * bx + blkx) as usize].gmode;
+                    if using_global && target != RefPredMode::Intra {
+                        let gpred = block_global_prediction_enc(&current_gmode, bx, blkx, blky);
+                        enc.write_bool(&mut bank, mvctx::GLOBAL_BLOCK, target_g ^ gpred);
+                    }
+                    propagate_gmode(&mut current_gmode, bx, blkx, blky, step, target_g);
                 }
             }
         }
     }
     enc.finish()
+}
+
+/// §12.3.6.4 block-global-flag prediction: majority verdict of the three
+/// already-decoded causal neighbours. Encoder mirror of the decoder's
+/// `block_global_prediction` over the running gmode grid.
+fn block_global_prediction_enc(buf: &[bool], bx: u32, x: u32, y: u32) -> bool {
+    if x == 0 && y == 0 {
+        return false;
+    }
+    if y == 0 {
+        return buf[(x - 1) as usize];
+    }
+    if x == 0 {
+        return buf[((y - 1) * bx) as usize];
+    }
+    let count = buf[((y - 1) * bx + (x - 1)) as usize] as u32
+        + buf[((y - 1) * bx + x) as usize] as u32
+        + buf[(y * bx + (x - 1)) as usize] as u32;
+    count >= 2
+}
+
+fn propagate_gmode(buf: &mut [bool], bx: u32, xtl: u32, ytl: u32, k: u32, val: bool) {
+    for y in ytl..ytl + k {
+        for x in xtl..xtl + k {
+            buf[(y * bx + x) as usize] = val;
+        }
+    }
 }
 
 fn propagate_rmode(buf: &mut [RefPredMode], bx: u32, xtl: u32, ytl: u32, k: u32, val: RefPredMode) {
@@ -1669,9 +1755,13 @@ fn encode_vector_elements(
                     let blky = 4 * ysb + q * step;
                     let bi = (blky * bx + blkx) as usize;
                     let block = &blocks[bi];
-                    // Set the current block's rmode in `current` so
-                    // mv_prediction's mv_available check matches.
+                    // Set the current block's rmode + gmode in `current`
+                    // so mv_prediction's mv_available check matches the
+                    // decoder (§12.3.6.1 excludes global blocks from the
+                    // neighbour median, so the encoder must carry the same
+                    // gmode flags in its prediction context).
                     current[bi].rmode = block.rmode;
+                    current[bi].gmode = block.gmode;
                     // Decoder-side `block_vector` returns early if the
                     // block doesn't use this reference (or is global) —
                     // mirror that exactly so 2-ref Ref1Only blocks skip
@@ -1988,11 +2078,13 @@ fn build_motion_from_mv_grid(
     blocks_x: u32,
     blocks_y: u32,
     mvs: &[IntegerMv],
+    gmode: Option<&[bool]>,
+    global1: Option<GlobalParams>,
 ) -> PictureMotionData {
     let blocks: Vec<BlockData> = (0..blocks_x * blocks_y)
         .map(|i| BlockData {
             rmode: RefPredMode::Ref1Only,
-            gmode: false,
+            gmode: gmode.map(|g| g[i as usize]).unwrap_or(false),
             mv: [(mvs[i as usize].0, mvs[i as usize].1), (0, 0)],
             dc: [0; 3],
         })
@@ -2004,7 +2096,7 @@ fn build_motion_from_mv_grid(
         superblocks_y: sby,
         sb_split: vec![2u32; (sbx * sby) as usize],
         blocks,
-        global1: None,
+        global1,
         global2: None,
     }
 }
@@ -2583,7 +2675,23 @@ fn build_inter_residue_pyramids(
 ) -> InterResiduePyramids {
     let (sbx, sby, blocks_x, blocks_y) = motion_grid(sequence.luma_width, sequence.luma_height);
     let pred = picture_prediction_params_from(sequence, iep, iep.mv_precision, 1);
-    let motion = build_motion_from_mv_grid(sbx, sby, blocks_x, blocks_y, mvs);
+    let gmode_grid = iep
+        .global_motion
+        .as_ref()
+        .map(|cfg| resolve_gmode_grid(cfg, blocks_x, blocks_y));
+    let global1 = iep
+        .global_motion
+        .as_ref()
+        .map(|cfg| effective_global_params(&cfg.global1));
+    let motion = build_motion_from_mv_grid(
+        sbx,
+        sby,
+        blocks_x,
+        blocks_y,
+        mvs,
+        gmode_grid.as_deref(),
+        global1,
+    );
     let (pred_y, pred_u, pred_v) =
         build_obmc_prediction(sequence, &pred, &motion, false, ref_y, ref_u, ref_v);
     let res_y = build_residue_plane(cur_y, &pred_y, sequence.luma_depth);
@@ -2777,7 +2885,25 @@ pub fn encode_inter_picture(
     // when `mv_precision == 0`.
     let (sbx, sby, blocks_x, blocks_y) = motion_grid(sequence.luma_width, sequence.luma_height);
     let mvs = inter_mv_grid(sequence, params, cur_y, ref_y);
-    encode_block_motion_data(&mut w, sbx, sby, blocks_x, blocks_y, &mvs);
+    // §12.3.3.2 per-block global-mode grid (None when the picture uses
+    // block motion only).
+    let gmode_grid = params
+        .global_motion
+        .as_ref()
+        .map(|cfg| resolve_gmode_grid(cfg, blocks_x, blocks_y));
+    let global1 = params
+        .global_motion
+        .as_ref()
+        .map(|cfg| effective_global_params(&cfg.global1));
+    encode_block_motion_data(
+        &mut w,
+        sbx,
+        sby,
+        blocks_x,
+        blocks_y,
+        &mvs,
+        gmode_grid.as_deref(),
+    );
     w.byte_align();
 
     // §11.3 wavelet_transform.
@@ -2787,7 +2913,15 @@ pub fn encode_inter_picture(
         // decoder will reconstruct from the bytes we just wrote so the
         // OBMC prediction matches symbol-for-symbol.
         let pred = picture_prediction_params_from(sequence, params, params.mv_precision, 1);
-        let motion = build_motion_from_mv_grid(sbx, sby, blocks_x, blocks_y, &mvs);
+        let motion = build_motion_from_mv_grid(
+            sbx,
+            sby,
+            blocks_x,
+            blocks_y,
+            &mvs,
+            gmode_grid.as_deref(),
+            global1.clone(),
+        );
         let (pred_y, pred_u, pred_v) =
             build_obmc_prediction(sequence, &pred, &motion, false, ref_y, ref_u, ref_v);
         let res_y = build_residue_plane(cur_y, &pred_y, sequence.luma_depth);
@@ -3982,7 +4116,7 @@ pub fn encode_bipred_inter_picture(
         );
     }
 
-    encode_block_motion_data_bipred(&mut w, sbx, sby, blocks_x, blocks_y, &decisions);
+    encode_block_motion_data_bipred(&mut w, sbx, sby, blocks_x, blocks_y, &decisions, None);
     w.byte_align();
 
     // §11.3 wavelet_transform.
@@ -4799,7 +4933,7 @@ mod tests {
             .map(|i| IntegerMv((i % 4) - 1, (i / 4) - 1))
             .collect();
         let mut w = BitWriter::new();
-        encode_block_motion_data(&mut w, sbx, sby, bx, by, &mvs);
+        encode_block_motion_data(&mut w, sbx, sby, bx, by, &mvs, None);
         let bytes = w.finish();
 
         // Parse: simulate `parse_picture_prediction_parameters` having
@@ -4843,6 +4977,70 @@ mod tests {
                     mvs[i].0,
                     mvs[i].1
                 );
+            }
+        }
+    }
+
+    /// Encoded `block_motion_data` with a §12.3.3.2 per-block global-mode
+    /// grid must round-trip: every block's `gmode` flag recovers, and the
+    /// non-global blocks recover their MVs (global blocks carry no MV
+    /// residual — their MV stays at the propagated default). Exercises the
+    /// block-global-flag prediction (§12.3.6.4) with a spatially varied
+    /// pattern so the neighbour-majority prediction fires both ways.
+    #[test]
+    fn block_motion_data_global_flags_roundtrip() {
+        let sbx = 1u32;
+        let sby = 1u32;
+        let bx = 4u32;
+        let by = 4u32;
+        let mvs: Vec<IntegerMv> = (0..16i32)
+            .map(|i| IntegerMv((i % 4) - 1, (i / 4) - 1))
+            .collect();
+        // Chequerboard-ish global pattern: top-left quadrant + a couple
+        // of scattered blocks are global.
+        let gmode: Vec<bool> = (0..16)
+            .map(|i| matches!(i, 0 | 1 | 4 | 5 | 10 | 15))
+            .collect();
+        let mut w = BitWriter::new();
+        encode_block_motion_data(&mut w, sbx, sby, bx, by, &mvs, Some(&gmode));
+        let bytes = w.finish();
+
+        use crate::picture_inter::{GlobalParams, PicturePredictionParams};
+        let pred = PicturePredictionParams {
+            luma_xblen: 8,
+            luma_yblen: 8,
+            luma_xbsep: 4,
+            luma_ybsep: 4,
+            mv_precision: 0,
+            using_global: true,
+            prediction_mode: 0,
+            superblocks_x: sbx,
+            superblocks_y: sby,
+            blocks_x: bx,
+            blocks_y: by,
+            refs_wt_precision: 1,
+            ref1_wt: 1,
+            ref2_wt: 1,
+            global1: Some(GlobalParams::default()),
+            global2: None,
+        };
+        let mut r = crate::bits::BitReader::new(&bytes);
+        let motion = decode_block_motion_data(&mut r, &pred, 1).expect("decode motion");
+        for by_ in 0..by {
+            for bx_ in 0..bx {
+                let i = (by_ * bx + bx_) as usize;
+                let blk = &motion.blocks[i];
+                assert_eq!(blk.rmode, RefPredMode::Ref1Only, "block {i} rmode");
+                assert_eq!(blk.gmode, gmode[i], "block {i} gmode flag");
+                // Non-global blocks recover their MV; global blocks skip
+                // the MV residual entirely (§12.3.5).
+                if !gmode[i] {
+                    assert_eq!(
+                        blk.mv[0],
+                        (mvs[i].0, mvs[i].1),
+                        "block {i} MV mismatch (non-global)"
+                    );
+                }
             }
         }
     }

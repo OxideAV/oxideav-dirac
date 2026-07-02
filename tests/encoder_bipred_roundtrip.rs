@@ -319,7 +319,7 @@ fn bipred_block_motion_data_roundtrips_through_decoder() {
         })
         .collect();
     let mut w = BitWriter::new();
-    encode_block_motion_data_bipred(&mut w, sbx, sby, bx, by, &decisions);
+    encode_block_motion_data_bipred(&mut w, sbx, sby, bx, by, &decisions, None);
     let bytes = w.finish();
 
     let pred = PicturePredictionParams {
