@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.9](https://github.com/OxideAV/oxideav-dirac/compare/v0.0.8...v0.0.9) - 2026-07-02
+
+### Other
+
+- upgrade self-roundtrip lib test to bit-exact — terminator followup landed (round-382)
+- mention estimate_global_pan_config auto-fit (round-382)
+- pan/tilt global-motion estimation from the ME grid (round-382)
+- external-oracle bit-exact cross-decode of global-motion P stream (round-382)
+- global-motion encode + exact AC terminator status (round-382)
+- sequence-driver global-motion integration + rate-control estimate (round-382)
+- 120-case global-motion fuzz sweep (round-382)
+- global-field variant coverage — zoom ramp, qpel field, mixed grid (round-382)
+- fix §B.2.7.1 terminator — spurious follow bit corrupted AC block tails (round-382)
+- §11.2.6 global motion on the bipred (0x0A) path — bit-exact B-frame (round-382)
+- end-to-end §11.2.6 global-motion P-picture round-trip (round-382)
+- §12.3.3.2 per-block global-mode emission + gmode grid (round-382)
+- §11.2.6 global-motion params + picture-prediction-params emit (round-382)
+- inter sequence driver: codeblock-grid residue integration coverage (round-370)
+- inter-residue rate control: account for the §11.3.3 codeblock grid (round-370)
+- codeblock-grid robustness fuzz sweep (round-370)
+- inter bipred: codeblock-grid residue round-trip coverage (round-370)
+- §11.3.3 spatial-partition codeblock grid (round-370)
+- extend 10-bit intra decode coverage to the dwt_depth axis + asymmetric transform
+- 10/12-bit intra encode→decode round-trip — close the >8-bit corpus gap on the decode side
+- §15.8.7/§15.8.2 global-motion prediction-branch coverage (round-337)
+- §15.8.8 global_mv unit tests + spec-grounded translation note
+- inter sequence driver: leaky-bucket VBV + VbvHysteresis residue rate control (round-326)
+- multi-picture rate-controlled inter sequence driver (round-320)
+- refresh to current status, drop per-round changelog cruft
+
 ### Added
 
 - **§11.2.6 global-motion encoder path** (round-382) — closes the
