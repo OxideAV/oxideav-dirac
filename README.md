@@ -23,7 +23,7 @@ core syntax, and the VC-2 v3 fragmented-picture path.
 | Bit reader + exp-Golomb | MSB-first reader; interleaved unsigned/signed exp-Golomb with EOF/iteration caps |
 | Sequence header | Parse parameters + base video format + source overrides + §12.4.4 extended (asymmetric) transform parameters |
 | Predefined video formats | Full table (indices 0-20): frame size, chroma, range, etc. |
-| Arithmetic decoder | Binary multi-context engine + probability LUT (Annex B) |
+| Arithmetic coder | Binary multi-context engine + probability LUT (Annex B); the encoder's §B.2.7.1 terminator is exact as of round-382 (a spurious follow bit used to corrupt the final symbols of tight-interval AC blocks — the source of every historical "AC-terminator roughness"), so AC-coded streams round-trip bit-exactly at `qindex = 0` |
 | Wavelet transforms | Inverse DWT (all 7 filters) + §13.3 intra DC prediction + §15.4 asymmetric (horizontal-only) IDWT (`idwt_with_ho`) |
 | VC-2 / Dirac intra **decode** | Full coefficient decode, bit-exact on the intra-only docs-corpus fixtures (LD + core-syntax, 4:2:0 + 4:2:2, depth 3 + 4). The §12.4.4 asymmetric transform decodes end-to-end (custom and Annex D default quant matrices) |
 | High-bit-depth intra **decode** | §10.5.2 `video_depth`-parameterised reconstruction proven end-to-end at 10-bit (HQ, all 3 chromas × 6 reversible wavelets; all `dwt_depth` 1..=5; §12.4.4 asymmetric transform — all bit-exact) and 12-bit (HQ 4:2:0, bit-exact) via full-range `&[u16]` encode → decode round-trips — closes the docs-corpus "bit depths > 8" gap on the decode side |
@@ -36,8 +36,8 @@ core syntax, and the VC-2 v3 fragmented-picture path.
 |------|-------|
 | VC-2 HQ intra | 8/10/12-bit (deeper samples via the `&[u16]` `encode_single_hq_intra_stream_u16` entry + `PRESET_{10,12}BIT_FULL` signal ranges), 4:2:0/4:2:2/4:4:4, 6 wavelets, all spec-allowed `dwt_depth` (1..=5), optional custom quant matrix, per-slice / picture-level rate control (PerPicture / CBR / VBV / VBV-hysteresis), asymmetric transform emission, slice-prefix bytes |
 | VC-2 LD intra | Same axis + rate-control coverage as HQ; bit-exact at q=0 against the reference oracle |
-| Dirac core-syntax intra | AC-coded (`0x0C`) + VLC (`0x4C`) encoders, near-lossless at q=0, optional §11.3.3 spatial-partition codeblock grid with per-codeblock differential quantiser |
-| Dirac inter | 1-ref P (`0x09`) and 2-ref bipred B (`0x0A`); sub-pel ME (qpel default), OBMC-aware ME refinement, per-block reference-mode + adaptive sub-pel/integer-pel selection, §11.3 wavelet residue (bit-exact self-roundtrip at q=0) with optional §11.3.3 spatial-partition codeblock grid + per-codeblock differential quantiser (bit-exact for codeblocks ≥ 4×4 samples; byte-for-byte mirror of the core-intra codeblock encoder; wired on both the 1-ref and bipred paths), inter-residue rate-control qindex picker, **multi-picture inter sequence driver** (HQ intra anchor + N `0x09` pictures, with PerPicture / Cbr / leaky-bucket Vbv / drain-limited VbvHysteresis residue-byte rate control — the full four-variant set the HQ/LD intra drivers carry) |
+| Dirac core-syntax intra | AC-coded (`0x0C`) + VLC (`0x4C`) encoders, both bit-exact at q=0, optional §11.3.3 spatial-partition codeblock grid with per-codeblock differential quantiser |
+| Dirac inter | 1-ref P (`0x09`) and 2-ref bipred B (`0x0A`); sub-pel ME (qpel default), OBMC-aware ME refinement, per-block reference-mode + adaptive sub-pel/integer-pel selection, §11.3 wavelet residue (bit-exact self-roundtrip at q=0) with optional §11.3.3 spatial-partition codeblock grid + per-codeblock differential quantiser (bit-exact for every codeblock geometry incl. 1×1-sample; byte-for-byte mirror of the core-intra codeblock encoder; wired on both the 1-ref and bipred paths), **§11.2.6 global motion** (affine-perspective `GlobalParams` per reference, §12.3.3.2 per-block global flags — whole-picture or per-block grids — global blocks carry no MV residual and predict via the §15.8.8 `global_mv` field; end-to-end on P + bipred B + the sequence driver, 120-case fuzz sweep), inter-residue rate-control qindex picker, **multi-picture inter sequence driver** (HQ intra anchor + N `0x09` pictures, with PerPicture / Cbr / leaky-bucket Vbv / drain-limited VbvHysteresis residue-byte rate control — the full four-variant set the HQ/LD intra drivers carry) |
 | Mixed I+P/B interop | Homogeneous core-syntax chains accepted end-to-end by the external oracle |
 
 ## Codec ID
@@ -63,7 +63,7 @@ The crate ships four fuzz oracles under `tests/`:
   four LD/HQ rate-control variants × pathological targets and inputs.
 - `encoder_inter_fuzz_oracle.rs` — inter-encoder parameter-surface
   sweep (precision, OBMC passes, search range, residue config, adaptive
-  flags, pathological pixels).
+  flags, global-motion fields/grids, pathological pixels).
 - `fragment_assembler_fuzz_oracle.rs` — VC-2 v3 §14 `FragmentAssembler`
   state machine driven by a seeded random walk against a reference
   model.
