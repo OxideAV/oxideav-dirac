@@ -77,6 +77,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     zero-translation global model on both refs: anchors bit-exact, the
     global-motion B frame reconstructs **bit-exactly** (∞ dB) through
     the §15.8.5 two-ref blend + qindex-0 residue.
+  - **Global-field variant coverage** (round-382, after the terminator
+    fix below unblocked the all-global case): three more end-to-end
+    P-picture tests in `tests/encoder_inter_roundtrip.rs` —
+    `intra_then_inter_global_zoom_field_roundtrips` (identity matrix at
+    `zrs_exp = 4` ⇒ a per-pixel 0..=4-pel affine ramp; ≥ 60 dB pins
+    encoder/decoder §15.8.8 field agreement across the whole plane),
+    `intra_then_inter_global_motion_qpel_roundtrips` (`mv_precision = 2`,
+    the field in qpel units through the §15.8.10 sub-pel sampler), and
+    `intra_then_inter_mixed_global_and_block_motion_roundtrips` (left
+    half of the block grid global, right half block-motion ME with MV
+    residuals — the §12.3.6.1 global-block exclusion from the MV median
+    and the §12.3.6.4 gmode majority prediction across the boundary,
+    ≥ 60 dB). Discovering that the first two plateaued at the exact
+    no-residue PSNR while 15-of-16-global closed bit-exactly is what
+    exposed the §B.2.7.1 terminator bug.
 
 - **§11.3.3 spatial-partition (codeblock grid) for the inter-residue
   encoder** (round-370) — closes the lib-doc "still unsupported:

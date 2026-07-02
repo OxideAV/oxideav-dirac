@@ -1093,3 +1093,208 @@ fn intra_then_inter_global_motion_p_picture_roundtrips() {
     assert!(psnr_u >= 40.0, "U PSNR {psnr_u:.2} dB below 40 dB");
     assert!(psnr_v >= 40.0, "V PSNR {psnr_v:.2} dB below 40 dB");
 }
+
+/// **Spatially-varying global field** (round-382). A pure-translation
+/// field (zero affine matrix) exercises only one point of the §15.8.8
+/// model; this test drives a genuine affine gradient: identity matrix at
+/// `zrs_exp = 4` ⇒ `v(x, y) = ((x + 8) >> 4, (y + 8) >> 4)` — a gentle
+/// 0..=4-pel zoom-style ramp across the 64×64 picture that varies
+/// **per pixel**, not per block. The encoder's OBMC prediction and the
+/// decoder's must evaluate the identical per-pixel field or the qindex-0
+/// residue won't close the loop; a ≥ 60 dB reconstruction therefore
+/// pins encoder/decoder `global_mv` agreement across the whole plane.
+#[test]
+fn intra_then_inter_global_zoom_field_roundtrips() {
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let intra_params = EncoderParams::default_hq(WaveletFilter::LeGall5_3, 3);
+
+    let (y0, u0, v0, y1, u1, v1) = synthetic_translating_pair_64(4, 0);
+    let global1 = GlobalParams {
+        pan_tilt: (0, 0),
+        zrs: [[1, 0], [0, 1]],
+        zrs_exp: 4,
+        perspective: (0, 0),
+        persp_exp: 0,
+    };
+    let inter_params = InterEncoderParams {
+        mv_precision: 0,
+        global_motion: Some(GlobalMotionConfig {
+            global1,
+            global2: None,
+            block_gmode: None,
+        }),
+        ..InterEncoderParams::default()
+    };
+
+    let intra = InterInputPicture {
+        picture_number: 0,
+        y: &y0,
+        u: &u0,
+        v: &v0,
+    };
+    let inter = InterInputPicture {
+        picture_number: 1,
+        y: &y1,
+        u: &u1,
+        v: &v1,
+    };
+    let stream = encode_intra_then_inter_stream(&seq, &intra_params, &inter_params, &intra, &inter);
+
+    let mut reg = CodecRegistry::new();
+    oxideav_dirac::register_codecs(&mut reg);
+    let cp = CodecParameters::video(CodecId::new("dirac"));
+    let mut dec = reg.first_decoder(&cp).expect("make decoder");
+    let packet = Packet::new(0, TimeBase::new(1, 25), stream);
+    dec.send_packet(&packet).expect("send_packet");
+    let _frame0 = dec.receive_frame().expect("intra frame");
+    let frame1 = match dec.receive_frame().expect("inter frame") {
+        Frame::Video(vf) => vf,
+        other => panic!("expected video, got {other:?}"),
+    };
+    let psnr_y = psnr(&frame1.planes[0].data, &y1);
+    eprintln!("global zoom-field inter Y PSNR: {psnr_y:.2} dB");
+    // The zoom field is a poor motion model for the pure-translation
+    // fixture — the residue is what closes the loop. What this pins is
+    // that the encoder subtracted the SAME per-pixel global prediction
+    // the decoder adds back (any divergence anywhere in the plane
+    // craters PSNR).
+    assert!(
+        psnr_y >= 60.0,
+        "zoom-field inter Y PSNR {psnr_y:.2} dB below 60 dB — encoder/decoder \
+         §15.8.8 global_mv fields disagree"
+    );
+}
+
+/// **Quarter-pel global field** (round-382). At `mv_precision = 2` the
+/// §15.8.8 field is in qpel units and the §15.8.7 `pixel_pred` fetch
+/// goes through the §15.8.10 sub-pel sampler. `pan_tilt = (-17, -1)`
+/// with a zero affine matrix gives the constant field `(-16, 0)` qpel =
+/// −4 integer pels, matching the fixture's +4 shift exactly, so the
+/// global prediction itself is near-perfect (block-interior pixels) and
+/// the residue mops up the OBMC edge effects.
+#[test]
+fn intra_then_inter_global_motion_qpel_roundtrips() {
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let intra_params = EncoderParams::default_hq(WaveletFilter::LeGall5_3, 3);
+
+    let (y0, u0, v0, y1, u1, v1) = synthetic_translating_pair_64(4, 0);
+    let global1 = GlobalParams {
+        pan_tilt: (-17, -1),
+        zrs: [[0, 0], [0, 0]],
+        zrs_exp: 0,
+        perspective: (0, 0),
+        persp_exp: 0,
+    };
+    let inter_params = InterEncoderParams {
+        mv_precision: 2,
+        global_motion: Some(GlobalMotionConfig {
+            global1,
+            global2: None,
+            block_gmode: None,
+        }),
+        ..InterEncoderParams::default()
+    };
+
+    let intra = InterInputPicture {
+        picture_number: 0,
+        y: &y0,
+        u: &u0,
+        v: &v0,
+    };
+    let inter = InterInputPicture {
+        picture_number: 1,
+        y: &y1,
+        u: &u1,
+        v: &v1,
+    };
+    let stream = encode_intra_then_inter_stream(&seq, &intra_params, &inter_params, &intra, &inter);
+
+    let mut reg = CodecRegistry::new();
+    oxideav_dirac::register_codecs(&mut reg);
+    let cp = CodecParameters::video(CodecId::new("dirac"));
+    let mut dec = reg.first_decoder(&cp).expect("make decoder");
+    let packet = Packet::new(0, TimeBase::new(1, 25), stream);
+    dec.send_packet(&packet).expect("send_packet");
+    let _frame0 = dec.receive_frame().expect("intra frame");
+    let frame1 = match dec.receive_frame().expect("inter frame") {
+        Frame::Video(vf) => vf,
+        other => panic!("expected video, got {other:?}"),
+    };
+    let psnr_y = psnr(&frame1.planes[0].data, &y1);
+    eprintln!("global qpel inter Y PSNR: {psnr_y:.2} dB");
+    assert!(
+        psnr_y >= 60.0,
+        "qpel global inter Y PSNR {psnr_y:.2} dB below 60 dB"
+    );
+}
+
+/// **Mixed global/block-motion picture** (round-382). Only the left
+/// half of the block grid is global (§12.3.3.2 flags spatially split);
+/// the right half uses ordinary per-block ME MVs with their §12.3.5
+/// residuals. Exercises the two prediction branches side-by-side in one
+/// picture — including the §12.3.6.1 rule that global blocks are
+/// excluded from their neighbours' MV median and the §12.3.6.4
+/// neighbour-majority gmode prediction across the half boundary.
+#[test]
+fn intra_then_inter_mixed_global_and_block_motion_roundtrips() {
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let intra_params = EncoderParams::default_hq(WaveletFilter::LeGall5_3, 3);
+
+    let (y0, u0, v0, y1, u1, v1) = synthetic_translating_pair_64(4, 0);
+    // Whole-picture translation model matching the +4 shift.
+    let global1 = GlobalParams {
+        pan_tilt: (-5, -1),
+        zrs: [[0, 0], [0, 0]],
+        zrs_exp: 0,
+        perspective: (0, 0),
+        persp_exp: 0,
+    };
+    // 64x64 at preset 1 → 16x16 block grid. Left 8 columns global.
+    let blocks_x = 16u32;
+    let blocks_y = 16u32;
+    let gmode: Vec<bool> = (0..blocks_x * blocks_y)
+        .map(|i| (i % blocks_x) < 8)
+        .collect();
+    let inter_params = InterEncoderParams {
+        mv_precision: 0,
+        global_motion: Some(GlobalMotionConfig {
+            global1,
+            global2: None,
+            block_gmode: Some(gmode),
+        }),
+        ..InterEncoderParams::default()
+    };
+
+    let intra = InterInputPicture {
+        picture_number: 0,
+        y: &y0,
+        u: &u0,
+        v: &v0,
+    };
+    let inter = InterInputPicture {
+        picture_number: 1,
+        y: &y1,
+        u: &u1,
+        v: &v1,
+    };
+    let stream = encode_intra_then_inter_stream(&seq, &intra_params, &inter_params, &intra, &inter);
+
+    let mut reg = CodecRegistry::new();
+    oxideav_dirac::register_codecs(&mut reg);
+    let cp = CodecParameters::video(CodecId::new("dirac"));
+    let mut dec = reg.first_decoder(&cp).expect("make decoder");
+    let packet = Packet::new(0, TimeBase::new(1, 25), stream);
+    dec.send_packet(&packet).expect("send_packet");
+    let _frame0 = dec.receive_frame().expect("intra frame");
+    let frame1 = match dec.receive_frame().expect("inter frame") {
+        Frame::Video(vf) => vf,
+        other => panic!("expected video, got {other:?}"),
+    };
+    let psnr_y = psnr(&frame1.planes[0].data, &y1);
+    eprintln!("mixed global/block inter Y PSNR: {psnr_y:.2} dB");
+    assert!(
+        psnr_y >= 60.0,
+        "mixed global/block inter Y PSNR {psnr_y:.2} dB below 60 dB — the \
+         two prediction branches disagree with the decoder somewhere"
+    );
+}

@@ -6,8 +6,13 @@
 //!
 //! * **Single reference** (parse code `0x09` — non-reference 1-ref AC
 //!   inter picture). One `picture_number` delta, no `retd`.
-//! * **No global motion**, no reference weights override (`refs_wt =
-//!   1 / 1`, `refs_wt_precision = 1`).
+//! * **§11.2.6 global motion** (round-382, opt-in via
+//!   [`InterEncoderParams::global_motion`]): the picture can signal an
+//!   affine-perspective global model per reference and mark any subset
+//!   of blocks as §12.3.3.2 global blocks (whole-picture by default).
+//!   Global blocks carry no MV residual — prediction comes from the
+//!   §15.8.8 `global_mv` field. No reference weights override
+//!   (`refs_wt = 1 / 1`, `refs_wt_precision = 1`).
 //! * **Quarter-pel motion** (`mv_precision = 2` by default; configurable
 //!   via [`InterEncoderParams::mv_precision`]) — integer-pel SAD search
 //!   over `[-mv_search_range, +mv_search_range]` followed by an 8-neighbor
