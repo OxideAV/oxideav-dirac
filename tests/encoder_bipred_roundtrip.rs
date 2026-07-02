@@ -24,13 +24,13 @@ use oxideav_core::CodecRegistry;
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
 use oxideav_dirac::encoder::make_minimal_sequence;
 use oxideav_dirac::encoder_inter::{
-    bipred_select_modes, InterEncoderParams, InterInputPicture, ResidueParams,
+    bipred_select_modes, GlobalMotionConfig, InterEncoderParams, InterInputPicture, ResidueParams,
 };
 use oxideav_dirac::encoder_intra_core::{
     encode_core_intra_then_bipred_stream, encode_core_intra_then_inter_stream,
     CoreIntraEncoderParams,
 };
-use oxideav_dirac::picture_inter::RefPredMode;
+use oxideav_dirac::picture_inter::{GlobalParams, RefPredMode};
 use oxideav_dirac::video_format::ChromaFormat;
 use oxideav_dirac::wavelet::WaveletFilter;
 
@@ -1006,5 +1006,89 @@ fn bipred_post_obmc_refine_does_not_regress_no_residue() {
         "post-OBMC bipred refinement regressed PSNR: off = {psnr_off:.2} dB, \
          on = {psnr_on:.2} dB (round-95 strict-superset invariant breached \
          at the picture-level reconstruction)"
+    );
+}
+
+/// **§11.2.6 global-motion 2-ref bipred B-picture end-to-end**
+/// (round-382). The bipred (`0x0A`) path threads the global-motion
+/// config through the block motion data (both `global_motion_parameters`
+/// blocks on the wire, one per reference) and the §11.3 residue OBMC
+/// prediction. Every block is a §12.3.3.2 global block, so no per-block
+/// MV residual is emitted for either reference; the per-pixel prediction
+/// is derived from each reference's §15.8.8 `global_mv` field.
+///
+/// Both references use a zero-translation global model (`pan_tilt`
+/// `(-1, -1)` ⇒ field `(0, 0)`), so the bipred blend samples each
+/// reference in place — the complementary-bar B frame is exactly the
+/// 1/2 average of the two anchors, and the LeGall 5/3 qindex-0 residue
+/// closes the loop bit-exactly.
+#[test]
+fn bipred_global_motion_b_picture_roundtrips() {
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let intra_params = CoreIntraEncoderParams::default_intra(WaveletFilter::LeGall5_3, 3);
+    // Zero affine, pan_tilt (-1,-1) ⇒ constant (0,0) global field.
+    let g = GlobalParams {
+        pan_tilt: (-1, -1),
+        zrs: [[0, 0], [0, 0]],
+        zrs_exp: 0,
+        perspective: (0, 0),
+        persp_exp: 0,
+    };
+    let inter_params = InterEncoderParams {
+        bipred_mv_precision: 0,
+        global_motion: Some(GlobalMotionConfig {
+            global1: g.clone(),
+            global2: Some(g),
+            block_gmode: None,
+        }),
+        ..InterEncoderParams::default()
+    };
+
+    let (y0, u0, v0, y1, u1, v1, ym, um, vm) = synthetic_bipred_triplet();
+    let intra_a = InterInputPicture {
+        picture_number: 0,
+        y: &y0,
+        u: &u0,
+        v: &v0,
+    };
+    let intra_b = InterInputPicture {
+        picture_number: 2,
+        y: &y1,
+        u: &u1,
+        v: &v1,
+    };
+    let bipred = InterInputPicture {
+        picture_number: 1,
+        y: &ym,
+        u: &um,
+        v: &vm,
+    };
+    let stream = encode_core_intra_then_bipred_stream(
+        &seq,
+        &intra_params,
+        &inter_params,
+        &intra_a,
+        &intra_b,
+        &bipred,
+    );
+
+    let frames = decode_stream(stream);
+    assert!(frames.len() >= 3, "expected 3 frames, got {}", frames.len());
+    assert_eq!(
+        frames[0].planes[0].data,
+        y0.to_vec(),
+        "intra-A Y bit-exact at qindex=0"
+    );
+    assert_eq!(
+        frames[1].planes[0].data,
+        y1.to_vec(),
+        "intra-B Y bit-exact at qindex=0"
+    );
+    let py = psnr(&frames[2].planes[0].data, &ym);
+    eprintln!("bipred global-motion B-frame Y PSNR: {py:.2} dB");
+    assert!(
+        py >= 60.0,
+        "bipred global-motion B-frame Y PSNR {py:.2} dB below 60 dB — the \
+         global-motion residue path failed to close the prediction loop"
     );
 }

@@ -65,6 +65,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - New `GlobalMotionConfig::pan_tilt_all(dx, dy)` convenience
     constructor (whole-picture pure-translation global model against
     ref1).
+  - **End-to-end global-motion bipred B-picture** (parse code `0x0A`).
+    `encode_bipred_inter_picture` threads the config the same way the
+    1-ref path does: both references' `global_motion_parameters` go on
+    the wire, `build_motion_from_bipred_grid` carries the gmode grid +
+    `global1`/`global2` into the residue's OBMC prediction, and global
+    blocks skip the MV residual for **both** references
+    (v1x/v1y/v2x/v2y).
+    `tests/encoder_bipred_roundtrip.rs::bipred_global_motion_b_picture_roundtrips`
+    drives the complementary-bar fixture through a whole-picture
+    zero-translation global model on both refs: anchors bit-exact, the
+    global-motion B frame reconstructs **bit-exactly** (∞ dB) through
+    the §15.8.5 two-ref blend + qindex-0 residue.
+
+- **§11.3.3 spatial-partition (codeblock grid) for the inter-residue
   encoder** (round-370) — closes the lib-doc "still unsupported:
   per-codeblock partitioning for the residue path" gap. The §11.3
   wavelet-residue path now accepts an optional per-level

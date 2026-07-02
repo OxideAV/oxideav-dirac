@@ -3870,20 +3870,25 @@ pub fn bipred_post_obmc_refine_modes(
 
 /// Build the same `PictureMotionData` the decoder will reconstruct from
 /// the 2-ref `block_motion_data` block this encoder emits — preserves
-/// the per-block `RefPredMode` and both MVs.
+/// the per-block `RefPredMode`, both MVs, and (round-382) the per-block
+/// global-mode flags + both references' global parameters.
+#[allow(clippy::too_many_arguments)]
 fn build_motion_from_bipred_grid(
     sbx: u32,
     sby: u32,
     blocks_x: u32,
     blocks_y: u32,
     decisions: &[BipredBlock],
+    gmode: Option<&[bool]>,
+    global1: Option<GlobalParams>,
+    global2: Option<GlobalParams>,
 ) -> PictureMotionData {
     let blocks: Vec<BlockData> = (0..blocks_x * blocks_y)
         .map(|i| {
             let d = decisions[i as usize];
             BlockData {
                 rmode: d.rmode,
-                gmode: false,
+                gmode: gmode.map(|g| g[i as usize]).unwrap_or(false),
                 mv: [(d.mv1.0, d.mv1.1), (d.mv2.0, d.mv2.1)],
                 dc: [0; 3],
             }
@@ -3896,8 +3901,8 @@ fn build_motion_from_bipred_grid(
         superblocks_y: sby,
         sb_split: vec![2u32; (sbx * sby) as usize],
         blocks,
-        global1: None,
-        global2: None,
+        global1,
+        global2,
     }
 }
 
@@ -4116,13 +4121,45 @@ pub fn encode_bipred_inter_picture(
         );
     }
 
-    encode_block_motion_data_bipred(&mut w, sbx, sby, blocks_x, blocks_y, &decisions, None);
+    // §12.3.3.2 per-block global-mode grid + §11.2.6 params for both
+    // references (None when the picture uses block motion only).
+    let gmode_grid = params
+        .global_motion
+        .as_ref()
+        .map(|cfg| resolve_gmode_grid(cfg, blocks_x, blocks_y));
+    let (global1, global2) = match &params.global_motion {
+        None => (None, None),
+        Some(cfg) => (
+            Some(effective_global_params(&cfg.global1)),
+            Some(effective_global_params(
+                &cfg.global2.clone().unwrap_or_default(),
+            )),
+        ),
+    };
+    encode_block_motion_data_bipred(
+        &mut w,
+        sbx,
+        sby,
+        blocks_x,
+        blocks_y,
+        &decisions,
+        gmode_grid.as_deref(),
+    );
     w.byte_align();
 
     // §11.3 wavelet_transform.
     if let Some(ref residue) = params.residue {
         let pred = picture_prediction_params_from(sequence, params, bmp, 2);
-        let motion = build_motion_from_bipred_grid(sbx, sby, blocks_x, blocks_y, &decisions);
+        let motion = build_motion_from_bipred_grid(
+            sbx,
+            sby,
+            blocks_x,
+            blocks_y,
+            &decisions,
+            gmode_grid.as_deref(),
+            global1.clone(),
+            global2.clone(),
+        );
         let (pred_y, pred_u, pred_v) = build_obmc_prediction_bipred(
             sequence, &pred, &motion, ref1_y, ref1_u, ref1_v, ref2_y, ref2_u, ref2_v,
         );
