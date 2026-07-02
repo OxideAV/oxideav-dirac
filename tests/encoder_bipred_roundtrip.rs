@@ -824,20 +824,26 @@ fn ffmpeg_cross_decodes_camera_pan_bipred_with_subpel_gain() {
         "camera-pan bipred ffmpeg cross-decode: int = {psnr_int:.2} dB, \
          qpel(adaptive) = {psnr_qpel:.2} dB"
     );
-    // Floor: quarter-pel adaptive must beat integer-pel by ≥ 2 dB on
-    // this all-smooth-motion fixture. Empirically lifts from 48 to 52.
+    // Premise rewritten in round-382: before the §B.2.7.1 terminator fix
+    // the residue's final arith symbols could misdecode, capping the
+    // integer-pel baseline at ~48-50 dB, and qpel ME recovered ≥ 2 dB of
+    // that gap. With the terminator fixed, the qindex-0 residue closes
+    // the loop so completely that the integer-pel variant cross-decodes
+    // **bit-exactly** (∞ dB) — a "beats int by 2 dB" premise is vacuous
+    // against a lossless baseline. What still needs pinning is that the
+    // round-39 per-block adaptive sub-pel selection keeps the qpel
+    // variant in the same near-lossless regime (a regression there
+    // historically cost 7+ dB of 8-tap-filter convention drift).
     assert!(
-        psnr_qpel >= psnr_int + 2.0,
-        "bipred qpel(adaptive) PSNR {psnr_qpel:.2} dB did not beat \
-         integer-pel {psnr_int:.2} dB by ≥ 2 dB on the camera-pan smooth-\
-         motion fixture — round-39 per-block adaptive sub-pel selection \
-         regression"
+        psnr_int >= 60.0,
+        "bipred int-pel camera-pan cross-decode PSNR {psnr_int:.2} dB below \
+         60 dB — the qindex-0 residue no longer closes the loop"
     );
     assert!(
-        psnr_qpel >= 50.0,
-        "bipred qpel(adaptive) camera-pan PSNR {psnr_qpel:.2} dB below 50 dB \
-         absolute floor — expected ~52 dB after round-39 per-block adaptive \
-         sub-pel selection"
+        psnr_qpel >= 60.0,
+        "bipred qpel(adaptive) camera-pan cross-decode PSNR {psnr_qpel:.2} dB \
+         below 60 dB — round-39 per-block adaptive sub-pel selection \
+         regression"
     );
 }
 

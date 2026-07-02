@@ -98,11 +98,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it through the shared `picture_core::decode_subband` walk
   (`spatial_partition_flag` already round-tripped on the decode side).
   With reversible LeGall 5/3 at `qindex = 0` the residue round-trips
-  bit-exactly whenever every codeblock is ≥ 4×4 samples; sub-4×4-sample
-  codeblocks carry the same near-lossless §B.2.7.1 AC-terminator
-  roughness the core-intra path documents (an encoder-terminator
-  boundary effect, not a decode bug — verified by the byte-equivalence
-  unit test).
+  bit-exactly whenever every codeblock is ≥ 4×4 samples. (*Update,
+  round-382*: the sub-4×4 "near-lossless §B.2.7.1 AC-terminator
+  roughness" caveat that originally qualified this entry was the
+  terminator bug fixed below — sub-4×4 and 1×1-sample codeblocks are now
+  bit-exact too, pinned by `codeblock_sub4x4_grid_q0_legall_bit_exact`.)
   - `tests/encoder_inter_residue_codeblocks.rs` (5 tests): mode-0 2×2
     grid bit-exact (Y/U/V); mode-1 running-quantiser lockstep; the
     partitioned stream differs from the single-codeblock stream yet
@@ -123,6 +123,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     values × qindex {0, 24, 96} (so the skip path fires as the quantiser
     zeroes codeblocks) × {LeGall 5/3, Haar}. Every combination decodes to
     exactly 2 frames with no panic and no arithmetic-coder desync.
+
+### Fixed
+
+- **§B.2.7.1 arithmetic-encoder terminator: spurious follow bit corrupted
+  the tail of every AC block** (round-382). `ArithEncoder::finish()`
+  injected an artificial `follow_bits += 1` before emitting the 16-bit
+  disambiguation value `T = low + 0x4000`, inserting one `!b0` bit
+  between `T`'s top bit and its 15-bit tail — shifting the tail one
+  position right. With a loose final interval the corrupted value still
+  landed inside `[low, low + range)` and everything decoded; with a
+  tight interval (strongly-adapted contexts near the end of a block,
+  e.g. long runs of one symbol) the final few symbols misdecoded. This
+  was the root cause of every long-tolerated "§B.2.7.1 AC-terminator
+  roughness":
+  - the AC core-intra testsrc V plane (V ≈ 24 dB "1-LSB gradient
+    roughness", the CHANGELOG followup "carry-resolved flush") is now
+    **bit-exact on all three planes** —
+    `core_intra_self_roundtrip_yuv420_synth_testsrc` upgraded from
+    `psnr >= 22 dB` floors to `assert_eq!`;
+  - `core_intra_vlc_beats_ac_on_v_gradient` (which pinned the VLC/AC
+    *contrast*) rewritten as `core_intra_vlc_and_ac_agree_at_q0`: both
+    entropy coders now reconstruct bit-exactly at qindex 0;
+  - the bipred camera-pan ffmpeg cross-decode integer-pel baseline went
+    from ~50 dB to **bit-exact (∞ dB)** —
+    `ffmpeg_cross_decodes_camera_pan_bipred_with_subpel_gain`'s
+    "qpel beats int by ≥ 2 dB" premise was vacuous against a lossless
+    baseline and is rewritten as a ≥ 60 dB floor on both variants;
+  - sub-4×4-sample (and 1×1-sample) codeblocks in the §11.3.3 spatial
+    partition now round-trip **bit-exactly** at qindex 0 — new
+    `codeblock_sub4x4_grid_q0_legall_bit_exact` drives an 8×8 grid on a
+    depth-3 transform (1×1-sample codeblocks at the deepest levels) to
+    exactness, retiring the round-370 "must be ≥ 4×4 samples" caveat;
+  - an all-global 16×16 motion grid (512 heavily-biased prediction-mode
+    symbols) decoded block (12, 15)'s rmode wrong — the failure that
+    exposed the bug.
+  Discovered via the round-382 global-motion work; minimal repro pinned
+  by `arith::tests::terminator_biased_stream_decodes_every_symbol`
+  (symbol 504 of the exact 512-symbol pattern misdecoded before the
+  fix) plus a 200-case seeded random sweep
+  (`terminator_random_streams_decode_every_symbol`) over length ×
+  bias × context count. The termination is now the WNC protocol with
+  the correctness argument spelled out in the comment: `T >= low`,
+  `T + 1 <= low + range` (range > 0x4000 after renormalise), and
+  `T <= 0xFFFF` from the inductive invariant `low + range <= 0x10000`,
+  so the decoder's past-end 1-extension stays inside the final interval
+  for every remaining symbol resolution.
 
 ### Changed
 

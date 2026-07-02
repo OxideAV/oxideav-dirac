@@ -63,18 +63,16 @@ fn core_intra_self_roundtrip_yuv420_synth_testsrc() {
     let pu = psnr(&vf.planes[1].data, &u);
     let pv = psnr(&vf.planes[2].data, &v);
     eprintln!("core-intra self-roundtrip: Y={py:.2} U={pu:.2} V={pv:.2}");
-    // Y / U round-trip bit-exactly. After round-118's spec-correct §5.4
-    // intra-DC unbiased-`mean` rounding, V's level-0 LL band ends in a
-    // non-zero coefficient that lands the V-LL AC block's final sign
-    // symbol on the §B.2.7.1 terminator boundary, where the encoder's WNC
-    // flush and the efficient decoder disagree by 1 LSB (→ V ≈ 24 dB).
-    // ffmpeg decodes this exact stream to the SAME error, so it is a
-    // genuine encoder AC-terminator limitation on a degenerate monotonic
-    // ramp, not a decoder bug. Tracked as a followup (carry-resolved
-    // §B.3.3.4 flush).
-    assert!(py >= 48.0);
-    assert!(pu >= 48.0);
-    assert!(pv >= 22.0);
+    // All three planes round-trip bit-exactly at qindex 0. Historical
+    // note: before round-382's §B.2.7.1 terminator fix, V's level-0 LL
+    // band ended in a non-zero coefficient whose final sign symbol
+    // landed on the corrupted terminator tail (→ V ≈ 24 dB, the
+    // long-tolerated "1-LSB roughness"). The spurious extra follow bit
+    // in `ArithEncoder::finish()` was the cause; with it removed the AC
+    // path is exactly as lossless as the VLC path at q=0.
+    assert_eq!(vf.planes[0].data, y.to_vec(), "AC Y bit-exact at q=0");
+    assert_eq!(vf.planes[1].data, u.to_vec(), "AC U bit-exact at q=0");
+    assert_eq!(vf.planes[2].data, v.to_vec(), "AC V bit-exact at q=0");
 }
 
 /// Intra-only with a flat picture — the IDWT collapses to a single LL
@@ -161,20 +159,14 @@ fn core_intra_multi_codeblock_mode0_testsrc_near_lossless() {
     let (y, u, v) = synthetic_testsrc_64_yuv420();
     let stream = encode_single_core_intra_stream(&seq, &params, 0, &y, &u, &v);
     let (ry, ru, rv) = decode_single(stream);
-    let py = psnr(&ry, &y);
-    let pu = psnr(&ru, &u);
-    let pv = psnr(&rv, &v);
-    eprintln!("multi-cb mode0 testsrc: Y={py:.2} U={pu:.2} V={pv:.2}");
     // qindex == 0 ⇒ identical coefficients to the single-codeblock path;
-    // the partition is entropy-only, so Y / U stay bit-exact. V drops to
-    // ~24 dB on the single coefficient that round-118's spec-correct §5.4
-    // intra-DC `mean` rounding pushes onto the §B.2.7.1 AC-terminator
-    // boundary (ffmpeg decodes the same 1-LSB error — encoder-terminator
-    // limitation, not a decoder bug; see the followup note in
-    // `core_intra_self_roundtrip_yuv420_synth_testsrc`).
-    assert!(py >= 48.0);
-    assert!(pu >= 48.0);
-    assert!(pv >= 22.0);
+    // the partition is entropy-only, so all three planes are bit-exact.
+    // (Before round-382's §B.2.7.1 terminator fix, V lost ~1 LSB on the
+    // final LL sign symbol — see the historical note in
+    // `core_intra_self_roundtrip_yuv420_synth_testsrc`.)
+    assert_eq!(ry, y.to_vec(), "Y bit-exact (mode 0 partition)");
+    assert_eq!(ru, u.to_vec(), "U bit-exact (mode 0 partition)");
+    assert_eq!(rv, v.to_vec(), "V bit-exact (mode 0 partition)");
 }
 
 /// Round-100: spatial-partition core-intra at `codeblock_mode == 1`
@@ -248,14 +240,13 @@ fn core_intra_multi_codeblock_mode1_cumulative_quant_testsrc() {
     // `base_q + delta` per codeblock (instead of carrying it forward) would
     // mis-dequantise the later codeblocks and collapse PSNR toward ~37 dB,
     // far below the 44 dB floor.
-    // V's floor is relaxed for the round-118 §B.2.7.1 AC-terminator 1-LSB
-    // loss on the degenerate ramp's final LL coefficient (ffmpeg
-    // reproduces it; see the followup note in
-    // `core_intra_self_roundtrip_yuv420_synth_testsrc`). Y / U still pin
-    // the cumulative-offset fix vs the reset-per-codeblock bug (~37 dB).
+    // Since round-382's §B.2.7.1 terminator fix, V (whose energy skips
+    // down to a low running quantiser on this fixture) reconstructs
+    // bit-exactly, so its floor is back at the same 44 dB
+    // cumulative-vs-reset separation line as U.
     assert!(py >= 48.0, "Y PSNR {py:.2} below cumulative-quant floor");
     assert!(pu >= 44.0, "U PSNR {pu:.2} below cumulative-quant floor");
-    assert!(pv >= 22.0, "V PSNR {pv:.2} below cumulative-quant floor");
+    assert!(pv >= 44.0, "V PSNR {pv:.2} below cumulative-quant floor");
 }
 
 /// A 64×64 luma picture whose detail is confined to the top-left
@@ -411,8 +402,8 @@ fn core_intra_vlc_stream_uses_parse_code_0x4c() {
 /// (LeGall 5/3 dead-zone identity) the VLC path is *lossless*: it codes the
 /// quantised coefficients with plain exp-Golomb (`read_sintb`), so there is
 /// no entropy-coder rounding at all and the reconstruction is bit-exact on
-/// all three planes. (The AC path on this same fixture loses ~1 LSB on the
-/// V plane's steep gradient — see `core_intra_vlc_beats_ac_on_v_gradient`.)
+/// all three planes. (Since round-382's §B.2.7.1 terminator fix the AC path
+/// is equally lossless at q=0 — see `core_intra_vlc_and_ac_agree_at_q0`.)
 #[test]
 fn core_intra_vlc_self_roundtrip_yuv420_synth_testsrc() {
     let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
@@ -445,22 +436,20 @@ fn core_intra_vlc_self_roundtrip_constant_frame_is_bit_exact() {
     assert_eq!(rv, v.to_vec(), "VLC V plane bit-exact");
 }
 
-/// VLC and AC code the *same* quantised coefficients, so on the flat planes
-/// (Y / U on the testsrc fixture both round-trip exactly through either
-/// entropy coder) the two reconstructions agree. The interesting plane is
-/// V: its steep vertical gradient pushes coefficient magnitudes into a range
-/// where the AC path loses ~1 LSB on a handful of edge coefficients (the
-/// long-tolerated "1-LSB roughness" of `core_intra_self_roundtrip`), whereas
-/// the VLC path — plain exp-Golomb with no context modelling — reproduces
-/// every quantised coefficient exactly and is therefore bit-exact against
-/// the source.
+/// VLC and AC code the *same* quantised coefficients, so at qindex 0 the
+/// two entropy coders must produce identical (and, on the LeGall 5/3
+/// dead-zone identity, source-bit-exact) reconstructions on every plane.
 ///
-/// This pins the VLC encoder as a faithful, *strictly lossless-at-q0*
-/// counterpart to the decoder's `decode_subband_vlc`: the VLC V plane equals
-/// the source, the AC V plane does not, and the VLC PSNR is at least the AC
-/// PSNR on every plane.
+/// Premise rewritten in round-382: this test originally pinned a
+/// *contrast* — VLC bit-exact on the steep V gradient while AC carried a
+/// "1-LSB roughness" on its final sign symbol. That roughness was the
+/// §B.2.7.1 terminator bug (a spurious extra follow bit in
+/// `ArithEncoder::finish()` corrupting the disambiguation value's tail),
+/// not an inherent property of arithmetic coding. With the terminator
+/// fixed the correct invariant is equality: both coders reproduce every
+/// quantised coefficient, so both reconstructions equal the source.
 #[test]
-fn core_intra_vlc_beats_ac_on_v_gradient() {
+fn core_intra_vlc_and_ac_agree_at_q0() {
     let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
     let params = CoreIntraEncoderParams::default_intra(WaveletFilter::LeGall5_3, 3);
     let (y, u, v) = synthetic_testsrc_64_yuv420();
@@ -469,32 +458,20 @@ fn core_intra_vlc_beats_ac_on_v_gradient() {
     let (ay, au, av) = decode_single(ac_stream);
     let (vy, vu, vv) = decode_single(vlc_stream);
 
-    // Flat-ish planes agree between the two entropy coders.
+    // The two entropy coders agree on every plane...
     assert_eq!(vy, ay, "VLC vs AC Y reconstruction agree");
     assert_eq!(vu, au, "VLC vs AC U reconstruction agree");
+    assert_eq!(vv, av, "VLC vs AC V reconstruction agree");
 
-    // VLC is bit-exact on the V gradient; AC is not (1-LSB roughness).
+    // ...and both are bit-exact against the source at qindex 0,
+    // including the steep V gradient that used to trip the AC
+    // terminator.
+    assert_eq!(vy, y.to_vec(), "VLC Y bit-exact against source");
+    assert_eq!(vu, u.to_vec(), "VLC U bit-exact against source");
     assert_eq!(vv, v.to_vec(), "VLC V bit-exact against source");
-    assert_ne!(
-        av,
-        v.to_vec(),
-        "AC V carries its known 1-LSB gradient roughness (guards the contrast)"
-    );
-
-    // VLC PSNR is at least the AC PSNR on every plane.
-    for (plane, vlc_p, ac_p, src) in [
-        ("Y", &vy, &ay, &y[..]),
-        ("U", &vu, &au, &u[..]),
-        ("V", &vv, &av, &v[..]),
-    ] {
-        let pv = psnr(vlc_p, src);
-        let pa = psnr(ac_p, src);
-        eprintln!("{plane}: VLC={pv:.2} AC={pa:.2}");
-        assert!(
-            pv >= pa - 1e-9,
-            "{plane}: VLC PSNR {pv:.2} should be >= AC PSNR {pa:.2}"
-        );
-    }
+    assert_eq!(ay, y.to_vec(), "AC Y bit-exact against source");
+    assert_eq!(au, u.to_vec(), "AC U bit-exact against source");
+    assert_eq!(av, v.to_vec(), "AC V bit-exact against source");
 }
 
 /// VLC core-intra with a 4×4 spatial partition at `codeblock_mode == 0`.

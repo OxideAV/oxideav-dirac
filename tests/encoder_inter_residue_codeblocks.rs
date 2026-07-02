@@ -15,11 +15,12 @@
 //! (`encoder_inter::tests::cb_residue_bytes_match_intra_core_byte_for_byte`)
 //! asserts the two emit byte-identical AC streams on an identical band +
 //! grid. Like the intra-core path, with reversible LeGall 5/3 at
-//! `qindex = 0` the residue round-trips **bit-exactly** as long as every
-//! codeblock is at least 4x4 samples; for sub-4x4-sample codeblocks the
-//! shared §B.2.7.1 AC terminator leaves the same near-lossless roughness
-//! the intra-core `core_intra_multi_codeblock_mode0_testsrc_*` tests
-//! document (an encoder-terminator boundary effect, not a decode bug).
+//! `qindex = 0` the residue round-trips **bit-exactly** for every
+//! codeblock geometry. (Before round-382's §B.2.7.1 terminator fix,
+//! sub-4x4-sample codeblocks carried a "near-lossless roughness" on
+//! their final AC symbols — that was the spurious-follow-bit terminator
+//! bug in `ArithEncoder::finish()`, since removed;
+//! `codeblock_sub4x4_grid_q0_legall_bit_exact` pins the exactness.)
 //!
 //! Source of truth: BBC Dirac Specification v2.2.3 §11.3.3
 //! (codeblock_parameters), §13.4.3 (codeblock skip + quant offset),
@@ -301,4 +302,48 @@ fn codeblock_per_level_grid_mode1_lockstep() {
         "per-level mode-1 grid Y PSNR {psnr:.2} dB below 40 dB — \
          running-quantiser accumulator decode must stay in lockstep"
     );
+}
+
+/// **Sub-4×4-sample codeblocks are bit-exact since the round-382
+/// §B.2.7.1 terminator fix.** A pathologically fine 8×8 grid on a
+/// depth-3 transform of a 64×64 picture drives 1×1-sample codeblocks at
+/// the deepest levels — the exact shape whose final AC symbols used to
+/// land on the corrupted terminator tail and decode "near-lossless"
+/// instead of exact. With `ArithEncoder::finish()` fixed, the qindex-0
+/// LeGall 5/3 residue round-trips bit-exactly even on this grid, so the
+/// old "every codeblock must be ≥ 4×4 samples" caveat is gone.
+#[test]
+fn codeblock_sub4x4_grid_q0_legall_bit_exact() {
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let intra_params = EncoderParams::default_hq(WaveletFilter::LeGall5_3, 3);
+    let mut rp = ResidueParams::default_for(WaveletFilter::LeGall5_3, 3);
+    // 8×8 codeblocks per subband at every level: level-1 luma subbands
+    // are 8×8 coefficients → 1×1-sample codeblocks; chroma is half that,
+    // driving empty codeblocks too.
+    rp.codeblocks = Some(vec![(1, 1), (8, 8), (8, 8), (8, 8)]);
+    rp.codeblock_mode = 0;
+    let inter_params = InterEncoderParams {
+        residue: Some(rp),
+        ..InterEncoderParams::default()
+    };
+
+    let (y0, u0, v0, y1, u1, v1) = pics();
+    let intra = InterInputPicture {
+        picture_number: 0,
+        y: &y0,
+        u: &u0,
+        v: &v0,
+    };
+    let inter = InterInputPicture {
+        picture_number: 1,
+        y: &y1,
+        u: &u1,
+        v: &v1,
+    };
+    let stream = encode_intra_then_inter_stream(&seq, &intra_params, &inter_params, &intra, &inter);
+    let (dy, du, dv) = decode_inter_planes(stream);
+
+    assert_eq!(dy, y1.to_vec(), "Y plane not bit-exact (mode 0, 8x8 grid)");
+    assert_eq!(du, u1.to_vec(), "U plane not bit-exact (mode 0, 8x8 grid)");
+    assert_eq!(dv, v1.to_vec(), "V plane not bit-exact (mode 0, 8x8 grid)");
 }

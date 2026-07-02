@@ -149,9 +149,10 @@
 //! byte-for-byte mirror of the proven core-intra codeblock encoder (the
 //! decoder reads it through the shared `picture_core::decode_subband`
 //! walk). With reversible LeGall 5/3 at `qindex = 0` the residue
-//! round-trips bit-exactly whenever every codeblock is at least 4×4
-//! samples; sub-4×4-sample codeblocks carry the same near-lossless
-//! §B.2.7.1 AC-terminator roughness the core-intra path documents.
+//! round-trips bit-exactly for every codeblock geometry — including
+//! sub-4×4-sample and 1×1-sample codeblocks, whose final AC symbols
+//! used to land on the flawed §B.2.7.1 terminator tail before the
+//! round-382 `ArithEncoder::finish()` fix.
 
 #![allow(clippy::needless_range_loop)]
 

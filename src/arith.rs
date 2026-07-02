@@ -385,21 +385,38 @@ impl ArithEncoder {
     /// the encoded interval.
     pub fn finish(mut self) -> Vec<u8> {
         // §B.2.7.1 termination. After the renormalise loops we have
-        // 0x4000 < range <= 0x10000 and 0 <= low < 0x10000 with
-        // `low + range > 0x4000` (a non-empty interval that doesn't
-        // collapse on the lower edge). Emit a value `T` that's inside
-        // [low, low + range), big enough that any subsequent
-        // past-end-read 1s extending it stay inside the same interval.
+        // `range > 0x4000` and (inductively, over E1/E2/E3 and the
+        // symbol-coding step) `low + range <= 0x10000`. Emit the value
+        // `T = low + 0x4000`, which satisfies:
         //
-        // Choice: the bit string corresponding to the integer
-        // `(low + 0x4000)` truncated/padded to 16 bits — it sits at
-        // least 0x4000 above `low` (so >= low) and below `low + range`
-        // since range > 0x4000. We follow the WNC bit-plus-follows
-        // protocol for the FIRST disambiguating bit and emit the
-        // remaining 15 bits raw.
-        self.follow_bits += 1;
-        let target = self.low.wrapping_add(0x4000) & 0xFFFF;
-        // First bit: top bit of target.
+        // * `T >= low` — inside the interval from below;
+        // * `T + 1 <= low + range` (because `range >= 0x4001`) — so the
+        //   decoder's past-end 1-extension of the emitted 16 bits,
+        //   which converges toward (but never reaches) `T + 1`, stays
+        //   strictly inside `[low, low + range)` for every remaining
+        //   symbol resolution;
+        // * `T <= 0xFFFF` (from `low + range <= 0x10000`) — the value
+        //   always fits 16 bits, no carry into already-flushed bytes.
+        //
+        // The FIRST bit goes through the WNC bit-plus-follows protocol
+        // so any pending E3 `follow_bits` resolve as its complement
+        // (the deferred carry decision); the remaining 15 bits are the
+        // raw MSB-first tail of `T`.
+        //
+        // Historical note: this used to inject one extra follow bit
+        // (`follow_bits += 1`) before emitting `T`, which inserted a
+        // spurious `!b0` bit between `T`'s top bit and the rest —
+        // shifting the 15-bit tail one position right. With a loose
+        // final interval the corrupted value still landed inside
+        // `[low, low + range)` and everything decoded; with a tight
+        // interval (strongly-adapted contexts near the end of a block)
+        // the final few symbols could misdecode — the long-observed
+        // "§B.2.7.1 terminator roughness" on the last symbols of an
+        // arith block was exactly this, not a rounding property of the
+        // scheme.
+        let target = self.low + 0x4000;
+        debug_assert!(target <= 0xFFFF, "low + range <= 0x10000 invariant");
+        // First bit: top bit of target (resolves pending follows).
         let b0 = (target >> 15) & 1;
         self.emit_with_follows(b0);
         // Remaining 15 bits, MSB-first.
@@ -425,6 +442,80 @@ mod tests {
         let bank = ContextBank::new(4);
         assert_eq!(bank.get(0), 0x8000);
         assert_eq!(bank.get(3), 0x8000);
+    }
+
+    /// §B.2.7.1 terminator regression (round-382): a heavily-biased
+    /// two-context stream (one rare symbol, then a long run of the
+    /// dominant value on both contexts) drives the final coding interval
+    /// tight against the terminator. The old `finish()` injected one
+    /// spurious follow bit before the 16-bit disambiguation value,
+    /// shifting its tail — symbol 504 of this exact 512-symbol pattern
+    /// misdecoded. Every symbol must decode back.
+    #[test]
+    fn terminator_biased_stream_decodes_every_symbol() {
+        let mut symbols: Vec<(usize, bool)> = Vec::new();
+        for i in 0..256 {
+            let first = i == 0;
+            symbols.push((0, first));
+            symbols.push((2, first));
+        }
+        let mut enc = ArithEncoder::new();
+        let mut bank = ContextBank::new(3);
+        for &(ctx, v) in &symbols {
+            enc.write_bool(&mut bank, ctx, v);
+        }
+        let bytes = enc.finish();
+        let mut dec = ArithDecoder::new(&bytes, bytes.len());
+        let mut bank2 = ContextBank::new(3);
+        for (k, &(ctx, want)) in symbols.iter().enumerate() {
+            let got = dec.read_bool(&mut bank2, ctx);
+            assert_eq!(got, want, "symbol {k} misdecoded");
+        }
+    }
+
+    /// Randomised terminator sweep: 200 seeded pseudo-random streams of
+    /// varying length / bias / context count all round-trip every
+    /// symbol. Broad protection for the `finish()` interval maths.
+    #[test]
+    fn terminator_random_streams_decode_every_symbol() {
+        // xorshift32 — deterministic, no external crates.
+        let mut state = 0x1234_5678u32;
+        let mut rng = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        for round in 0..200 {
+            let n_ctx = 1 + (rng() % 4) as usize;
+            let len = 1 + (rng() % 700) as usize;
+            // Bias: 0 = uniform, otherwise value is mostly false with
+            // 1-in-bias trues (drives contexts to saturation).
+            let bias = rng() % 20;
+            let symbols: Vec<(usize, bool)> = (0..len)
+                .map(|_| {
+                    let ctx = (rng() % n_ctx as u32) as usize;
+                    let v = if bias == 0 {
+                        rng() & 1 == 1
+                    } else {
+                        rng() % (bias + 1) == 0
+                    };
+                    (ctx, v)
+                })
+                .collect();
+            let mut enc = ArithEncoder::new();
+            let mut bank = ContextBank::new(n_ctx);
+            for &(ctx, v) in &symbols {
+                enc.write_bool(&mut bank, ctx, v);
+            }
+            let bytes = enc.finish();
+            let mut dec = ArithDecoder::new(&bytes, bytes.len());
+            let mut bank2 = ContextBank::new(n_ctx);
+            for (k, &(ctx, want)) in symbols.iter().enumerate() {
+                let got = dec.read_bool(&mut bank2, ctx);
+                assert_eq!(got, want, "round {round} symbol {k}/{len} misdecoded");
+            }
+        }
     }
 
     #[test]
