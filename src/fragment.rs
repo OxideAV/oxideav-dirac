@@ -1229,6 +1229,331 @@ impl<'s> FragmentedPictureDecoder<'s> {
     }
 }
 
+// ----------------------------------------------------------------------
+// §14 fragment EMITTER (round-386)
+// ----------------------------------------------------------------------
+
+/// One emitted §14 fragment data unit, ready for §10.5.1 parse-info
+/// framing: the fragment parse code plus the complete fragment payload
+/// (§14.2 fragment header + transform-parameter bytes for the setup
+/// fragment, or slice bytes for a data fragment).
+#[derive(Debug, Clone)]
+pub struct FragmentUnit {
+    /// `0xEC` (HQ) or `0xCC` (LD): the source picture's parse code with
+    /// bit 2 set (Table 5, `is_fragment := (parse_code & 0x0C) == 0x0C`).
+    pub parse_code: u8,
+    /// Complete fragment payload following the 13-byte parse-info
+    /// header.
+    pub payload: Vec<u8>,
+}
+
+/// Errors raised by [`fragment_picture_payload`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FragmentEmitError {
+    /// The parse code is not an LD (`0xC8`-shape) or HQ (`0xE8`-shape)
+    /// picture code.
+    NotAPictureParseCode(u8),
+    /// `max_slices_per_fragment` must be at least 1.
+    ZeroSlicesPerFragment,
+    /// The payload's `transform_parameters()` block failed to parse.
+    TransformParameters(PictureError),
+    /// The slice walk ran off the end of the payload — the payload is
+    /// shorter than its own transform parameters declare.
+    Truncated,
+    /// A §14.2 fragment-header field (`slice_count`, `x_offset`,
+    /// `y_offset` — all 16-bit) cannot represent the requested split.
+    FieldOverflow,
+}
+
+impl core::fmt::Display for FragmentEmitError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NotAPictureParseCode(pc) => {
+                write!(f, "parse code {pc:#04X} is not an LD/HQ picture")
+            }
+            Self::ZeroSlicesPerFragment => write!(f, "max_slices_per_fragment must be >= 1"),
+            Self::TransformParameters(e) => write!(f, "transform parameters: {e}"),
+            Self::Truncated => write!(f, "picture payload truncated during slice walk"),
+            Self::FieldOverflow => {
+                write!(
+                    f,
+                    "fragment header field overflow (16-bit slice_count / offsets)"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for FragmentEmitError {}
+
+/// **Split a non-fragmented LD / HQ picture payload into a §14 fragment
+/// sequence** (round-386) — the encode-side inverse of
+/// [`FragmentedPictureDecoder`].
+///
+/// `payload` is the picture payload as emitted by the crate's LD / HQ
+/// picture encoders (§12.2 picture number + byte-aligned
+/// `transform_parameters()` + byte-aligned slices);
+/// `picture_parse_code` is the code the picture would carry
+/// non-fragmented (`0xE8` / `0xC8` shapes); `major_version` is the
+/// version the payload's transform parameters were encoded with (v3
+/// payloads carry the §12.4.4 extended-transform flags). The result is
+/// one setup fragment carrying the transform-parameter bytes followed
+/// by data fragments of at most `max_slices_per_fragment` consecutive
+/// raster-order slices, each stamped with the §14.2 raster offset of
+/// its first slice.
+///
+/// The §14.2 `fragment_data_length` field "contains undefined data and
+/// does not contribute to decoding"; this emitter fills it with the
+/// fragment's trailing byte count when it fits in 16 bits and `0`
+/// otherwise.
+///
+/// Slice boundaries are recovered from the payload itself: the HQ walk
+/// follows §13.5.4 (prefix bytes, qindex byte, three
+/// length-byte-scaled component blocks per slice); the LD widths are
+/// the closed-form §13.5.3.2 `slice_bytes`. No encoder-internal state
+/// is consulted, so any conformant payload — including one produced by
+/// a different encoder — fragments correctly.
+pub fn fragment_picture_payload(
+    payload: &[u8],
+    picture_parse_code: u8,
+    major_version: u32,
+    max_slices_per_fragment: u32,
+) -> Result<Vec<FragmentUnit>, FragmentEmitError> {
+    if max_slices_per_fragment == 0 {
+        return Err(FragmentEmitError::ZeroSlicesPerFragment);
+    }
+    let profile = if (picture_parse_code & 0xF8) == 0xE8 {
+        LowDelayProfile::HQ
+    } else if (picture_parse_code & 0xF8) == 0xC8 {
+        LowDelayProfile::LD
+    } else {
+        return Err(FragmentEmitError::NotAPictureParseCode(picture_parse_code));
+    };
+    if (picture_parse_code & 0x0C) == 0x0C {
+        // Already a fragment code — fragmenting a fragment is a caller
+        // bug, not a picture.
+        return Err(FragmentEmitError::NotAPictureParseCode(picture_parse_code));
+    }
+    if payload.len() < 4 {
+        return Err(FragmentEmitError::Truncated);
+    }
+    let picture_number = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+
+    // Transform parameters: parse with the production reader, then
+    // byte-align — slice 0 starts at the next byte boundary.
+    let mut r = BitReader::new(&payload[4..]);
+    let tp = parse_transform_parameters(&mut r, profile, major_version)
+        .map_err(FragmentEmitError::TransformParameters)?;
+    r.byte_align();
+    let tp_end = 4 + r.byte_pos();
+    if tp_end > payload.len() {
+        return Err(FragmentEmitError::Truncated);
+    }
+
+    // Raster-order slice byte ranges.
+    let total_slices = (tp.slices_x as usize) * (tp.slices_y as usize);
+    let mut slice_ranges: Vec<core::ops::Range<usize>> = Vec::with_capacity(total_slices);
+    let mut p = tp_end;
+    match profile {
+        LowDelayProfile::HQ => {
+            let scaler = tp.slice_size_scaler.max(1) as usize;
+            for _ in 0..total_slices {
+                let start = p;
+                p = p
+                    .checked_add(tp.slice_prefix_bytes as usize + 1)
+                    .ok_or(FragmentEmitError::Truncated)?;
+                for _ in 0..3 {
+                    let len_byte = *payload.get(p).ok_or(FragmentEmitError::Truncated)? as usize;
+                    p = p
+                        .checked_add(1 + len_byte * scaler)
+                        .ok_or(FragmentEmitError::Truncated)?;
+                }
+                if p > payload.len() {
+                    return Err(FragmentEmitError::Truncated);
+                }
+                slice_ranges.push(start..p);
+            }
+        }
+        LowDelayProfile::LD => {
+            for sy in 0..tp.slices_y {
+                for sx in 0..tp.slices_x {
+                    let w = crate::picture::slice_bytes(
+                        tp.slices_x,
+                        tp.slice_bytes_numer,
+                        tp.slice_bytes_denom,
+                        sx,
+                        sy,
+                    ) as usize;
+                    let start = p;
+                    p = p.checked_add(w).ok_or(FragmentEmitError::Truncated)?;
+                    if p > payload.len() {
+                        return Err(FragmentEmitError::Truncated);
+                    }
+                    slice_ranges.push(start..p);
+                }
+            }
+        }
+    }
+
+    // §14.2 field-width guards: slice_count and the raster offsets are
+    // 16-bit. (A grid wider/taller than 65535 slices cannot be
+    // addressed; a fragment cannot carry more than 65535 slices.)
+    if tp.slices_x > u16::MAX as u32 + 1 || tp.slices_y > u16::MAX as u32 + 1 {
+        return Err(FragmentEmitError::FieldOverflow);
+    }
+
+    let frag_code = picture_parse_code | 0x04;
+    let data_len_field = |n: usize| -> [u8; 2] { u16::try_from(n).unwrap_or(0).to_be_bytes() };
+
+    let mut out: Vec<FragmentUnit> = Vec::with_capacity(1 + total_slices);
+
+    // Setup fragment: picture number + data length + slice_count 0 +
+    // the transform-parameter bytes.
+    let tp_bytes = &payload[4..tp_end];
+    let mut setup = Vec::with_capacity(8 + tp_bytes.len());
+    setup.extend_from_slice(&picture_number.to_be_bytes());
+    setup.extend_from_slice(&data_len_field(tp_bytes.len()));
+    setup.extend_from_slice(&0u16.to_be_bytes());
+    setup.extend_from_slice(tp_bytes);
+    out.push(FragmentUnit {
+        parse_code: frag_code,
+        payload: setup,
+    });
+
+    // Data fragments: consecutive raster-order chunks.
+    let chunk = max_slices_per_fragment as usize;
+    let mut s = 0usize;
+    while s < total_slices {
+        let n = chunk.min(total_slices - s);
+        let count = u16::try_from(n).map_err(|_| FragmentEmitError::FieldOverflow)?;
+        let x_off = (s as u32) % tp.slices_x;
+        let y_off = (s as u32) / tp.slices_x;
+        let (x_off, y_off) = (
+            u16::try_from(x_off).map_err(|_| FragmentEmitError::FieldOverflow)?,
+            u16::try_from(y_off).map_err(|_| FragmentEmitError::FieldOverflow)?,
+        );
+        let start = slice_ranges[s].start;
+        let end = slice_ranges[s + n - 1].end;
+        let bytes = &payload[start..end];
+        let mut data = Vec::with_capacity(12 + bytes.len());
+        data.extend_from_slice(&picture_number.to_be_bytes());
+        data.extend_from_slice(&data_len_field(bytes.len()));
+        data.extend_from_slice(&count.to_be_bytes());
+        data.extend_from_slice(&x_off.to_be_bytes());
+        data.extend_from_slice(&y_off.to_be_bytes());
+        data.extend_from_slice(bytes);
+        out.push(FragmentUnit {
+            parse_code: frag_code,
+            payload: data,
+        });
+        s += n;
+    }
+    Ok(out)
+}
+
+/// Frame a fragment-unit sequence into a complete elementary stream:
+/// sequence header (`0x00`), the units, end-of-sequence (`0x10`), with
+/// the §10.5.1 `next`/`previous` parse-offset chain wired.
+fn frame_fragment_stream(sequence: &SequenceHeader, units: &[FragmentUnit]) -> Vec<u8> {
+    let sh_payload = crate::encoder::encode_sequence_header(sequence);
+    let pi_size = ParseInfo::SIZE;
+    let mut out = Vec::new();
+    let sh_unit_len = (pi_size + sh_payload.len()) as u32;
+    crate::encoder::write_parse_info(&mut out, 0x00, sh_unit_len, 0);
+    out.extend_from_slice(&sh_payload);
+    let mut prev = sh_unit_len;
+    for unit in units {
+        let unit_len = (pi_size + unit.payload.len()) as u32;
+        crate::encoder::write_parse_info(&mut out, unit.parse_code, unit_len, prev);
+        out.extend_from_slice(&unit.payload);
+        prev = unit_len;
+    }
+    crate::encoder::write_parse_info(&mut out, 0x10, 0, prev);
+    out
+}
+
+/// **Encode a complete fragmented single-picture HQ intra stream**
+/// (round-386): a `major_version = 3` sequence header (`0x00`), a
+/// setup fragment + data fragments of at most
+/// `max_slices_per_fragment` slices (all `0xEC`), and end-of-sequence
+/// (`0x10`), with the §10.5.1 `next`/`previous` parse-offset chain
+/// wired. The fragmented counterpart of
+/// [`crate::encoder::encode_single_hq_intra_stream`].
+///
+/// `params.major_version` must be `>= 3` (fragmented pictures are VC-2
+/// v3 syntax, and the picture's transform parameters must carry the
+/// §12.4.4 extended flags the v3 sequence header promises) — use
+/// [`crate::encoder::EncoderParams::with_major_version_3`]. The
+/// emitted sequence header is the caller's with
+/// `parse_parameters.version_major` forced to 3 so the stream is
+/// self-consistent.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_single_hq_intra_fragmented_stream(
+    sequence: &SequenceHeader,
+    params: &crate::encoder::EncoderParams,
+    picture_number: u32,
+    y: &[u8],
+    u: &[u8],
+    v: &[u8],
+    max_slices_per_fragment: u32,
+) -> Vec<u8> {
+    assert!(
+        params.major_version >= 3,
+        "fragmented pictures are v3 syntax; use EncoderParams::with_major_version_3()"
+    );
+    let mut seq3 = sequence.clone();
+    seq3.parse_parameters.version_major = 3;
+
+    let payload = crate::encoder::encode_hq_intra_picture(&seq3, params, picture_number, y, u, v);
+    let units = fragment_picture_payload(
+        &payload,
+        0xE8,
+        params.major_version,
+        max_slices_per_fragment,
+    )
+    .expect("freshly encoded HQ payload must fragment cleanly");
+
+    frame_fragment_stream(&seq3, &units)
+}
+
+/// **Encode a complete fragmented single-picture LD intra stream**
+/// (round-386) — the LD (`0xCC`) counterpart of
+/// [`encode_single_hq_intra_fragmented_stream`], and the fragmented
+/// counterpart of [`crate::encoder::encode_single_ld_intra_stream`].
+/// Same contract: `params.major_version` must be `>= 3`; the emitted
+/// sequence header carries `version_major = 3`. The LD path is the one
+/// with the §14.5 trailing DC-prediction kick on the decode side, so a
+/// bit-exact round-trip through [`FragmentedPictureDecoder`] exercises
+/// the full v3 LD pipeline.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_single_ld_intra_fragmented_stream(
+    sequence: &SequenceHeader,
+    params: &crate::encoder::LdEncoderParams,
+    picture_number: u32,
+    y: &[u8],
+    u: &[u8],
+    v: &[u8],
+    max_slices_per_fragment: u32,
+) -> Vec<u8> {
+    assert!(
+        params.major_version >= 3,
+        "fragmented pictures are v3 syntax; set LdEncoderParams::major_version = 3"
+    );
+    let mut seq3 = sequence.clone();
+    seq3.parse_parameters.version_major = 3;
+
+    let payload = crate::encoder::encode_ld_intra_picture(&seq3, params, picture_number, y, u, v);
+    let units = fragment_picture_payload(
+        &payload,
+        0xC8,
+        params.major_version,
+        max_slices_per_fragment,
+    )
+    .expect("freshly encoded LD payload must fragment cleanly");
+
+    frame_fragment_stream(&seq3, &units)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
