@@ -1,5 +1,7 @@
 # oxideav-dirac
 
+[![CI](https://github.com/OxideAV/oxideav-dirac/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-dirac/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-dirac.svg)](https://crates.io/crates/oxideav-dirac) [![docs.rs](https://docs.rs/oxideav-dirac/badge.svg)](https://docs.rs/oxideav-dirac) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Pure-Rust codec for **Dirac** (BBC wavelet video codec) and its
 intra-only subset **SMPTE VC-2**. Implemented clean-room from the BBC
 "Dirac Specification" (v2.2.3, 2008) and SMPTE ST 2042-1:2022. Zero C
