@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.9](https://github.com/OxideAV/oxideav-dirac/compare/v0.0.8...v0.0.9) - 2026-07-03
+
+### Other
+
+- README + CHANGELOG: §14 fragment emitter status (round-386)
+- §14 fragment EMITTER — fragment_picture_payload + LD/HQ v3 fragmented-stream drivers (round-386)
+- README + CHANGELOG: round-386 global-model estimation status
+- external-oracle cross-decode of estimator output — pan bit-exact + affine divergence characterised (round-386)
+- 48-case random-warp + degeneracy fuzz sweep over the global-model estimator (round-386)
+- estimate_global_bipred_config — two-model §11.2.6 estimation for B-pictures (round-386)
+- per-picture auto global-motion in the sequence driver (round-386)
+- estimated affine/perspective global-motion end-to-end — bit-exact + byte-savings pins (round-386)
+- §11.2.6 affine + perspective global-model estimation from the ME grid (round-386)
+- pan_tilt_all emits the zero matrix — the field is now a true pan (round-386)
+- upgrade self-roundtrip lib test to bit-exact — terminator followup landed (round-382)
+- mention estimate_global_pan_config auto-fit (round-382)
+- pan/tilt global-motion estimation from the ME grid (round-382)
+- external-oracle bit-exact cross-decode of global-motion P stream (round-382)
+- global-motion encode + exact AC terminator status (round-382)
+- sequence-driver global-motion integration + rate-control estimate (round-382)
+- 120-case global-motion fuzz sweep (round-382)
+- global-field variant coverage — zoom ramp, qpel field, mixed grid (round-382)
+- fix §B.2.7.1 terminator — spurious follow bit corrupted AC block tails (round-382)
+- §11.2.6 global motion on the bipred (0x0A) path — bit-exact B-frame (round-382)
+- end-to-end §11.2.6 global-motion P-picture round-trip (round-382)
+- §12.3.3.2 per-block global-mode emission + gmode grid (round-382)
+- §11.2.6 global-motion params + picture-prediction-params emit (round-382)
+- inter sequence driver: codeblock-grid residue integration coverage (round-370)
+- inter-residue rate control: account for the §11.3.3 codeblock grid (round-370)
+- codeblock-grid robustness fuzz sweep (round-370)
+- inter bipred: codeblock-grid residue round-trip coverage (round-370)
+- §11.3.3 spatial-partition codeblock grid (round-370)
+- extend 10-bit intra decode coverage to the dwt_depth axis + asymmetric transform
+- 10/12-bit intra encode→decode round-trip — close the >8-bit corpus gap on the decode side
+- §15.8.7/§15.8.2 global-motion prediction-branch coverage (round-337)
+- §15.8.8 global_mv unit tests + spec-grounded translation note
+- inter sequence driver: leaky-bucket VBV + VbvHysteresis residue rate control (round-326)
+- multi-picture rate-controlled inter sequence driver (round-320)
+- refresh to current status, drop per-round changelog cruft
+
 ### Added
 
 - **§14 fragment emitter** (round-386) — the encode-side inverse of
