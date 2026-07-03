@@ -1339,3 +1339,272 @@ fn ffmpeg_decodes_our_global_motion_p_stream_bit_exact() {
         "global-motion inter V bit-exact"
     );
 }
+
+/// Smooth trackable luma texture + §15.8.8 warp helpers for the
+/// round-386 estimator cross-decode tests.
+fn smooth_luma(w: usize, h: usize, seed: u32) -> Vec<u8> {
+    let cell = 8usize;
+    let gw = w / cell + 2;
+    let gh = h / cell + 2;
+    let mut state = seed | 1;
+    let mut grid = vec![0f64; gw * gh];
+    for g in grid.iter_mut() {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        *g = 40.0 + (state % 160) as f64;
+    }
+    let mut out = vec![0u8; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let (gx, gy) = (x / cell, y / cell);
+            let fx = (x % cell) as f64 / cell as f64;
+            let fy = (y % cell) as f64 / cell as f64;
+            let v = grid[gy * gw + gx] * (1.0 - fx) * (1.0 - fy)
+                + grid[gy * gw + gx + 1] * fx * (1.0 - fy)
+                + grid[(gy + 1) * gw + gx] * (1.0 - fx) * fy
+                + grid[(gy + 1) * gw + gx + 1] * fx * fy;
+            out[y * w + x] = v.round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    out
+}
+
+/// `out(x) = src(x + global_mv(g, x))`, edge-clamped (`mv_precision=0`
+/// integer-field convention).
+fn warp_by_field(
+    src: &[u8],
+    w: usize,
+    h: usize,
+    g: &oxideav_dirac::picture_inter::GlobalParams,
+) -> Vec<u8> {
+    use oxideav_dirac::obmc::global_mv;
+    let mut out = vec![0u8; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let (dx, dy) = global_mv(g, x as i32, y as i32);
+            let sx = (x as i32 + dx).clamp(0, w as i32 - 1) as usize;
+            let sy = (y as i32 + dy).clamp(0, h as i32 - 1) as usize;
+            out[y * w + x] = src[sy * w + sx];
+        }
+    }
+    out
+}
+
+/// Run the external oracle on a Dirac elementary stream and return the
+/// raw yuv420p output bytes.
+fn oracle_decode_yuv420(stream: &[u8], tag: &str) -> Vec<u8> {
+    let drc = std::env::temp_dir().join(format!("oxideav_dirac_{tag}.drc"));
+    let yuv = std::env::temp_dir().join(format!("oxideav_dirac_{tag}.yuv"));
+    std::fs::write(&drc, stream).expect("write drc");
+    let s = std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "dirac",
+            "-i",
+        ])
+        .arg(&drc)
+        .args(["-f", "rawvideo", "-pix_fmt", "yuv420p"])
+        .arg(&yuv)
+        .status()
+        .expect("run ffmpeg");
+    assert!(
+        s.success(),
+        "external oracle rejected the stream — see {drc:?}"
+    );
+    std::fs::read(&yuv).expect("read decoded yuv")
+}
+
+/// **Estimated pan cross-decode, bit-exact** (round-386). The round-382
+/// oracle test validates a hand-authored constant field; this one closes
+/// the loop on the ESTIMATOR: a whole-frame integer pan over a textured
+/// fixture, `estimate_global_pan_config` fits the translation from the
+/// encoder's own ME grid, and the external oracle reconstructs the inter
+/// frame **bit-exactly** — third-party validation that an estimated
+/// model + per-block gmode grid mean the same thing to an independent
+/// implementation.
+#[test]
+fn ffmpeg_decodes_our_estimated_pan_global_stream_bit_exact() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg not available; skipping estimated-pan cross-decode");
+        return;
+    }
+    use oxideav_dirac::encoder::make_minimal_sequence;
+    use oxideav_dirac::encoder_inter::{
+        estimate_global_pan_config, InterEncoderParams, InterInputPicture,
+    };
+    use oxideav_dirac::encoder_intra_core::{
+        encode_core_intra_then_inter_stream, CoreIntraEncoderParams,
+    };
+    use oxideav_dirac::wavelet::WaveletFilter;
+
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let intra_params = CoreIntraEncoderParams::default_intra(WaveletFilter::LeGall5_3, 3);
+    let y0 = smooth_luma(64, 64, 0x2468_ace1);
+    // Whole-frame pan: cur(x) = ref(x + 3) with right-edge replication.
+    let mut y1 = vec![0u8; 64 * 64];
+    for r in 0..64usize {
+        for c in 0..64usize {
+            y1[r * 64 + c] = y0[r * 64 + (c + 3).min(63)];
+        }
+    }
+    let u = vec![128u8; 32 * 32];
+    let v = vec![128u8; 32 * 32];
+
+    let base = InterEncoderParams {
+        mv_precision: 0,
+        ..InterEncoderParams::default()
+    };
+    let (cfg, fraction) = estimate_global_pan_config(&seq, &base, &y1, &y0);
+    assert!(fraction >= 0.8, "estimator fraction {fraction} too low");
+    let inter_params = InterEncoderParams {
+        global_motion: Some(cfg),
+        ..base
+    };
+    let intra = InterInputPicture {
+        picture_number: 0,
+        y: &y0,
+        u: &u,
+        v: &v,
+    };
+    let inter = InterInputPicture {
+        picture_number: 1,
+        y: &y1,
+        u: &u,
+        v: &v,
+    };
+    let stream =
+        encode_core_intra_then_inter_stream(&seq, &intra_params, &inter_params, &intra, &inter);
+    let out = oracle_decode_yuv420(&stream, "estimated_pan_global");
+    let frame_size = 64 * 64 + 2 * 32 * 32;
+    assert_eq!(
+        out.len(),
+        2 * frame_size,
+        "expected exactly 2 decoded frames"
+    );
+    assert_eq!(&out[..64 * 64], &y0[..], "anchor Y bit-exact");
+    assert_eq!(
+        &out[frame_size..frame_size + 64 * 64],
+        &y1[..],
+        "estimated-pan global inter Y bit-exact through the external oracle"
+    );
+}
+
+/// **Estimated affine cross-decode — oracle divergence characterisation**
+/// (round-386). The current frame is the reference warped by a known
+/// §15.8.8 zoom field and `estimate_global_affine_config` recovers the
+/// model (non-trivial zoom_rotate_shear matrix, whole-grid gmode). Our
+/// own decoder reconstructs the frame bit-exactly (pinned in
+/// `encoder_inter_roundtrip.rs`). The external oracle, however,
+/// **applies the §15.8.8 field evaluated at (0, 0) to every pixel** —
+/// behaviourally pan-only, ignoring the position-dependent matrix term
+/// that spec §15.8.8 defines (`v = (1 − 2^−β·cᵀx)(2^−α·A·x + b)`, a
+/// per-pixel field). This test pins the exact black-box behaviour:
+/// the oracle must accept the stream and its inter frame must equal
+/// EITHER the spec per-pixel-field reconstruction (bit-exact `y1` —
+/// a future oracle that honours the matrix) OR the constant-field
+/// approximation `ref(x + global_mv(g, 0, 0))` it applies today. Any
+/// third output shape means our wire emission of `zrs`/`zrs_exp`
+/// desynced the oracle's parser — the actual regression this guards.
+#[test]
+fn ffmpeg_estimated_affine_global_stream_characterised() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg not available; skipping estimated-affine characterisation");
+        return;
+    }
+    use oxideav_dirac::encoder::make_minimal_sequence;
+    use oxideav_dirac::encoder_inter::{
+        estimate_global_affine_config, InterEncoderParams, InterInputPicture,
+    };
+    use oxideav_dirac::encoder_intra_core::{
+        encode_core_intra_then_inter_stream, CoreIntraEncoderParams,
+    };
+    use oxideav_dirac::obmc::global_mv;
+    use oxideav_dirac::picture_inter::GlobalParams;
+    use oxideav_dirac::wavelet::WaveletFilter;
+
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let intra_params = CoreIntraEncoderParams::default_intra(WaveletFilter::LeGall5_3, 3);
+    let y0 = smooth_luma(64, 64, 0x1357_9bdf);
+    let g_true = GlobalParams {
+        pan_tilt: (-3, -3),
+        zrs: [[16, 0], [0, 16]],
+        zrs_exp: 8,
+        perspective: (0, 0),
+        persp_exp: 0,
+    };
+    let y1 = warp_by_field(&y0, 64, 64, &g_true);
+    let u = vec![128u8; 32 * 32];
+    let v = vec![128u8; 32 * 32];
+
+    let base = InterEncoderParams {
+        mv_precision: 0,
+        ..InterEncoderParams::default()
+    };
+    let (cfg, fraction) = estimate_global_affine_config(&seq, &base, &y1, &y0);
+    assert!(fraction >= 0.6, "estimator fraction {fraction} too low");
+    assert_ne!(
+        cfg.global1.zrs,
+        [[0, 0], [0, 0]],
+        "zoom must reach the matrix"
+    );
+    let g_est = cfg.global1.clone();
+    let inter_params = InterEncoderParams {
+        global_motion: Some(cfg),
+        ..base
+    };
+    let intra = InterInputPicture {
+        picture_number: 0,
+        y: &y0,
+        u: &u,
+        v: &v,
+    };
+    let inter = InterInputPicture {
+        picture_number: 1,
+        y: &y1,
+        u: &u,
+        v: &v,
+    };
+    let stream =
+        encode_core_intra_then_inter_stream(&seq, &intra_params, &inter_params, &intra, &inter);
+    let out = oracle_decode_yuv420(&stream, "estimated_affine_global");
+    let frame_size = 64 * 64 + 2 * 32 * 32;
+    assert_eq!(
+        out.len(),
+        2 * frame_size,
+        "expected exactly 2 decoded frames"
+    );
+    assert_eq!(&out[..64 * 64], &y0[..], "anchor Y bit-exact");
+
+    let oracle_y = &out[frame_size..frame_size + 64 * 64];
+    if oracle_y == &y1[..] {
+        eprintln!("oracle honoured the per-pixel §15.8.8 matrix field — bit-exact");
+        return;
+    }
+    // Constant-field approximation: the estimated field at (0, 0)
+    // applied to every pixel of the reference.
+    let g0 = global_mv(&g_est, 0, 0);
+    let constant = GlobalParams {
+        pan_tilt: (g0.0 - 1, g0.1 - 1),
+        zrs: [[0, 0], [0, 0]],
+        zrs_exp: 0,
+        perspective: (0, 0),
+        persp_exp: 0,
+    };
+    let pan_only = warp_by_field(&y0, 64, 64, &constant);
+    assert_eq!(
+        oracle_y,
+        &pan_only[..],
+        "oracle output matches neither the spec per-pixel field nor its \
+         own constant-field approximation — the zrs wire emission likely \
+         desynced the oracle's parser"
+    );
+    eprintln!(
+        "oracle applied the constant field {g0:?} to every pixel (pan-only \
+         global MC); our decoder implements the per-pixel §15.8.8 field"
+    );
+}
