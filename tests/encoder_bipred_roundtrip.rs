@@ -1098,3 +1098,166 @@ fn bipred_global_motion_b_picture_roundtrips() {
          global-motion residue path failed to close the prediction loop"
     );
 }
+
+// ---- round-386: estimated bipred global motion ------------------------
+
+/// Deterministic smooth luma texture (coarse pseudo-random grid,
+/// bilinearly upsampled) — same construction as the 1-ref estimator
+/// fixtures.
+fn smooth_texture_96(seed: u32) -> Vec<u8> {
+    let (w, h, cell) = (96usize, 96usize, 8usize);
+    let gw = w / cell + 2;
+    let gh = h / cell + 2;
+    let mut state = seed | 1;
+    let mut grid = vec![0f64; gw * gh];
+    for g in grid.iter_mut() {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        *g = 40.0 + (state % 160) as f64;
+    }
+    let mut out = vec![0u8; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let (gx, gy) = (x / cell, y / cell);
+            let fx = (x % cell) as f64 / cell as f64;
+            let fy = (y % cell) as f64 / cell as f64;
+            let v = grid[gy * gw + gx] * (1.0 - fx) * (1.0 - fy)
+                + grid[gy * gw + gx + 1] * fx * (1.0 - fy)
+                + grid[(gy + 1) * gw + gx] * (1.0 - fx) * fy
+                + grid[(gy + 1) * gw + gx + 1] * fx * fy;
+            out[y * w + x] = v.round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    out
+}
+
+/// Warp a plane by the integer §15.8.8 field of `g`:
+/// `out(x) = src(x + global_mv(g, x))`, edge-clamped.
+fn warp_plane(src: &[u8], w: usize, h: usize, g: &GlobalParams) -> Vec<u8> {
+    use oxideav_dirac::obmc::global_mv;
+    let mut out = vec![0u8; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let (dx, dy) = global_mv(g, x as i32, y as i32);
+            let sx = (x as i32 + dx).clamp(0, w as i32 - 1) as usize;
+            let sy = (y as i32 + dy).clamp(0, h as i32 - 1) as usize;
+            out[y * w + x] = src[sy * w + sx];
+        }
+    }
+    out
+}
+
+/// **Round-386: estimated global motion on the bipred (0x0A) path.**
+/// A B-picture halfway through a steady camera zoom-out (field
+/// v = x/16 per axis per frame step): both per-reference ME grids vary
+/// spatially, so the block-motion encode pays MV residuals everywhere
+/// while the estimated per-reference affine models shed them. The
+/// AND-rule gmode grid must mark a dominant share of blocks global,
+/// and the encoded stream must (a) decode at the same near-lossless
+/// quality as the block-motion bipred encode and (b) spend fewer
+/// bytes.
+#[test]
+fn estimated_bipred_global_zoom_roundtrips_and_saves_bytes() {
+    use oxideav_dirac::encoder_inter::{estimate_global_bipred_config, GlobalMotionModel};
+
+    let seq = make_minimal_sequence(96, 96, ChromaFormat::Yuv420);
+    let intra_params = CoreIntraEncoderParams::default_intra(WaveletFilter::LeGall5_3, 3);
+
+    let y0 = smooth_texture_96(0x0bad_cafe);
+    // Steady zoom-out at a = 16/256 per frame: B is one step from the
+    // past anchor, the future anchor two steps.
+    let g_step = GlobalParams {
+        pan_tilt: (-3, -3),
+        zrs: [[16, 0], [0, 16]],
+        zrs_exp: 8,
+        perspective: (0, 0),
+        persp_exp: 0,
+    };
+    let g_two = GlobalParams {
+        pan_tilt: (-6, -6),
+        zrs: [[32, 0], [0, 32]],
+        zrs_exp: 8,
+        perspective: (0, 0),
+        persp_exp: 0,
+    };
+    let ym = warp_plane(&y0, 96, 96, &g_step); // B one zoom step out
+    let y2 = warp_plane(&y0, 96, 96, &g_two); // future anchor, two steps
+    let u = vec![128u8; 48 * 48];
+    let v = vec![128u8; 48 * 48];
+
+    // Integer-pel bipred ME keeps the fixture's constant fields exact.
+    let base = InterEncoderParams {
+        bipred_mv_precision: 0,
+        ..InterEncoderParams::default()
+    };
+    let (cfg, fraction) =
+        estimate_global_bipred_config(&seq, &base, &ym, &y0, &y2, GlobalMotionModel::Affine);
+    // The AND rule is deliberately strict — the field must win the SAD
+    // race against BOTH references' ME MVs. The two-step warp towards
+    // the future anchor compounds two nearest-neighbour resamplings, so
+    // ref2's fit is noisier than ref1's; a simple majority is the
+    // realistic bar (measured 0.559 on this deterministic fixture).
+    assert!(
+        fraction >= 0.5,
+        "steady zoom should mark a majority of blocks global on both refs, got {fraction}"
+    );
+    assert!(cfg.global2.is_some(), "bipred estimate carries two models");
+    let with_global = InterEncoderParams {
+        global_motion: Some(cfg),
+        ..base.clone()
+    };
+
+    let intra_a = InterInputPicture {
+        picture_number: 0,
+        y: &y0,
+        u: &u,
+        v: &v,
+    };
+    let intra_b = InterInputPicture {
+        picture_number: 2,
+        y: &y2,
+        u: &u,
+        v: &v,
+    };
+    let bipred = InterInputPicture {
+        picture_number: 1,
+        y: &ym,
+        u: &u,
+        v: &v,
+    };
+
+    let encode_len_psnr = |params: &InterEncoderParams| -> (usize, f64) {
+        let stream = encode_core_intra_then_bipred_stream(
+            &seq,
+            &intra_params,
+            params,
+            &intra_a,
+            &intra_b,
+            &bipred,
+        );
+        let len = stream.len();
+        let frames = decode_stream(stream);
+        assert!(frames.len() >= 3, "expected 3 frames, got {}", frames.len());
+        assert_eq!(frames[0].planes[0].data, y0, "intra-A bit-exact");
+        assert_eq!(frames[1].planes[0].data, y2, "intra-B bit-exact");
+        (len, psnr(&frames[2].planes[0].data, &ym))
+    };
+
+    let (len_block, psnr_block) = encode_len_psnr(&base);
+    let (len_global, psnr_global) = encode_len_psnr(&with_global);
+    eprintln!(
+        "estimated bipred global: fraction {fraction:.3}, block-motion {psnr_block:.2} dB / \
+         {len_block} B, global {psnr_global:.2} dB / {len_global} B"
+    );
+    assert!(
+        psnr_global >= 60.0,
+        "estimated-global bipred Y PSNR {psnr_global:.2} dB below 60 dB — a \
+         reference's field diverged between encoder and decoder"
+    );
+    assert!(
+        len_global < len_block,
+        "estimated bipred global model must shed MV-residual bytes: \
+         {len_global} B (global) vs {len_block} B (block motion)"
+    );
+}

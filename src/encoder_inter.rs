@@ -534,6 +534,108 @@ pub fn estimate_global_perspective_config(
     )
 }
 
+/// **Estimate a §11.2.6 global model for a 2-reference bipred picture**
+/// (round-386): one model per reference, fitted from an independent
+/// per-reference ME grid at `params.bipred_mv_precision` (the precision
+/// [`encode_bipred_inter_picture`] signals), plus a **conservative**
+/// per-block global grid: a bipred global block predicts through the
+/// §15.8.8 field for *whichever* references its §12.3.3.1 mode uses, so
+/// a block is only marked global when the field wins the SAD comparison
+/// against its own ME MV for **both** references — whichever mode the
+/// encoder's per-block selector later picks, the field is at least as
+/// good as the block MV it replaces.
+///
+/// Returns the two-model config (`global2 = Some(..)`) and the AND-rule
+/// global fraction. Fit degeneracy on either reference falls back to
+/// that reference's median-pan model, mirroring the 1-ref estimator's
+/// fallback.
+pub fn estimate_global_bipred_config(
+    sequence: &SequenceHeader,
+    params: &InterEncoderParams,
+    cur_y: &[u8],
+    ref1_y: &[u8],
+    ref2_y: &[u8],
+    model: GlobalMotionModel,
+) -> (GlobalMotionConfig, f64) {
+    let (_sbx, _sby, blocks_x, blocks_y) = motion_grid(sequence.luma_width, sequence.luma_height);
+    let bmp = params.bipred_mv_precision;
+    let mut per_ref = |ref_y: &[u8]| -> (GlobalParams, Vec<bool>) {
+        let mvs = subpel_search_me(
+            cur_y,
+            ref_y,
+            sequence.luma_width,
+            sequence.luma_height,
+            blocks_x,
+            blocks_y,
+            params.mv_search_range,
+            bmp,
+        );
+        let g = match model {
+            GlobalMotionModel::Pan => None,
+            GlobalMotionModel::Affine => fit_global_params_from_grid(
+                &mvs,
+                blocks_x,
+                blocks_y,
+                sequence.luma_width,
+                sequence.luma_height,
+                false,
+            ),
+            GlobalMotionModel::Perspective => fit_global_params_from_grid(
+                &mvs,
+                blocks_x,
+                blocks_y,
+                sequence.luma_width,
+                sequence.luma_height,
+                true,
+            ),
+        };
+        // Pan request or degenerate fit → median-pan fallback (the
+        // constant field `t = median MV`, i.e. `pan_tilt = t − (1, 1)`
+        // under the zero matrix).
+        let g = g.unwrap_or_else(|| {
+            let mut xs: Vec<i32> = mvs.iter().map(|m| m.0).collect();
+            let mut ys: Vec<i32> = mvs.iter().map(|m| m.1).collect();
+            let t = (median(&mut xs), median(&mut ys));
+            GlobalParams {
+                pan_tilt: (t.0 - 1, t.1 - 1),
+                zrs: [[0, 0], [0, 0]],
+                zrs_exp: 0,
+                perspective: (0, 0),
+                persp_exp: 0,
+            }
+        });
+        let (gmode, _fraction) = global_gmode_by_sad(
+            cur_y,
+            ref_y,
+            sequence.luma_width,
+            sequence.luma_height,
+            blocks_x,
+            blocks_y,
+            &mvs,
+            &g,
+            bmp,
+        );
+        (g, gmode)
+    };
+    let (g1, gmode1) = per_ref(ref1_y);
+    let (g2, gmode2) = per_ref(ref2_y);
+    let gmode: Vec<bool> = gmode1
+        .iter()
+        .zip(gmode2.iter())
+        .map(|(&a, &b)| a && b)
+        .collect();
+    let marked = gmode.iter().filter(|&&b| b).count();
+    let fraction = marked as f64 / gmode.len().max(1) as f64;
+    (
+        GlobalMotionConfig {
+            global1: g1,
+            global2: Some(g2),
+            block_gmode: Some(gmode),
+        },
+        fraction,
+    )
+}
+
 /// Real-valued global-model fit, before quantisation onto the §11.2.6
 /// integer parameterisation. `a` / `b` are the affine matrix and
 /// translation of `v(x) ≈ A·x + b` in MV units; `c` is the perspective
