@@ -1393,3 +1393,237 @@ fn estimated_global_motion_roundtrips_and_matches_block_motion_quality() {
          ({psnr_block:.2} dB) — the estimate must not change the prediction"
     );
 }
+
+// ---- round-386: estimated affine / perspective global motion ---------
+
+/// Deterministic smooth luma texture (coarse pseudo-random 8-pel grid,
+/// bilinearly upsampled): every ME window gets a unique low-frequency
+/// signature that stays trackable under spatially-varying warps.
+fn smooth_texture(w: usize, h: usize, seed: u32) -> Vec<u8> {
+    let cell = 8usize;
+    let gw = w / cell + 2;
+    let gh = h / cell + 2;
+    let mut state = seed | 1;
+    let mut grid = vec![0f64; gw * gh];
+    for g in grid.iter_mut() {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        *g = 40.0 + (state % 160) as f64;
+    }
+    let mut out = vec![0u8; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let gx = x / cell;
+            let gy = y / cell;
+            let fx = (x % cell) as f64 / cell as f64;
+            let fy = (y % cell) as f64 / cell as f64;
+            let v00 = grid[gy * gw + gx];
+            let v01 = grid[gy * gw + gx + 1];
+            let v10 = grid[(gy + 1) * gw + gx];
+            let v11 = grid[(gy + 1) * gw + gx + 1];
+            let v = v00 * (1.0 - fx) * (1.0 - fy)
+                + v01 * fx * (1.0 - fy)
+                + v10 * (1.0 - fx) * fy
+                + v11 * fx * fy;
+            out[y * w + x] = v.round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    out
+}
+
+/// Warp `refp` by the integer §15.8.8 field of `g` (`mv_precision = 0`
+/// convention): `cur(x) = ref(x + global_mv(g, x))`, edge-clamped. The
+/// decoder's own field arithmetic generates the fixture, so the true
+/// camera model is exactly representable.
+fn warp_by_global_field(refp: &[u8], w: usize, h: usize, g: &GlobalParams) -> Vec<u8> {
+    use oxideav_dirac::obmc::global_mv;
+    let mut out = vec![0u8; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let (dx, dy) = global_mv(g, x as i32, y as i32);
+            let sx = (x as i32 + dx).clamp(0, w as i32 - 1) as usize;
+            let sy = (y as i32 + dy).clamp(0, h as i32 - 1) as usize;
+            out[y * w + x] = refp[sy * w + sx];
+        }
+    }
+    out
+}
+
+/// Shared driver: encode intra + inter with `params`, decode with our
+/// own decoder, and return (bit_exact_y, bit_exact_u, bit_exact_v,
+/// stream_len).
+fn roundtrip_report(
+    seq: &oxideav_dirac::sequence::SequenceHeader,
+    params: &InterEncoderParams,
+    intra: &InterInputPicture<'_>,
+    inter: &InterInputPicture<'_>,
+) -> (bool, bool, bool, usize) {
+    let intra_params = EncoderParams::default_hq(WaveletFilter::LeGall5_3, 3);
+    let stream = encode_intra_then_inter_stream(seq, &intra_params, params, intra, inter);
+    let len = stream.len();
+    let mut reg = CodecRegistry::new();
+    oxideav_dirac::register_codecs(&mut reg);
+    let cp = CodecParameters::video(CodecId::new("dirac"));
+    let mut dec = reg.first_decoder(&cp).expect("decoder");
+    let packet = Packet::new(0, TimeBase::new(1, 25), stream);
+    dec.send_packet(&packet).expect("send");
+    let _f0 = dec.receive_frame().expect("intra");
+    let f1 = match dec.receive_frame().expect("inter") {
+        Frame::Video(vf) => vf,
+        other => panic!("expected video, got {other:?}"),
+    };
+    (
+        f1.planes[0].data == inter.y,
+        f1.planes[1].data == inter.u,
+        f1.planes[2].data == inter.v,
+        len,
+    )
+}
+
+/// **Estimated affine global motion end-to-end** (round-386). The
+/// current frame is the reference warped by a known §15.8.8 zoom field;
+/// `estimate_global_affine_config` must recover a non-trivial matrix
+/// from the ME grid, and feeding the estimate into the encoder must
+/// (a) stay bit-exact through our decoder at `qindex = 0` (the encoder
+/// mirrors the §15.8.8 field into its own OBMC prediction), and
+/// (b) spend fewer bytes than the pure block-motion encode — the whole
+/// point of the model: the per-block MV residuals leave the wire.
+#[test]
+fn estimated_affine_zoom_roundtrips_bit_exact_and_saves_bytes() {
+    use oxideav_dirac::encoder_inter::estimate_global_affine_config;
+
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let y0 = smooth_texture(64, 64, 0x1357_9bdf);
+    // Uniform zoom-out: v = x/16 − 3 per axis (a = 16 at ez = 8).
+    let g_true = GlobalParams {
+        pan_tilt: (-3, -3),
+        zrs: [[16, 0], [0, 16]],
+        zrs_exp: 8,
+        perspective: (0, 0),
+        persp_exp: 0,
+    };
+    let y1 = warp_by_global_field(&y0, 64, 64, &g_true);
+    let u = vec![128u8; 32 * 32];
+    let v = vec![128u8; 32 * 32];
+
+    let base = InterEncoderParams {
+        mv_precision: 0,
+        ..InterEncoderParams::default()
+    };
+    let (cfg, fraction) = estimate_global_affine_config(&seq, &base, &y1, &y0);
+    assert!(
+        fraction >= 0.6,
+        "zoom fixture: estimator fraction {fraction} too low"
+    );
+    assert_ne!(
+        cfg.global1.zrs,
+        [[0, 0], [0, 0]],
+        "the zoom must reach the matrix"
+    );
+    let with_global = InterEncoderParams {
+        global_motion: Some(cfg),
+        ..base.clone()
+    };
+
+    let intra = InterInputPicture {
+        picture_number: 0,
+        y: &y0,
+        u: &u,
+        v: &v,
+    };
+    let inter = InterInputPicture {
+        picture_number: 1,
+        y: &y1,
+        u: &u,
+        v: &v,
+    };
+
+    let (bx, bu, bv, len_block) = roundtrip_report(&seq, &base, &intra, &inter);
+    let (gx, gu, gv, len_global) = roundtrip_report(&seq, &with_global, &intra, &inter);
+    eprintln!(
+        "estimated affine zoom: fraction {fraction:.3}, block-motion {len_block} B, \
+         global {len_global} B"
+    );
+    assert!(bx && bu && bv, "block-motion roundtrip must be bit-exact");
+    assert!(
+        gx && gu && gv,
+        "estimated-affine roundtrip must be bit-exact at qindex 0"
+    );
+    assert!(
+        len_global < len_block,
+        "estimated affine model must shed MV-residual bytes: \
+         {len_global} B (global) vs {len_block} B (block motion)"
+    );
+}
+
+/// **Estimated perspective global motion end-to-end** (round-386).
+/// Same shape as the affine test on a strong perspective warp at
+/// 96×96: the estimator must detect a non-zero perspective vector,
+/// stay bit-exact through our decoder, and beat block motion on bytes.
+#[test]
+fn estimated_perspective_warp_roundtrips_bit_exact_and_saves_bytes() {
+    use oxideav_dirac::encoder_inter::estimate_global_perspective_config;
+
+    let seq = make_minimal_sequence(96, 96, ChromaFormat::Yuv420);
+    let y0 = smooth_texture(96, 96, 0x0246_8ace);
+    let g_true = GlobalParams {
+        pan_tilt: (4, 2),
+        zrs: [[24, 0], [0, 24]],
+        zrs_exp: 8,
+        perspective: (8, 4),
+        persp_exp: 12,
+    };
+    let y1 = warp_by_global_field(&y0, 96, 96, &g_true);
+    let u = vec![128u8; 48 * 48];
+    let v = vec![128u8; 48 * 48];
+
+    let base = InterEncoderParams {
+        mv_precision: 0,
+        ..InterEncoderParams::default()
+    };
+    let (cfg, fraction) = estimate_global_perspective_config(&seq, &base, &y1, &y0);
+    assert!(
+        fraction >= 0.5,
+        "perspective fixture: estimator fraction {fraction} too low"
+    );
+    assert_ne!(
+        cfg.global1.perspective,
+        (0, 0),
+        "the perspective component must be detected"
+    );
+    let with_global = InterEncoderParams {
+        global_motion: Some(cfg),
+        ..base.clone()
+    };
+
+    let intra = InterInputPicture {
+        picture_number: 0,
+        y: &y0,
+        u: &u,
+        v: &v,
+    };
+    let inter = InterInputPicture {
+        picture_number: 1,
+        y: &y1,
+        u: &u,
+        v: &v,
+    };
+
+    let (bx, bu, bv, len_block) = roundtrip_report(&seq, &base, &intra, &inter);
+    let (gx, gu, gv, len_global) = roundtrip_report(&seq, &with_global, &intra, &inter);
+    eprintln!(
+        "estimated perspective warp: fraction {fraction:.3}, block-motion {len_block} B, \
+         global {len_global} B"
+    );
+    assert!(bx && bu && bv, "block-motion roundtrip must be bit-exact");
+    assert!(
+        gx && gu && gv,
+        "estimated-perspective roundtrip must be bit-exact at qindex 0"
+    );
+    assert!(
+        len_global < len_block,
+        "estimated perspective model must shed MV-residual bytes: \
+         {len_global} B (global) vs {len_block} B (block motion)"
+    );
+}
