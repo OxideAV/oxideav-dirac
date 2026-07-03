@@ -638,3 +638,230 @@ fn sequence_driver_threads_global_motion() {
         }
     }
 }
+
+/// **Round-386: per-picture automatic global-motion estimation in the
+/// sequence driver.** With `auto_global_motion` set (affine model, 0.5
+/// threshold) on the camera-pan fixture, every inter picture must:
+/// signal `using_global` on the wire, carry the measured fraction +
+/// applied flag in its report entry, and the whole chain must still
+/// decode to one frame per input with rate control intact.
+#[test]
+fn sequence_driver_auto_global_estimates_per_picture() {
+    use oxideav_dirac::encoder_inter::{AutoGlobalMotion, GlobalMotionModel};
+
+    let (seq, frames) = fixture();
+    let inputs = input_pictures(&frames);
+    let intra_params = EncoderParams::default_hq(WaveletFilter::LeGall5_3, 3);
+    let inter_params = InterEncoderParams {
+        mv_precision: 0,
+        residue: Some(ResidueParams::default_for(WaveletFilter::LeGall5_3, 3)),
+        auto_global_motion: Some(AutoGlobalMotion {
+            model: GlobalMotionModel::Affine,
+            min_fraction: 0.5,
+        }),
+        ..InterEncoderParams::default()
+    };
+
+    let target = 900u32;
+    let (stream, report) = encode_inter_sequence_with_residue_target_report(
+        &seq,
+        &intra_params,
+        &inter_params,
+        &inputs,
+        target,
+        InterRateControl::PerPicture,
+    );
+
+    // Telemetry: the estimate ran on every picture; the whole-frame pan
+    // fixture must clear the 0.5 threshold on each.
+    assert_eq!(report.len(), 3);
+    for e in &report {
+        let f = e
+            .global_fraction
+            .expect("auto estimation must run on every picture");
+        assert!(
+            f >= 0.5,
+            "pic {}: pan fixture fraction {f} below threshold",
+            e.picture_number
+        );
+        assert!(
+            e.global_applied,
+            "pic {}: estimate not applied",
+            e.picture_number
+        );
+    }
+
+    // Wire: every 0x09 picture signals using_global.
+    use oxideav_dirac::bits::BitReader;
+    use oxideav_dirac::parse_info::ParseInfo;
+    use oxideav_dirac::picture_inter::parse_picture_prediction_parameters;
+    let mut pos = 0usize;
+    let mut inter_units = 0usize;
+    while let Some(pi) = ParseInfo::parse(&stream, pos) {
+        if pi.parse_code == 0x09 {
+            let payload = &stream[pos + 13..pos + pi.next_parse_offset as usize];
+            let mut r = BitReader::new(payload);
+            r.byte_align();
+            let _pic_num = r.read_uint_lit(4);
+            let _d1 = r.read_sint();
+            r.byte_align();
+            let pred = parse_picture_prediction_parameters(&mut r, &seq, 1).expect("PPP");
+            assert!(
+                pred.using_global,
+                "auto-applied picture must signal using_global"
+            );
+            assert!(pred.global1.is_some(), "global1 must be on the wire");
+            inter_units += 1;
+        }
+        if pi.next_parse_offset == 0 {
+            break;
+        }
+        pos += pi.next_parse_offset as usize;
+        if pos >= stream.len() {
+            break;
+        }
+    }
+    assert_eq!(inter_units, 3, "three 0x09 pictures in the chain");
+
+    // The stream still decodes to one frame per input picture.
+    assert_eq!(decode_frame_count(stream), inputs.len());
+
+    // Rate control still functions: every satisfiable request fits.
+    for e in &report {
+        assert_eq!(e.requested_residue_bytes, target);
+        if e.qindex < 127 {
+            assert!(e.actual_residue_bytes <= e.requested_residue_bytes);
+        }
+    }
+}
+
+/// **Round-386: telemetry-only auto-global run.** With a threshold
+/// above 1.0 the estimate can never be applied: the report still
+/// carries the measured fraction per picture, but no picture signals
+/// `using_global` and the emitted stream is byte-identical to a run
+/// with auto estimation off — the estimator must be observation-only
+/// below threshold.
+#[test]
+fn sequence_driver_auto_global_telemetry_only_leaves_stream_untouched() {
+    use oxideav_dirac::encoder_inter::{AutoGlobalMotion, GlobalMotionModel};
+
+    let (seq, frames) = fixture();
+    let inputs = input_pictures(&frames);
+    let intra_params = EncoderParams::default_hq(WaveletFilter::LeGall5_3, 3);
+    let base = InterEncoderParams {
+        mv_precision: 0,
+        residue: Some(ResidueParams::default_for(WaveletFilter::LeGall5_3, 3)),
+        ..InterEncoderParams::default()
+    };
+    let telemetry = InterEncoderParams {
+        auto_global_motion: Some(AutoGlobalMotion {
+            model: GlobalMotionModel::Affine,
+            min_fraction: 1.01,
+        }),
+        ..base.clone()
+    };
+
+    let target = 900u32;
+    let (stream_base, report_base) = encode_inter_sequence_with_residue_target_report(
+        &seq,
+        &intra_params,
+        &base,
+        &inputs,
+        target,
+        InterRateControl::Cbr,
+    );
+    let (stream_tel, report_tel) = encode_inter_sequence_with_residue_target_report(
+        &seq,
+        &intra_params,
+        &telemetry,
+        &inputs,
+        target,
+        InterRateControl::Cbr,
+    );
+
+    assert_eq!(
+        stream_base, stream_tel,
+        "telemetry-only auto-global must not change a single byte"
+    );
+    for (b, t) in report_base.iter().zip(report_tel.iter()) {
+        assert!(b.global_fraction.is_none(), "auto off ⇒ no fraction");
+        assert!(!b.global_applied);
+        assert!(
+            t.global_fraction.is_some(),
+            "telemetry run must still measure the fraction"
+        );
+        assert!(!t.global_applied, "1.01 threshold can never be met");
+        assert_eq!(b.qindex, t.qindex, "rate decisions must be identical");
+        assert_eq!(b.actual_residue_bytes, t.actual_residue_bytes);
+    }
+}
+
+/// **Round-386: explicit config wins over auto.** When both
+/// `global_motion` and `auto_global_motion` are set, the caller's
+/// explicit model reaches the wire unchanged and the report shows the
+/// estimator never ran.
+#[test]
+fn sequence_driver_explicit_global_beats_auto() {
+    use oxideav_dirac::encoder_inter::{AutoGlobalMotion, GlobalMotionConfig};
+
+    let (seq, frames) = fixture();
+    let inputs = input_pictures(&frames);
+    let intra_params = EncoderParams::default_hq(WaveletFilter::LeGall5_3, 3);
+    let inter_params = InterEncoderParams {
+        mv_precision: 0,
+        residue: Some(ResidueParams::default_for(WaveletFilter::LeGall5_3, 3)),
+        global_motion: Some(GlobalMotionConfig::pan_tilt_all(-1, -1)),
+        auto_global_motion: Some(AutoGlobalMotion::default()),
+        ..InterEncoderParams::default()
+    };
+
+    let (stream, report) = encode_inter_sequence_with_residue_target_report(
+        &seq,
+        &intra_params,
+        &inter_params,
+        &inputs,
+        900,
+        InterRateControl::PerPicture,
+    );
+
+    for e in &report {
+        assert!(
+            e.global_fraction.is_none(),
+            "explicit config must suppress the estimator"
+        );
+        assert!(!e.global_applied);
+    }
+
+    // The explicit pan_tilt reaches every 0x09 PPP unchanged.
+    use oxideav_dirac::bits::BitReader;
+    use oxideav_dirac::parse_info::ParseInfo;
+    use oxideav_dirac::picture_inter::parse_picture_prediction_parameters;
+    let mut pos = 0usize;
+    let mut inter_units = 0usize;
+    while let Some(pi) = ParseInfo::parse(&stream, pos) {
+        if pi.parse_code == 0x09 {
+            let payload = &stream[pos + 13..pos + pi.next_parse_offset as usize];
+            let mut r = BitReader::new(payload);
+            r.byte_align();
+            let _pic_num = r.read_uint_lit(4);
+            let _d1 = r.read_sint();
+            r.byte_align();
+            let pred = parse_picture_prediction_parameters(&mut r, &seq, 1).expect("PPP");
+            assert!(pred.using_global);
+            assert_eq!(
+                pred.global1.expect("global1").pan_tilt,
+                (-1, -1),
+                "caller's explicit pan_tilt must win over auto"
+            );
+            inter_units += 1;
+        }
+        if pi.next_parse_offset == 0 {
+            break;
+        }
+        pos += pi.next_parse_offset as usize;
+        if pos >= stream.len() {
+            break;
+        }
+    }
+    assert_eq!(inter_units, 3);
+}

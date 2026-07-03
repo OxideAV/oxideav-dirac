@@ -225,6 +225,53 @@ pub struct InterEncoderParams {
     /// `None` (the default) keeps the pre-round-382 behaviour:
     /// `using_global = false`, every block uses block motion.
     pub global_motion: Option<GlobalMotionConfig>,
+    /// **Per-picture automatic global-motion estimation** (round-386).
+    ///
+    /// Consumed by the multi-picture sequence driver
+    /// ([`encode_inter_sequence_with_residue_target`] /
+    /// `_report`): when `Some` and [`global_motion`] is `None`, the
+    /// driver runs [`estimate_global_motion_config`] on **each** inter
+    /// picture against its reference and applies the estimate to that
+    /// picture iff the global fraction clears
+    /// [`AutoGlobalMotion::min_fraction`] — so a camera-motion shot
+    /// sheds its MV residuals while a scene cut or scattered-motion
+    /// picture stays pure block motion, per picture, with no caller
+    /// intervention. The estimate is resolved **before** the residue
+    /// qindex picker runs, so rate control measures exactly the stream
+    /// it will emit. An explicit [`global_motion`] config always wins
+    /// (auto never overrides a caller's model).
+    ///
+    /// `None` (the default) keeps the round-382 behaviour: global
+    /// motion is only ever emitted when the caller supplies a config.
+    ///
+    /// [`global_motion`]: InterEncoderParams::global_motion
+    pub auto_global_motion: Option<AutoGlobalMotion>,
+}
+
+/// Configuration for [`InterEncoderParams::auto_global_motion`]
+/// (round-386).
+#[derive(Debug, Clone, Copy)]
+pub struct AutoGlobalMotion {
+    /// Which §11.2.6 model family to fit per picture.
+    pub model: GlobalMotionModel,
+    /// Minimum share of blocks the fitted field must win (by the
+    /// estimator's SAD decision) for the model to be applied to the
+    /// picture. Below the threshold the picture is emitted with pure
+    /// block motion. `0.0` applies every fit; `> 1.0` never applies
+    /// (useful for A/B telemetry-only runs — the report still carries
+    /// the measured fraction).
+    pub min_fraction: f64,
+}
+
+impl Default for AutoGlobalMotion {
+    /// Affine model at a 0.5 fraction threshold: apply the camera
+    /// model when it wins at least half the blocks.
+    fn default() -> Self {
+        Self {
+            model: GlobalMotionModel::Affine,
+            min_fraction: 0.5,
+        }
+    }
 }
 
 /// §11.2.6 global-motion encoder configuration (round-382).
@@ -1073,6 +1120,10 @@ impl Default for InterEncoderParams {
             // block motion, `using_global = false`. Opt in with a
             // `GlobalMotionConfig`.
             global_motion: None,
+            // Round-386: per-picture automatic estimation off by
+            // default; the sequence driver only fits a model when
+            // asked.
+            auto_global_motion: None,
         }
     }
 }
@@ -5068,6 +5119,18 @@ pub struct InterPictureRate {
     /// [`InterRateControl::PerPicture`] does not) and, for the VBV
     /// variants, whether the savings side is clamped at `-buffer_bytes`.
     pub running_surplus_bytes: i64,
+    /// Global fraction measured by the per-picture
+    /// [`InterEncoderParams::auto_global_motion`] estimate — the share
+    /// of blocks whose fitted §15.8.8 field beat their own block MV.
+    /// `None` when auto estimation did not run for this picture
+    /// (feature off, or an explicit `global_motion` config was set).
+    pub global_fraction: Option<f64>,
+    /// Whether the auto estimate was actually applied to this picture
+    /// (`global_fraction >= min_fraction`). Always `false` when
+    /// [`global_fraction`] is `None`.
+    ///
+    /// [`global_fraction`]: InterPictureRate::global_fraction
+    pub global_applied: bool,
 }
 
 /// Encode a multi-picture core-syntax inter sequence (one HQ intra
@@ -5223,13 +5286,38 @@ pub fn encode_inter_sequence_with_residue_target_report(
             }
         };
 
+        // Round-386: per-picture automatic global-motion estimation.
+        // Resolved BEFORE the residue qindex picker so rate control
+        // measures exactly the stream it will emit (a global picture's
+        // prediction — and therefore its residue — differs from the
+        // block-motion one). An explicit caller config always wins.
+        let mut pic_params = inter_params.clone();
+        let mut global_fraction: Option<f64> = None;
+        let mut global_applied = false;
+        if pic_params.global_motion.is_none() {
+            if let Some(auto) = &inter_params.auto_global_motion {
+                let (cfg, fraction) = estimate_global_motion_config(
+                    sequence,
+                    inter_params,
+                    pic.y,
+                    reference.y,
+                    auto.model,
+                );
+                global_fraction = Some(fraction);
+                if fraction >= auto.min_fraction {
+                    pic_params.global_motion = Some(cfg);
+                    global_applied = true;
+                }
+            }
+        }
+
         // Pick the residue qindex for this picture against the budget,
         // and measure what it actually costs. With residue disabled the
         // diagnostic returns `(0, 0)` and the picture is emitted
         // ZERO_RESIDUAL=true.
         let (qindex, actual_residue) = inter_residue_qindex_diagnostic(
             sequence,
-            inter_params,
+            &pic_params,
             pic.y,
             pic.u,
             pic.v,
@@ -5240,7 +5328,6 @@ pub fn encode_inter_sequence_with_residue_target_report(
         );
 
         // Emit the inter picture with the chosen residue qindex applied.
-        let mut pic_params = inter_params.clone();
         if let Some(ref rp) = inter_params.residue {
             let mut rp = rp.clone();
             rp.qindex = qindex;
@@ -5292,6 +5379,8 @@ pub fn encode_inter_sequence_with_residue_target_report(
             actual_residue_bytes: actual_residue as u32,
             qindex,
             running_surplus_bytes: carry,
+            global_fraction,
+            global_applied,
         });
     }
 
