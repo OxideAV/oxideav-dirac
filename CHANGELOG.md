@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **§14 fragment emitter** (round-386) — the encode-side inverse of
+  round-248's `FragmentedPictureDecoder`.
+  - `fragment::fragment_picture_payload` splits any conformant
+    non-fragmented LD/HQ picture payload into a `[setup][data…]` §14
+    fragment sequence, at most `max_slices_per_fragment` raster-order
+    slices per data fragment, each stamped with the §14.2 offsets of
+    its first slice. Slice boundaries are recovered from the payload
+    itself (§13.5.4 HQ length-byte walk / §13.5.3.2 LD closed-form
+    widths) via the production transform-parameters parser, so
+    third-party payloads fragment too. Typed `FragmentEmitError`
+    surface (non-picture parse code, zero chunk, mid-slice truncation,
+    16-bit §14.2 field overflow).
+  - `fragment::encode_single_{hq,ld}_intra_fragmented_stream` —
+    complete v3 elementary streams (version-3 sequence header,
+    `0xEC`/`0xCC` fragment chain with §10.5.1 offsets, EOS), the
+    fragmented counterparts of the single-picture intra drivers.
+  - Oracle: the crate's own proven decode path — bit-exact reassembly
+    across chunk sizes 1 / ragged / one-row / all-slices, both
+    profiles (LD exercising the §14.5 trailing DC kick), raster
+    offsets pinned per row, full error surface.
 - **§11.2.6 global-motion model estimation** (round-386) — the
   affine / perspective generalisation of round-382's pan estimator;
   all encoder policy on the proven §11.2.6/§15.8.8 emission path.
