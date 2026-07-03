@@ -559,7 +559,7 @@ pub fn estimate_global_bipred_config(
 ) -> (GlobalMotionConfig, f64) {
     let (_sbx, _sby, blocks_x, blocks_y) = motion_grid(sequence.luma_width, sequence.luma_height);
     let bmp = params.bipred_mv_precision;
-    let mut per_ref = |ref_y: &[u8]| -> (GlobalParams, Vec<bool>) {
+    let per_ref = |ref_y: &[u8]| -> (GlobalParams, Vec<bool>) {
         let mvs = subpel_search_me(
             cur_y,
             ref_y,

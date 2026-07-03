@@ -685,3 +685,171 @@ fn global_motion_parameter_sweep_never_panics() {
     }
     assert_eq!(count, 120, "sweep should cover 5 × 4 × 2 × 3 combinations");
 }
+
+// -------------------------------------------------------------------
+// Round-386: global-model estimator sweep
+// -------------------------------------------------------------------
+
+/// xorshift32 step, shared by the estimator-sweep fixtures below.
+fn xs32(state: &mut u32) -> u32 {
+    *state ^= *state << 13;
+    *state ^= *state >> 17;
+    *state ^= *state << 5;
+    *state
+}
+
+/// Smooth trackable 64×64 luma texture (coarse random grid, bilinear
+/// upsample) for the estimator sweep.
+fn smooth_luma_64(seed: u32) -> Vec<u8> {
+    let (w, h, cell) = (64usize, 64usize, 8usize);
+    let gw = w / cell + 2;
+    let gh = h / cell + 2;
+    let mut state = seed | 1;
+    let mut grid = vec![0f64; gw * gh];
+    for g in grid.iter_mut() {
+        *g = 40.0 + (xs32(&mut state) % 160) as f64;
+    }
+    let mut out = vec![0u8; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let (gx, gy) = (x / cell, y / cell);
+            let fx = (x % cell) as f64 / cell as f64;
+            let fy = (y % cell) as f64 / cell as f64;
+            let v = grid[gy * gw + gx] * (1.0 - fx) * (1.0 - fy)
+                + grid[gy * gw + gx + 1] * fx * (1.0 - fy)
+                + grid[(gy + 1) * gw + gx] * (1.0 - fx) * fy
+                + grid[(gy + 1) * gw + gx + 1] * fx * fy;
+            out[y * w + x] = v.round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    out
+}
+
+/// **Estimator fuzz sweep** (round-386). 48 seeded random affine (and
+/// perspective) camera warps — zoom / rotation / shear entries in
+/// ±40/256 per pel, pan in ±6, perspective in ±6/2^12 on half the
+/// cases — applied to a smooth texture with the decoder's own §15.8.8
+/// arithmetic. For each case the sweep runs
+/// `estimate_global_motion_config` with a case-rotating model
+/// (Pan / Affine / Perspective), encodes with the returned config, and
+/// pins the fuzz contract: non-empty stream, clean 2-frame decode, a
+/// sane fraction (`0.0..=1.0`), and encode determinism. Estimation
+/// quality is pinned elsewhere (`encoder_inter_roundtrip.rs`); this
+/// sweep pins that NO fitted model — however skewed the warp or noisy
+/// the ME — can panic the encoder or derail the decoder.
+#[test]
+fn estimated_global_model_random_warp_sweep_never_panics() {
+    use oxideav_dirac::encoder_inter::{estimate_global_motion_config, GlobalMotionModel};
+    use oxideav_dirac::picture_inter::GlobalParams;
+
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let ip = intra_params();
+    let models = [
+        GlobalMotionModel::Pan,
+        GlobalMotionModel::Affine,
+        GlobalMotionModel::Perspective,
+    ];
+
+    let mut state = 0x386_2026u32;
+    for case in 0..48u32 {
+        let model = models[(case % 3) as usize];
+        let seed = xs32(&mut state);
+        let y0 = smooth_luma_64(seed);
+
+        // Random true warp, kept inside the default ±16 search range
+        // over a 64-pel frame: matrix entries ±40/256 (≤ 10-pel corner
+        // displacement), pan ±6, perspective ±6/2^12 on odd cases.
+        let r = |state: &mut u32, span: i32| -> i32 {
+            (xs32(state) % (2 * span as u32 + 1)) as i32 - span
+        };
+        let with_persp = case % 2 == 1;
+        let g_true = GlobalParams {
+            pan_tilt: (r(&mut state, 6), r(&mut state, 6)),
+            zrs: [
+                [r(&mut state, 40), r(&mut state, 12)],
+                [r(&mut state, 12), r(&mut state, 40)],
+            ],
+            zrs_exp: 8,
+            perspective: if with_persp {
+                (r(&mut state, 6), r(&mut state, 6))
+            } else {
+                (0, 0)
+            },
+            persp_exp: if with_persp { 12 } else { 0 },
+        };
+        let mut y1 = vec![0u8; 64 * 64];
+        for y in 0..64usize {
+            for x in 0..64usize {
+                let (dx, dy) = oxideav_dirac::obmc::global_mv(&g_true, x as i32, y as i32);
+                let sx = (x as i32 + dx).clamp(0, 63) as usize;
+                let sy = (y as i32 + dy).clamp(0, 63) as usize;
+                y1[y * 64 + x] = y0[sy * 64 + sx];
+            }
+        }
+
+        let mvp = (case % 4).min(3);
+        let base = InterEncoderParams {
+            mv_precision: mvp,
+            ..InterEncoderParams::default()
+        };
+        let (cfg, fraction) = estimate_global_motion_config(&seq, &base, &y1, &y0, model);
+        assert!(
+            (0.0..=1.0).contains(&fraction),
+            "case {case}: fraction {fraction} out of range"
+        );
+        let params = InterEncoderParams {
+            global_motion: Some(cfg),
+            ..base
+        };
+
+        let chroma = vec![128u8; 32 * 32];
+        let intra_t = (y0, chroma.clone(), chroma.clone());
+        let inter_t = (y1, chroma.clone(), chroma);
+        let (intra, inter) = pair_inputs(&intra_t, &inter_t);
+        let label = format!("estimator sweep case {case} ({model:?}, mvp {mvp}, seed {seed:#x})");
+        let stream = encode_intra_then_inter_stream(&seq, &ip, &params, &intra, &inter);
+        assert_decodes_to(&stream, 2, &label);
+        let stream2 = encode_intra_then_inter_stream(&seq, &ip, &params, &intra, &inter);
+        assert_eq!(stream, stream2, "{label}: encode must be deterministic");
+    }
+}
+
+/// **Estimator degeneracy sweep** (round-386). Zero-energy (solid) and
+/// single-pulse inputs give the LS normal equations nothing to grip:
+/// the affine / perspective estimators must fall back cleanly (pan fit
+/// or zero model), never panic or divide by zero, and the resulting
+/// config must still encode + decode.
+#[test]
+fn estimated_global_model_degenerate_inputs_never_panic() {
+    use oxideav_dirac::encoder_inter::{estimate_global_motion_config, GlobalMotionModel};
+
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let ip = intra_params();
+    let fixtures = [
+        ("solid-0", solid_64(0), solid_64(0)),
+        ("solid-255", solid_64(255), solid_64(255)),
+        ("solid-vs-pulse", solid_64(128), pulse_64(31, 17)),
+        ("pulse-vs-solid", pulse_64(31, 17), solid_64(128)),
+    ];
+    for model in [
+        GlobalMotionModel::Pan,
+        GlobalMotionModel::Affine,
+        GlobalMotionModel::Perspective,
+    ] {
+        for (name, f0, f1) in &fixtures {
+            let base = InterEncoderParams::default();
+            let (cfg, fraction) = estimate_global_motion_config(&seq, &base, &f1.0, &f0.0, model);
+            assert!(
+                (0.0..=1.0).contains(&fraction),
+                "{name} ({model:?}): fraction {fraction} out of range"
+            );
+            let params = InterEncoderParams {
+                global_motion: Some(cfg),
+                ..base
+            };
+            let (intra, inter) = pair_inputs(f0, f1);
+            let stream = encode_intra_then_inter_stream(&seq, &ip, &params, &intra, &inter);
+            assert_decodes_to(&stream, 2, &format!("degenerate {name} ({model:?})"));
+        }
+    }
+}
