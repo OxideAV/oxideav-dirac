@@ -335,6 +335,613 @@ pub fn estimate_global_pan_config(
     )
 }
 
+/// Model family for [`estimate_global_motion_config`] (round-386).
+///
+/// §11.2.6 parameterises the per-reference global field as the full
+/// affine-perspective triple `pan_tilt` / `zoom_rotate_shear` /
+/// `perspective`; which subset an encoder *fits* is pure encoder
+/// policy. Each variant fits a strictly richer model:
+///
+/// * [`Pan`] — constant translation (the round-382
+///   [`estimate_global_pan_config`] median fit; blocks are global only
+///   on an exact MV match, so the choice is provably neutral on the
+///   prediction).
+/// * [`Affine`] — 6-parameter least-squares fit `v(x) ≈ A·x + b` of
+///   the ME grid (zoom / rotation / shear + translation), robust to
+///   outlier blocks via one trimmed refit.
+/// * [`Perspective`] — the affine fit plus a linearised 2-parameter
+///   perspective correction `v(x) ≈ (A·x + b)·(1 − c·x / 2^ep)`.
+///
+/// [`Pan`]: GlobalMotionModel::Pan
+/// [`Affine`]: GlobalMotionModel::Affine
+/// [`Perspective`]: GlobalMotionModel::Perspective
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GlobalMotionModel {
+    /// Constant-translation fit (median ME MV).
+    Pan,
+    /// 6-parameter affine fit (`pan_tilt` + `zoom_rotate_shear`).
+    Affine,
+    /// 8-parameter affine + perspective fit (adds the §15.8.8 `c`
+    /// vector via a linearised least-squares pass on the affine
+    /// residuals).
+    Perspective,
+}
+
+/// **Estimate a §11.2.6 global-motion model from the encoder's own ME
+/// grid** (round-386) — the affine / perspective generalisation of
+/// [`estimate_global_pan_config`].
+///
+/// Runs the same motion search [`encode_inter_picture`] will commit to
+/// the wire ([`inter_mv_grid`]), fits the requested [`GlobalMotionModel`]
+/// to the per-block MVs by least squares (with one trimmed refit so a
+/// minority of foreground blocks cannot drag the camera model), and
+/// quantises the fit onto the exact integer parameterisation the
+/// §15.8.8 `global_mv` field arithmetic consumes:
+///
+/// * `zrs_exp` is the smallest exponent that keeps the matrix
+///   quantisation error under ~1/8 MV unit at the far frame corner
+///   (`2^ez ≥ 4·max(width, height)`), so the emitted field tracks the
+///   real-valued fit across the whole picture;
+/// * `pan_tilt` is refined **after** matrix quantisation by a small
+///   direct search over the integer candidates around the fitted
+///   translation, scored against the actual (floor-rounded) `global_mv`
+///   output — this absorbs the `+ (1, 1)` rounding bias and the
+///   floor-direction interaction with the matrix term exactly rather
+///   than approximately;
+/// * a fitted matrix that quantises to zero collapses to the pan
+///   parameterisation (`zrs_exp = 0`), and a perspective vector that
+///   quantises to zero (or would drive the §15.8.8 denominator
+///   `m = 2^ep − c·x` non-positive anywhere on the frame) collapses to
+///   the affine parameterisation.
+///
+/// Per-block global flags are then chosen by **measured SAD**: each
+/// block compares the source against the per-pixel `global_mv` field
+/// prediction and against its own block-MV prediction (both sampled
+/// through the same §15.8.10 sub-pel path the decoder uses), and is
+/// marked global iff the field predicts at least as well — a tie goes
+/// to global because a global block carries no MV residual on the wire.
+/// Unlike the pan estimator's exact-match rule this is *not* prediction
+/// neutral: a global block's prediction follows the spatially-varying
+/// field (usually the point — on zoom/rotation content the field
+/// interpolates motion *within* blocks, beating any constant block MV).
+/// The self-roundtrip stays bit-exact at `qindex = 0` regardless,
+/// because the encoder builds its OBMC prediction and residue from the
+/// same effective parameters the decoder reads back.
+///
+/// Returns the config plus the global fraction (share of blocks marked
+/// global, `0.0..=1.0`). The caller applies the worthiness threshold —
+/// on whole-frame camera motion the fraction approaches 1 and the
+/// config removes almost every MV residual from the wire; on scattered
+/// motion it approaches 0 and block motion alone is cheaper. A
+/// degenerate ME grid (too few usable blocks for the normal equations)
+/// falls back to the pan fit.
+pub fn estimate_global_motion_config(
+    sequence: &SequenceHeader,
+    params: &InterEncoderParams,
+    cur_y: &[u8],
+    ref_y: &[u8],
+    model: GlobalMotionModel,
+) -> (GlobalMotionConfig, f64) {
+    if model == GlobalMotionModel::Pan {
+        return estimate_global_pan_config(sequence, params, cur_y, ref_y);
+    }
+    let mvs = inter_mv_grid(sequence, params, cur_y, ref_y);
+    let (_sbx, _sby, blocks_x, blocks_y) = motion_grid(sequence.luma_width, sequence.luma_height);
+    let global1 = match fit_global_params_from_grid(
+        &mvs,
+        blocks_x,
+        blocks_y,
+        sequence.luma_width,
+        sequence.luma_height,
+        model == GlobalMotionModel::Perspective,
+    ) {
+        Some(g) => g,
+        // Degenerate fit (blank frame / tiny grid): fall back to pan.
+        None => return estimate_global_pan_config(sequence, params, cur_y, ref_y),
+    };
+    let (gmode, fraction) = global_gmode_by_sad(
+        cur_y,
+        ref_y,
+        sequence.luma_width,
+        sequence.luma_height,
+        blocks_x,
+        blocks_y,
+        &mvs,
+        &global1,
+        params.mv_precision,
+    );
+    (
+        GlobalMotionConfig {
+            global1,
+            global2: None,
+            block_gmode: Some(gmode),
+        },
+        fraction,
+    )
+}
+
+/// [`estimate_global_motion_config`] with [`GlobalMotionModel::Affine`].
+pub fn estimate_global_affine_config(
+    sequence: &SequenceHeader,
+    params: &InterEncoderParams,
+    cur_y: &[u8],
+    ref_y: &[u8],
+) -> (GlobalMotionConfig, f64) {
+    estimate_global_motion_config(sequence, params, cur_y, ref_y, GlobalMotionModel::Affine)
+}
+
+/// [`estimate_global_motion_config`] with
+/// [`GlobalMotionModel::Perspective`].
+pub fn estimate_global_perspective_config(
+    sequence: &SequenceHeader,
+    params: &InterEncoderParams,
+    cur_y: &[u8],
+    ref_y: &[u8],
+) -> (GlobalMotionConfig, f64) {
+    estimate_global_motion_config(
+        sequence,
+        params,
+        cur_y,
+        ref_y,
+        GlobalMotionModel::Perspective,
+    )
+}
+
+/// Real-valued global-model fit, before quantisation onto the §11.2.6
+/// integer parameterisation. `a` / `b` are the affine matrix and
+/// translation of `v(x) ≈ A·x + b` in MV units; `c` is the perspective
+/// vector of the multiplicative correction `(1 − c·x)` in **per-pixel**
+/// units (the `2^persp_exp` scaling is absorbed, i.e. this is
+/// `c_int / 2^ep`).
+#[derive(Debug, Clone, Copy, Default)]
+struct GlobalFit {
+    a: [[f64; 2]; 2],
+    b: [f64; 2],
+    c: [f64; 2],
+}
+
+impl GlobalFit {
+    /// Evaluate the real-valued field at pixel `(x, y)`.
+    fn eval(&self, x: f64, y: f64) -> (f64, f64) {
+        let m = 1.0 - (self.c[0] * x + self.c[1] * y);
+        (
+            (self.a[0][0] * x + self.a[0][1] * y + self.b[0]) * m,
+            (self.a[1][0] * x + self.a[1][1] * y + self.b[1]) * m,
+        )
+    }
+}
+
+/// The centre of block `(bx, by)`'s ME window (preset 1: the 8×8 SAD
+/// window at a 4-pel stride, top-left `(4·bx, 4·by)`), as the integer
+/// pixel used to anchor the fit and to score integer `global_mv`
+/// candidates against the block's MV.
+#[inline]
+fn block_anchor(bx: u32, by: u32) -> (i32, i32) {
+    ((4 * bx + 3) as i32, (4 * by + 3) as i32)
+}
+
+/// Fit `v(x) ≈ A·x + b` (optionally `· (1 − c·x)`) to the ME grid by
+/// least squares with one trimmed refit, then quantise onto
+/// [`GlobalParams`]. `None` when the normal equations are degenerate
+/// (fewer than 8 blocks, or a rank-deficient design — e.g. a 1-block-
+/// wide grid).
+fn fit_global_params_from_grid(
+    mvs: &[IntegerMv],
+    blocks_x: u32,
+    blocks_y: u32,
+    luma_w: u32,
+    luma_h: u32,
+    with_perspective: bool,
+) -> Option<GlobalParams> {
+    let n = (blocks_x * blocks_y) as usize;
+    debug_assert_eq!(mvs.len(), n);
+    if n < 8 {
+        return None;
+    }
+    let pts: Vec<(f64, f64)> = (0..blocks_y)
+        .flat_map(|by| {
+            (0..blocks_x).map(move |bx| {
+                let (ax, ay) = block_anchor(bx, by);
+                (ax as f64, ay as f64)
+            })
+        })
+        .collect();
+    let vx: Vec<f64> = mvs.iter().map(|m| m.0 as f64).collect();
+    let vy: Vec<f64> = mvs.iter().map(|m| m.1 as f64).collect();
+
+    // Pass 1: fit on every block.
+    let all: Vec<usize> = (0..n).collect();
+    let mut fit = affine_lsq(&pts, &vx, &vy, &all)?;
+
+    // Trimmed refit: drop blocks whose residual exceeds
+    // max(1 MV unit, 2 × median residual) — foreground objects and
+    // frame-edge blocks (whose true content left the picture) must not
+    // drag the camera model. Refit only when enough inliers survive to
+    // keep the normal equations honest.
+    let mut resid: Vec<f64> = (0..n)
+        .map(|i| {
+            let (px, py) = fit.eval(pts[i].0, pts[i].1);
+            (vx[i] - px).abs().max((vy[i] - py).abs())
+        })
+        .collect();
+    let mut sorted = resid.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let med = sorted[n / 2];
+    let thresh = (2.0 * med).max(1.0);
+    let inliers: Vec<usize> = (0..n).filter(|&i| resid[i] <= thresh).collect();
+    if inliers.len() >= 8 {
+        if let Some(refit) = affine_lsq(&pts, &vx, &vy, &inliers) {
+            fit = refit;
+            resid = (0..n)
+                .map(|i| {
+                    let (px, py) = fit.eval(pts[i].0, pts[i].1);
+                    (vx[i] - px).abs().max((vy[i] - py).abs())
+                })
+                .collect();
+        }
+    }
+    let inliers: Vec<usize> = (0..n)
+        .filter(|&i| resid[i] <= (2.0 * med).max(1.0))
+        .collect();
+    let score_set: &[usize] = if inliers.len() >= 8 { &inliers } else { &all };
+
+    // Optional perspective correction by alternating least squares:
+    // fit c with the affine part frozen (linear in c), then refit the
+    // affine part on the de-perspectived targets v/(1 − c·x) — the
+    // plain affine fit absorbs the *average* perspective shrinkage
+    // into its matrix, so without the refit the two terms would
+    // double-count it. Two rounds converge on the smooth fields this
+    // models. The quantiser rejects a c that would make the §15.8.8
+    // denominator m = 2^ep − c·x non-positive anywhere on the frame.
+    if with_perspective {
+        for _ in 0..2 {
+            let c = perspective_lsq(&fit, &pts, &vx, &vy, score_set);
+            let denom_floor = 0.25f64;
+            let mut vxc = vx.to_vec();
+            let mut vyc = vy.to_vec();
+            let mut ok = true;
+            for &i in score_set {
+                let (x, y) = pts[i];
+                let m = 1.0 - (c[0] * x + c[1] * y);
+                if m < denom_floor {
+                    ok = false;
+                    break;
+                }
+                vxc[i] = vx[i] / m;
+                vyc[i] = vy[i] / m;
+            }
+            if !ok {
+                break;
+            }
+            let Some(refit) = affine_lsq(&pts, &vxc, &vyc, score_set) else {
+                break;
+            };
+            fit = GlobalFit {
+                a: refit.a,
+                b: refit.b,
+                c,
+            };
+        }
+    }
+
+    Some(quantise_global_fit(
+        &fit, &pts, &vx, &vy, score_set, luma_w, luma_h,
+    ))
+}
+
+/// Solve the two shared-design 3-unknown least-squares systems
+/// `v ≈ p·x + q·y + r` over the index subset. `None` on a singular
+/// normal matrix.
+fn affine_lsq(pts: &[(f64, f64)], vx: &[f64], vy: &[f64], idx: &[usize]) -> Option<GlobalFit> {
+    let mut s = [[0.0f64; 3]; 3];
+    let mut rx = [0.0f64; 3];
+    let mut ry = [0.0f64; 3];
+    for &i in idx {
+        let (x, y) = pts[i];
+        let row = [x, y, 1.0];
+        for (j, &rj) in row.iter().enumerate() {
+            for (k, &rk) in row.iter().enumerate() {
+                s[j][k] += rj * rk;
+            }
+            rx[j] += rj * vx[i];
+            ry[j] += rj * vy[i];
+        }
+    }
+    let sol_x = solve3(s, rx)?;
+    let sol_y = solve3(s, ry)?;
+    Some(GlobalFit {
+        a: [[sol_x[0], sol_x[1]], [sol_y[0], sol_y[1]]],
+        b: [sol_x[2], sol_y[2]],
+        c: [0.0, 0.0],
+    })
+}
+
+/// Gaussian elimination with partial pivoting for a 3×3 system.
+fn solve3(mut m: [[f64; 3]; 3], mut r: [f64; 3]) -> Option<[f64; 3]> {
+    for col in 0..3 {
+        let piv = (col..3).max_by(|&a, &b| {
+            m[a][col]
+                .abs()
+                .partial_cmp(&m[b][col].abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })?;
+        if m[piv][col].abs() < 1e-9 {
+            return None;
+        }
+        m.swap(col, piv);
+        r.swap(col, piv);
+        for row in 0..3 {
+            if row == col {
+                continue;
+            }
+            let f = m[row][col] / m[col][col];
+            for k in col..3 {
+                m[row][k] -= f * m[col][k];
+            }
+            r[row] -= f * r[col];
+        }
+    }
+    Some([r[0] / m[0][0], r[1] / m[1][1], r[2] / m[2][2]])
+}
+
+/// Linearised perspective fit: with the **affine part** of `fit`
+/// frozen, minimise `Σ‖v_i − f(x_i)·(1 − c·x_i)‖²` — linear in `c`.
+/// Returns the solved `c`; `[0, 0]` on a singular system (e.g. a
+/// translation-free field where every `f(x_i)` is ~zero).
+fn perspective_lsq(
+    fit: &GlobalFit,
+    pts: &[(f64, f64)],
+    vx: &[f64],
+    vy: &[f64],
+    idx: &[usize],
+) -> [f64; 2] {
+    let affine = GlobalFit {
+        a: fit.a,
+        b: fit.b,
+        c: [0.0, 0.0],
+    };
+    let mut m00 = 0.0f64;
+    let mut m01 = 0.0f64;
+    let mut m11 = 0.0f64;
+    let mut r0 = 0.0f64;
+    let mut r1 = 0.0f64;
+    for &i in idx {
+        let (x, y) = pts[i];
+        let (fx, fy) = affine.eval(x, y);
+        let g = fx * fx + fy * fy;
+        // Residual of the affine part; the perspective term predicts
+        // v − f = −f·(c·x).
+        let hx = vx[i] - fx;
+        let hy = vy[i] - fy;
+        let h = hx * fx + hy * fy;
+        m00 += g * x * x;
+        m01 += g * x * y;
+        m11 += g * y * y;
+        r0 -= h * x;
+        r1 -= h * y;
+    }
+    let det = m00 * m11 - m01 * m01;
+    if det.abs() < 1e-9 {
+        return [0.0, 0.0];
+    }
+    // Normal equations for v ≈ f·(1 − c·x): with g = ‖f‖² and
+    // h = (v − f)·f they read
+    //   [Σ g·x²  Σ g·x·y] [c0]   [−Σ h·x]
+    //   [Σ g·x·y  Σ g·y²] [c1] = [−Σ h·y]
+    // (h > 0 — the observed field runs LONGER than the affine fit —
+    // pushes c·x negative, i.e. the §15.8.8 m grows past 2^ep there).
+    let c0 = (r0 * m11 - r1 * m01) / det;
+    let c1 = (r1 * m00 - r0 * m01) / det;
+    [c0, c1]
+}
+
+/// Quantise a real-valued [`GlobalFit`] onto the §11.2.6 integer
+/// parameterisation, then refine `pan_tilt` by direct search against
+/// the exact (floor-rounded) §15.8.8 `global_mv` output at the block
+/// anchors.
+fn quantise_global_fit(
+    fit: &GlobalFit,
+    pts: &[(f64, f64)],
+    vx: &[f64],
+    vy: &[f64],
+    idx: &[usize],
+    luma_w: u32,
+    luma_h: u32,
+) -> GlobalParams {
+    let max_dim = luma_w.max(luma_h).max(1);
+    // Smallest exponent with 2^ez ≥ 4·max_dim: the ±0.5 matrix
+    // rounding error then displaces the field by ≤ max_dim/2^ez ≤ 1/8
+    // MV unit at the far corner.
+    let mut ez = 0u32;
+    while (1u64 << ez) < 4 * max_dim as u64 && ez < 24 {
+        ez += 1;
+    }
+    let quant = |v: f64| -> i32 { (v * (1i64 << ez) as f64).round() as i32 };
+    let a = [
+        [quant(fit.a[0][0]), quant(fit.a[0][1])],
+        [quant(fit.a[1][0]), quant(fit.a[1][1])],
+    ];
+    // Matrix quantised away → pan parameterisation. `ez = 0` keeps the
+    // wire cost of the (still explicitly written) zero matrix minimal
+    // and matches `estimate_global_pan_config`.
+    let ez_eff = if a == [[0, 0], [0, 0]] { 0 } else { ez };
+
+    // Perspective: quantise at ep chosen so the ±0.5 rounding error
+    // stays ≪ the denominator, then reject any vector that could zero
+    // or flip the §15.8.8 m = 2^ep − c·x anywhere on the frame
+    // (keeping at least half the dynamic range as margin).
+    let mut persp = (0i32, 0i32);
+    let mut ep = 0u32;
+    if fit.c != [0.0, 0.0] {
+        let mut e = 0u32;
+        while (1u64 << e) < 256 * max_dim as u64 && e < 30 {
+            e += 1;
+        }
+        let c0 = (fit.c[0] * (1i64 << e) as f64).round() as i64;
+        let c1 = (fit.c[1] * (1i64 << e) as f64).round() as i64;
+        let corner = c0.abs() * (luma_w as i64 - 1) + c1.abs() * (luma_h as i64 - 1);
+        if (c0, c1) != (0, 0)
+            && corner * 2 < (1i64 << e)
+            && i32::try_from(c0).is_ok()
+            && i32::try_from(c1).is_ok()
+        {
+            persp = (c0 as i32, c1 as i32);
+            ep = e;
+        }
+    }
+
+    // Local integer refinement, scored on the **exact** (floor-rounded)
+    // §15.8.8 field: Σ|global_mv − mv| at the block anchors. Least
+    // squares through a floor-rounded integer field carries a
+    // systematic bias when a matrix row is axis-aligned (the staircase
+    // boundaries then land on exact multiples and the observable value
+    // range collapses to a couple of levels — e.g. a pure 1/32-per-pel
+    // vertical zoom over a 64-pel frame steps exactly once, and the LS
+    // slope through a single step underestimates by ~25%), so rounding
+    // the LS solution is not enough: search each matrix entry over ±2
+    // quantisation steps and the translation over −2..=+1 around the
+    // fit (the asymmetric window absorbs the `+ (1, 1)` §15.8.8
+    // rounding bias). The horizontal output depends only on matrix
+    // row 0 and `pan_tilt.0`, the vertical only on row 1 and
+    // `pan_tilt.1` (the perspective factor is shared but frozen here),
+    // so the two components refine independently — 100 candidates per
+    // component, each scored on the anchor grid.
+    let base_b = [fit.b[0].round() as i32, fit.b[1].round() as i32];
+    let mut best_a = a;
+    let mut best_b = [base_b[0] - 1, base_b[1] - 1];
+    for comp in 0..2usize {
+        let mut best_err = i64::MAX;
+        for da0 in -2i32..=2 {
+            for da1 in -2i32..=2 {
+                // A zero-collapsed matrix (pan parameterisation) is
+                // not perturbed — the fit said "no matrix", and at
+                // ez_eff = 0 a ±1 entry step is a whole MV unit per
+                // pixel of position.
+                if ez_eff == 0 && (da0 != 0 || da1 != 0) {
+                    continue;
+                }
+                for db in -2i32..=1 {
+                    let mut cand_a = a;
+                    cand_a[comp][0] += da0;
+                    cand_a[comp][1] += da1;
+                    let g = GlobalParams {
+                        pan_tilt: if comp == 0 {
+                            (base_b[0] + db, 0)
+                        } else {
+                            (0, base_b[1] + db)
+                        },
+                        zrs: cand_a,
+                        zrs_exp: ez_eff,
+                        perspective: persp,
+                        persp_exp: ep,
+                    };
+                    let mut err = 0i64;
+                    for &i in idx {
+                        let (x, y) = pts[i];
+                        let f = crate::obmc::global_mv(&g, x as i32, y as i32);
+                        let (fc, vc) = if comp == 0 {
+                            (f.0, vx[i])
+                        } else {
+                            (f.1, vy[i])
+                        };
+                        err += (fc as i64 - vc as i64).abs();
+                    }
+                    if err < best_err {
+                        best_err = err;
+                        best_a[comp] = cand_a[comp];
+                        best_b[comp] = base_b[comp] + db;
+                    }
+                }
+            }
+        }
+    }
+    GlobalParams {
+        pan_tilt: (best_b[0], best_b[1]),
+        zrs: best_a,
+        zrs_exp: ez_eff,
+        perspective: persp,
+        persp_exp: ep,
+    }
+}
+
+/// Per-block global-vs-block-motion decision by measured SAD: a block
+/// is marked global iff the per-pixel §15.8.8 field predicts the
+/// source at least as well as the block's own ME MV (both sampled
+/// through the same §15.8.10 path). Returns the grid plus the global
+/// fraction.
+#[allow(clippy::too_many_arguments)]
+fn global_gmode_by_sad(
+    cur_y: &[u8],
+    ref_y: &[u8],
+    width: u32,
+    height: u32,
+    blocks_x: u32,
+    blocks_y: u32,
+    mvs: &[IntegerMv],
+    global1: &GlobalParams,
+    mv_precision: u32,
+) -> (Vec<bool>, f64) {
+    let w = width as i32;
+    let h = height as i32;
+    let (xblen, yblen) = (8i32, 8i32);
+    let upref = if mv_precision > 0 {
+        Some(build_upref(ref_y, width, height))
+    } else {
+        None
+    };
+    // Integer-pel reference sample with edge clamping (the same
+    // convention as `sad_block`).
+    let sample_int = |px: i32, py: i32| -> i32 {
+        let cx = px.clamp(0, w - 1) as usize;
+        let cy = py.clamp(0, h - 1) as usize;
+        ref_y[cy * w as usize + cx] as i32
+    };
+    let sample = |px: i64, py: i64| -> i32 {
+        match &upref {
+            None => sample_int(px as i32, py as i32),
+            Some((up, up_w, up_h)) => {
+                crate::obmc::subpel_predict(up, *up_w, *up_h, px, py, mv_precision)
+            }
+        }
+    };
+    let g = effective_global_params(global1);
+    let mut gmode = vec![false; (blocks_x * blocks_y) as usize];
+    let mut marked = 0usize;
+    for by in 0..blocks_y {
+        for bx in 0..blocks_x {
+            let bidx = (by * blocks_x + bx) as usize;
+            let x0 = (bx * 4) as i32;
+            let y0 = (by * 4) as i32;
+            let mv = mvs[bidx];
+            let mut sad_block_mv = 0i64;
+            let mut sad_global = 0i64;
+            for dy in 0..yblen {
+                for dx in 0..xblen {
+                    let px = x0 + dx;
+                    let py = y0 + dy;
+                    let s = cur_y
+                        [(py.clamp(0, h - 1) as usize) * w as usize + px.clamp(0, w - 1) as usize]
+                        as i32;
+                    let scaled_x = (px as i64) << mv_precision;
+                    let scaled_y = (py as i64) << mv_precision;
+                    let rb = sample(scaled_x + mv.0 as i64, scaled_y + mv.1 as i64);
+                    let gv = crate::obmc::global_mv(&g, px, py);
+                    let rg = sample(scaled_x + gv.0 as i64, scaled_y + gv.1 as i64);
+                    sad_block_mv += (s - rb).unsigned_abs() as i64;
+                    sad_global += (s - rg).unsigned_abs() as i64;
+                }
+            }
+            // Tie goes to global: a global block carries no MV residual.
+            if sad_global <= sad_block_mv {
+                gmode[bidx] = true;
+                marked += 1;
+            }
+        }
+    }
+    let fraction = marked as f64 / gmode.len().max(1) as f64;
+    (gmode, fraction)
+}
+
 /// Wavelet residue encoder parameters. Mirrors
 /// [`crate::encoder_intra_core::CoreIntraEncoderParams`] but for the
 /// inter-residue path: same `WaveletFilter` and `dwt_depth` knobs, plus
@@ -5392,6 +5999,269 @@ mod tests {
         for (i, &g) in grid.iter().enumerate() {
             assert_eq!((mvs[i].0, mvs[i].1) == t, g, "block {i} gmode consistency");
         }
+    }
+
+    /// Deterministic smooth luma texture for the global-model
+    /// estimation tests: a coarse pseudo-random 8-pel grid bilinearly
+    /// upsampled, so every 8×8 ME window has a unique low-frequency
+    /// signature (trackable under warps) without hard edges that
+    /// alias under sub-pel resampling.
+    fn smooth_texture(w: usize, h: usize, seed: u32) -> Vec<u8> {
+        let cell = 8usize;
+        let gw = w / cell + 2;
+        let gh = h / cell + 2;
+        let mut state = seed | 1;
+        let mut grid = vec![0f64; gw * gh];
+        for g in grid.iter_mut() {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            *g = 40.0 + (state % 160) as f64;
+        }
+        let mut out = vec![0u8; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let gx = x / cell;
+                let gy = y / cell;
+                let fx = (x % cell) as f64 / cell as f64;
+                let fy = (y % cell) as f64 / cell as f64;
+                let v00 = grid[gy * gw + gx];
+                let v01 = grid[gy * gw + gx + 1];
+                let v10 = grid[(gy + 1) * gw + gx];
+                let v11 = grid[(gy + 1) * gw + gx + 1];
+                let v = v00 * (1.0 - fx) * (1.0 - fy)
+                    + v01 * fx * (1.0 - fy)
+                    + v10 * (1.0 - fx) * fy
+                    + v11 * fx * fy;
+                out[y * w + x] = v.round().clamp(0.0, 255.0) as u8;
+            }
+        }
+        out
+    }
+
+    /// Warp `refp` by the integer §15.8.8 field of `g` at
+    /// `mv_precision = 0`: `cur(x) = ref(x + global_mv(g, x))` with
+    /// edge clamping — the decoder's own field arithmetic generates
+    /// the fixture, so the true model is representable exactly.
+    fn warp_by_global_field(refp: &[u8], w: usize, h: usize, g: &GlobalParams) -> Vec<u8> {
+        let mut out = vec![0u8; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let (dx, dy) = crate::obmc::global_mv(g, x as i32, y as i32);
+                let sx = (x as i32 + dx).clamp(0, w as i32 - 1) as usize;
+                let sy = (y as i32 + dy).clamp(0, h as i32 - 1) as usize;
+                out[y * w + x] = refp[sy * w + sx];
+            }
+        }
+        out
+    }
+
+    /// [`affine_lsq`] must recover an exactly-linear MV field, and
+    /// [`quantise_global_fit`] must reproduce it through the integer
+    /// §15.8.8 arithmetic at every block anchor.
+    #[test]
+    fn affine_fit_recovers_exact_linear_field() {
+        let (blocks_x, blocks_y) = (16u32, 16u32);
+        let pts: Vec<(f64, f64)> = (0..blocks_y)
+            .flat_map(|by| {
+                (0..blocks_x).map(move |bx| {
+                    let (ax, ay) = block_anchor(bx, by);
+                    (ax as f64, ay as f64)
+                })
+            })
+            .collect();
+        // Targets are the exact integer §15.8.8 field of a known
+        // anamorphic zoom (a = [[16, 0], [0, −8]] at ez = 8 — the same
+        // exponent the estimator picks for a 64-pel frame), so the fit
+        // has a representable ground truth to reconstruct.
+        let g_true = GlobalParams {
+            pan_tilt: (-3, 1),
+            zrs: [[16, 0], [0, -8]],
+            zrs_exp: 8,
+            perspective: (0, 0),
+            persp_exp: 0,
+        };
+        let mvs: Vec<IntegerMv> = pts
+            .iter()
+            .map(|&(x, y)| {
+                let f = crate::obmc::global_mv(&g_true, x as i32, y as i32);
+                IntegerMv(f.0, f.1)
+            })
+            .collect();
+        let g = fit_global_params_from_grid(&mvs, blocks_x, blocks_y, 64, 64, false)
+            .expect("fit must succeed");
+        assert_ne!(g.zrs, [[0, 0], [0, 0]], "zoom must reach the matrix");
+        assert_eq!(g.perspective, (0, 0), "affine fit leaves c at zero");
+        // The reconstructed integer field must match the ground truth
+        // at ≥ 95% of the anchors (fitting through the floor-rounded
+        // integer targets can leave isolated off-by-ones right at the
+        // rounding boundaries).
+        let mut exact = 0usize;
+        for (i, &(x, y)) in pts.iter().enumerate() {
+            let f = crate::obmc::global_mv(&g, x as i32, y as i32);
+            if f == (mvs[i].0, mvs[i].1) {
+                exact += 1;
+            }
+        }
+        assert!(
+            exact as f64 >= 0.95 * pts.len() as f64,
+            "quantised field matches only {exact}/{} anchors",
+            pts.len()
+        );
+    }
+
+    /// A constant MV grid must collapse the affine estimator to the
+    /// pan parameterisation: zero matrix, `zrs_exp = 0`, and the exact
+    /// constant field.
+    #[test]
+    fn affine_fit_collapses_to_pan_on_constant_grid() {
+        let (blocks_x, blocks_y) = (16u32, 16u32);
+        let mvs = vec![IntegerMv(3, -2); (blocks_x * blocks_y) as usize];
+        let g = fit_global_params_from_grid(&mvs, blocks_x, blocks_y, 64, 64, false)
+            .expect("fit must succeed");
+        assert_eq!(g.zrs, [[0, 0], [0, 0]]);
+        assert_eq!(g.zrs_exp, 0);
+        assert_eq!(g.perspective, (0, 0));
+        for (x, y) in [(0, 0), (31, 17), (63, 63)] {
+            assert_eq!(crate::obmc::global_mv(&g, x, y), (3, -2));
+        }
+    }
+
+    /// The trimmed refit must reject a minority of outlier blocks: a
+    /// constant-pan grid with a 12% foreground of wild MVs still fits
+    /// the exact pan.
+    #[test]
+    fn affine_fit_trims_foreground_outliers() {
+        let (blocks_x, blocks_y) = (16u32, 16u32);
+        let n = (blocks_x * blocks_y) as usize;
+        let mut mvs = vec![IntegerMv(-4, 1); n];
+        // A 5×6 block "foreground object" moving hard the other way.
+        for by in 4..10u32 {
+            for bx in 6..11u32 {
+                mvs[(by * blocks_x + bx) as usize] = IntegerMv(11, -9);
+            }
+        }
+        let g = fit_global_params_from_grid(&mvs, blocks_x, blocks_y, 64, 64, false)
+            .expect("fit must succeed");
+        assert_eq!(g.zrs, [[0, 0], [0, 0]], "outliers must not bend the matrix");
+        for (x, y) in [(0, 0), (63, 63)] {
+            assert_eq!(
+                crate::obmc::global_mv(&g, x, y),
+                (-4, 1),
+                "background pan survives the foreground"
+            );
+        }
+    }
+
+    /// End-to-end [`estimate_global_affine_config`] on a synthetic
+    /// zoom: the current frame is the reference warped by a known
+    /// §15.8.8 zoom field (generated with the decoder's own `global_mv`
+    /// arithmetic), and the estimator must recover a non-trivial matrix
+    /// with a dominant global fraction.
+    #[test]
+    fn estimate_global_affine_recovers_zoom() {
+        let seq = crate::encoder::make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+        let params = InterEncoderParams {
+            mv_precision: 0,
+            ..InterEncoderParams::default()
+        };
+        let y0 = smooth_texture(64, 64, 0x1357_9bdf);
+        // True model: uniform zoom-out — field v = x/16 − 3 per axis
+        // (a = 16 at ez = 8, pan − bias). Max displacement 64/16 = 4
+        // pels, well inside the default ±16 search.
+        let g_true = GlobalParams {
+            pan_tilt: (-3, -3),
+            zrs: [[16, 0], [0, 16]],
+            zrs_exp: 8,
+            perspective: (0, 0),
+            persp_exp: 0,
+        };
+        let y1 = warp_by_global_field(&y0, 64, 64, &g_true);
+        let (cfg, fraction) = estimate_global_affine_config(&seq, &params, &y1, &y0);
+        assert!(
+            fraction >= 0.6,
+            "whole-frame zoom should mark most blocks global, got {fraction}"
+        );
+        assert_ne!(
+            cfg.global1.zrs,
+            [[0, 0], [0, 0]],
+            "the zoom must be captured by the matrix, not flattened to a pan"
+        );
+        // The recovered integer field must agree with the true field
+        // at most anchors (both are floor-rounded integer fields).
+        let mut agree = 0usize;
+        let mut total = 0usize;
+        for by in 0..16u32 {
+            for bx in 0..16u32 {
+                let (x, y) = block_anchor(bx, by);
+                total += 1;
+                if crate::obmc::global_mv(&effective_global_params(&cfg.global1), x, y)
+                    == crate::obmc::global_mv(&g_true, x, y)
+                {
+                    agree += 1;
+                }
+            }
+        }
+        assert!(
+            agree as f64 >= 0.75 * total as f64,
+            "recovered field agrees at only {agree}/{total} anchors"
+        );
+    }
+
+    /// End-to-end [`estimate_global_perspective_config`] on a strong
+    /// synthetic perspective warp: the linearised c-fit must produce a
+    /// non-zero perspective vector that beats the affine-only fit's
+    /// field error at the anchors.
+    #[test]
+    fn estimate_global_perspective_recovers_warp() {
+        let seq = crate::encoder::make_minimal_sequence(96, 96, ChromaFormat::Yuv420);
+        let params = InterEncoderParams {
+            mv_precision: 0,
+            mv_search_range: 16,
+            ..InterEncoderParams::default()
+        };
+        let y0 = smooth_texture(96, 96, 0x0246_8ace);
+        // True model: zoom + strong perspective — m shrinks ~28% at
+        // the far corner, so the field visibly deviates from affine.
+        let g_true = GlobalParams {
+            pan_tilt: (4, 2),
+            zrs: [[24, 0], [0, 24]],
+            zrs_exp: 8,
+            perspective: (8, 4),
+            persp_exp: 12,
+        };
+        let y1 = warp_by_global_field(&y0, 96, 96, &g_true);
+        let (cfg_p, fraction_p) = estimate_global_perspective_config(&seq, &params, &y1, &y0);
+        let (cfg_a, _) = estimate_global_affine_config(&seq, &params, &y1, &y0);
+        assert_ne!(
+            cfg_p.global1.perspective,
+            (0, 0),
+            "the perspective component must be detected"
+        );
+        // Field-error comparison at the anchors: the perspective model
+        // must fit the true field strictly better than affine-only.
+        let ge_p = effective_global_params(&cfg_p.global1);
+        let ge_a = effective_global_params(&cfg_a.global1);
+        let mut err_p = 0i64;
+        let mut err_a = 0i64;
+        for by in 0..24u32 {
+            for bx in 0..24u32 {
+                let (x, y) = block_anchor(bx, by);
+                let t = crate::obmc::global_mv(&g_true, x, y);
+                let p = crate::obmc::global_mv(&ge_p, x, y);
+                let a = crate::obmc::global_mv(&ge_a, x, y);
+                err_p += (p.0 - t.0).abs() as i64 + (p.1 - t.1).abs() as i64;
+                err_a += (a.0 - t.0).abs() as i64 + (a.1 - t.1).abs() as i64;
+            }
+        }
+        assert!(
+            err_p < err_a,
+            "perspective fit (Σ|Δ| = {err_p}) must beat affine-only (Σ|Δ| = {err_a})"
+        );
+        assert!(
+            fraction_p >= 0.5,
+            "perspective warp should mark most blocks global, got {fraction_p}"
+        );
     }
 
     /// [`GlobalMotionConfig::pan_tilt_all`] must produce a
