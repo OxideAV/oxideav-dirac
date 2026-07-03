@@ -251,11 +251,28 @@ impl GlobalMotionConfig {
     /// A whole-picture global model against reference 1 with a pure
     /// pan/tilt translation (`pan_tilt` in `1/(2^mv_precision)` luma-pel
     /// units, matching the block-MV convention). Every block is global.
+    ///
+    /// The §15.8.8 field this emits is the **constant** `(dx + 1,
+    /// dy + 1)` at every pixel — the `+ 1` is the `global_mv` rounding
+    /// bias at `zrs_exp = persp_exp = 0` (same convention as
+    /// [`estimate_global_pan_config`], whose fitted `pan_tilt` is
+    /// `t - (1, 1)` for a target translation `t`).
+    ///
+    /// A **position-independent** field needs the **zero** matrix:
+    /// `global_mv` computes the displacement `v = (A·x + 2^ez·b) · m /
+    /// 2^(ez+ep)` directly, so any non-zero `A` (including the §11.2.6
+    /// omission-default identity) makes the field grow with pixel
+    /// position. Through round-384 this constructor filled in the
+    /// identity matrix, which produced the position-proportional field
+    /// `(x + dx + 1, y + dy + 1)` instead of a pan — self-roundtrips
+    /// stayed bit-exact (the encoder mirrors the decoder either way)
+    /// but the prediction was a stretch, not a translation, so the
+    /// residue swallowed the difference.
     pub fn pan_tilt_all(dx: i32, dy: i32) -> Self {
         Self {
             global1: GlobalParams {
                 pan_tilt: (dx, dy),
-                zrs: [[1, 0], [0, 1]],
+                zrs: [[0, 0], [0, 0]],
                 zrs_exp: 0,
                 perspective: (0, 0),
                 persp_exp: 0,
@@ -5374,6 +5391,46 @@ mod tests {
         // block's differs.
         for (i, &g) in grid.iter().enumerate() {
             assert_eq!((mvs[i].0, mvs[i].1) == t, g, "block {i} gmode consistency");
+        }
+    }
+
+    /// [`GlobalMotionConfig::pan_tilt_all`] must produce a
+    /// **position-independent** §15.8.8 field — the constant
+    /// `(dx + 1, dy + 1)` at every pixel (the `+ 1` is the `global_mv`
+    /// rounding bias at exponent 0). Through round-384 the constructor
+    /// filled in the identity matrix instead of the zero matrix, which
+    /// made the field grow linearly with pixel position — a stretch,
+    /// not a pan. Pins the fixed constructor at the extreme corners of
+    /// a large frame, including through the wire round-trip
+    /// (`write_global_motion_parameters` →
+    /// `parse_global_motion_parameters`).
+    #[test]
+    fn pan_tilt_all_field_is_position_independent() {
+        use crate::obmc::global_mv;
+        for (dx, dy) in [(0, 0), (-1, -1), (7, -3), (-40, 25)] {
+            let cfg = GlobalMotionConfig::pan_tilt_all(dx, dy);
+            assert!(cfg.block_gmode.is_none(), "whole-picture grid");
+            assert!(cfg.global2.is_none());
+            let g = effective_global_params(&cfg.global1);
+            for (x, y) in [(0, 0), (1, 1), (63, 63), (1919, 1079), (4095, 2159)] {
+                assert_eq!(
+                    global_mv(&g, x, y),
+                    (dx + 1, dy + 1),
+                    "pan_tilt_all({dx}, {dy}) field at ({x}, {y})"
+                );
+            }
+            // Wire round-trip preserves the zero matrix (the flag is
+            // written because the zero matrix is NOT the omission
+            // default — the §11.2.6 default is the identity).
+            let mut w = BitWriter::new();
+            write_global_motion_parameters(&mut w, &g);
+            let bytes = w.finish();
+            let mut r = crate::bits::BitReader::new(&bytes);
+            let parsed = crate::picture_inter::parse_global_motion_parameters(&mut r);
+            assert_eq!(parsed.pan_tilt, (dx, dy));
+            assert_eq!(parsed.zrs, [[0, 0], [0, 0]]);
+            assert_eq!(parsed.zrs_exp, 0);
+            assert_eq!(parsed.perspective, (0, 0));
         }
     }
 
