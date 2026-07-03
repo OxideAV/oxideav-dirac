@@ -9,6 +9,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **§11.2.6 global-motion model estimation** (round-386) — the
+  affine / perspective generalisation of round-382's pan estimator;
+  all encoder policy on the proven §11.2.6/§15.8.8 emission path.
+  - `estimate_global_motion_config(.., GlobalMotionModel)` with three
+    model families: `Pan` (the round-382 median fit), `Affine`
+    (6-parameter least squares `v(x) ≈ A·x + b` on the committed ME
+    grid with one trimmed refit against foreground outliers) and
+    `Perspective` (alternating linearised fit of the §15.8.8
+    `v = (1 − 2^−β·cᵀx)(2^−α·A·x + b)` model — c-fit with the affine
+    part frozen, then an affine refit on the de-perspectived targets).
+    Quantisation onto the integer parameterisation picks
+    `2^zrs_exp ≥ 4·max(w, h)`, rejects a perspective vector that could
+    zero the on-frame denominator, and runs a per-component local
+    search (matrix entries ±2 steps, pan −2..+1) scored on the exact
+    floor-rounded `global_mv` output — plain LS rounding systematically
+    underestimates axis-aligned staircase slopes. Per-block gmode is
+    decided by measured SAD (field vs own block MV through the same
+    §15.8.10 sampling), tie to global. Measured on a whole-frame zoom:
+    fraction 1.0, bit-exact self-roundtrip at `qindex = 0`, stream
+    3569 → 2477 bytes (−31%) vs block motion.
+  - `estimate_global_bipred_config` — two models per B-picture (one
+    per reference, independent ME grids at `bipred_mv_precision`) with
+    a conservative AND-rule gmode grid: a block goes global only when
+    the field beats its ME MV against **both** references.
+  - `InterEncoderParams::auto_global_motion: Option<AutoGlobalMotion>`
+    (default `None`) — the sequence driver estimates a model per
+    picture and applies it iff the fraction clears `min_fraction`,
+    resolved before the residue qindex picker so rate control measures
+    the exact stream it emits; `InterPictureRate` grows
+    `global_fraction` / `global_applied` telemetry. Explicit
+    `global_motion` configs always win; a `min_fraction > 1.0` run is
+    telemetry-only and byte-identical to auto-off.
+  - External-oracle results: an estimator-produced pan model
+    cross-decodes **bit-exactly**; on a non-trivial matrix the oracle
+    is characterised (and pinned byte-for-byte) as **pan-only** — it
+    applies the §15.8.8 field evaluated at `(0, 0)` to every pixel,
+    ignoring the per-pixel matrix term of the spec's
+    `global_mv(ref, ref_num, x, y, c)` process, which our decoder
+    implements per-pixel.
+  - 48-case random-warp fuzz sweep (Pan/Affine/Perspective ×
+    `mv_precision 0..=3`, warps applied with the decoder's own field
+    arithmetic) + degenerate-input sweep (solid / pulse frames) over
+    the estimator: clean 2-frame decode + deterministic encode on
+    every fitted model.
+
+### Fixed
+
+- **`GlobalMotionConfig::pan_tilt_all` emitted the identity matrix**
+  (round-386): §15.8.8 computes the displacement
+  `v = (A·x + 2^ez·b)·m / 2^(ez+ep)` directly, so the identity `A`
+  made the constructor's field the position-proportional stretch
+  `(x + dx + 1, y + dy + 1)` instead of the documented constant pan.
+  Self-roundtrips stayed bit-exact (the encoder mirrors the decoder),
+  but the prediction was wrong-shaped and the residue absorbed it.
+  Now the zero matrix, matching `estimate_global_pan_config`'s proven
+  convention; regression-pinned at frame-corner extremes plus the wire
+  round-trip.
+
 - **§11.2.6 global-motion encoder path** (round-382) — closes the
   `docs/video/dirac/dirac-fixtures-and-traces.md` "Global motion
   compensation (`globalmc_flag=1`)" corpus gap on the **encode** side.
