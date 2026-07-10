@@ -659,6 +659,46 @@ mod tests {
         }
     }
 
+    /// §15.8.11 half-pel interpolation on a non-constant single-column
+    /// reference, with every value hand-computed from the spec's 8-tap
+    /// filter `(-1,3,-7,21,21,-7,3,-1)` + `16` rounding + floor `>> 5`,
+    /// clipped to `[-128, 127]`. Also exercises the edge extension: the
+    /// top and bottom odd rows read past the array and must clamp to the
+    /// nearest in-range sample. This is the sub-pel path the docs-corpus
+    /// never validated bit-exactly (its only quarter-pel fixture is
+    /// still `Tier::Bounded`), so it is pinned directly against the spec.
+    #[test]
+    fn interp2by2_halfpel_column_matches_hand_computed_spec() {
+        // Single column [10, 20, 40, 80], depth 8.
+        let r = vec![10i32, 20, 40, 80];
+        let (up, up_w, up_h) = interp2by2(&r, 1, 4, 8);
+        assert_eq!((up_w, up_h), (1, 7));
+        // Even rows copy; odd rows are the filtered half-pel values:
+        //   q=1 (rows 0,1): (16 +21*30 -7*50 +3*90 -1*90) >> 5 = 476>>5 = 14
+        //   q=3 (rows 1,2): (16 +21*60 -7*90 +3*90 -1*90) >> 5 = 826>>5 = 25
+        //   q=5 (rows 2,3): (16 +21*120 -7*100 +3*90 -1*90) >> 5 = 2016>>5 = 63
+        assert_eq!(up, vec![10, 14, 20, 25, 40, 63, 80]);
+    }
+
+    /// §15.8.10 quarter-pel sub-pixel prediction: bilinear blend of the
+    /// four nearest half-pel samples. Hand-computed for `mv_precision=2`
+    /// (`shift=1`, `denom=2`, final `(val + 2) >> 2`) at the (1,1)
+    /// quarter-pel offset, where all four weights are 1.
+    #[test]
+    fn subpel_predict_quarter_pel_matches_hand_computed_spec() {
+        // 3x3 half-pel array.
+        let up = vec![0i32, 10, 20, 30, 40, 50, 60, 70, 80];
+        // u = v = 1 (quarter-pel units): hu=hv=0, ru=rv=1.
+        //   w00=w01=w10=w11 = 1
+        //   val = up[0]+up[1]+up[3]+up[4] = 0+10+30+40 = 80
+        //   (80 + 2) >> 2 = 20
+        assert_eq!(subpel_predict(&up, 3, 3, 1, 1, 2), 20);
+        // u=3, v=0: hu=1, ru=1, hv=0, rv=0 → w00=2, w01=2, w10=w11=0.
+        //   val = 2*up[1] + 2*up[2] = 2*10 + 2*20 = 60
+        //   (60 + 2) >> 2 = 15
+        assert_eq!(subpel_predict(&up, 3, 3, 3, 0, 2), 15);
+    }
+
     #[test]
     fn subpel_predict_integer_position_copies() {
         // mv_precision=1 → half-pel; u=hv<<0 (all at integer) should read
