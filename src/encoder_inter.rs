@@ -65,16 +65,16 @@ pub struct InterEncoderParams {
     pub mv_precision: u32,
     /// Motion-vector precision for **2-ref (B-picture / bipred)** paths.
     ///
-    /// Empirically, integer-pel (`0`) gives significantly higher
-    /// ffmpeg cross-decode PSNR (~50 dB) than quarter-pel (`2`, ~42 dB)
-    /// on complementary-bar fixtures. The gain comes from eliminating
-    /// sub-pel interpolation convention differences between our
-    /// OBMC implementation and ffmpeg's at the 2-ref blend stage.
-    /// The wavelet residue then closes the prediction-error loop
-    /// exactly, making the extra interpolation noise unnecessary.
-    ///
-    /// Defaults to `0` (integer-pel). Set to `2` to use the same
-    /// quarter-pel ME as the 1-ref path (at a ~8 dB cross-decode cost).
+    /// Historical note: integer-pel (`0`) used to measure ~8 dB higher
+    /// external-oracle cross-decode than quarter-pel on
+    /// complementary-bar fixtures, which was attributed to sub-pel
+    /// interpolation convention differences. Round-408 identified the
+    /// real culprits (the oracle resolves §11.2.2 preset *index* 1 to
+    /// non-overlapped blocks and mishandles ZERO_RESIDUAL=1 skip
+    /// pictures); with literal block parameters and the explicit
+    /// zero-residue tail our 1-ref inter chains cross-decode
+    /// bit-exactly at every precision. The historical default is kept
+    /// for stability of the bipred rate/quality trade-off.
     pub bipred_mv_precision: u32,
     /// **OBMC-aware ME refinement passes** (#186, §15.8.6).
     ///
@@ -99,14 +99,32 @@ pub struct InterEncoderParams {
     /// blocks. The decoder adds this back to its OBMC reconstruction at
     /// §15.8.2 — closing the prediction-error loop.
     ///
-    /// `None` (or `enable_residue = false`) keeps the round-1 behaviour:
-    /// `ZERO_RESIDUAL = true`, no transform parameters, no coefficient
-    /// stream. PSNR is then determined entirely by ME quality.
+    /// `None` (or `enable_residue = false`) emits no coefficient data:
+    /// reconstruction = OBMC(reference) and PSNR is determined entirely
+    /// by ME quality. How the zero residue is *coded* on the wire is
+    /// controlled by [`explicit_zero_residue`].
     ///
     /// Residue encoding lifts the inter-encoder's quality ceiling
     /// dramatically on real-world content (where ME alone leaves
     /// edge-clamp / OBMC-blend residuals across block boundaries).
+    ///
+    /// [`explicit_zero_residue`]: InterEncoderParams::explicit_zero_residue
     pub residue: Option<ResidueParams>,
+    /// **Zero-residue wire form** (round-408). When `residue` is `None`
+    /// (or a rate-controlled picture gets a zero residue budget), the
+    /// spec offers two equivalent encodings: the §11.3 `ZERO_RESIDUAL =
+    /// 1` skip flag, or `ZERO_RESIDUAL = 0` followed by transform
+    /// parameters whose every subband block has `length = 0`. Both
+    /// decode to an all-zero residue on a conformant decoder — but
+    /// black-box probing showed the reference decoder **mis-reconstructs
+    /// skip pictures** (its output picks up a fine checkerboard offset
+    /// against the reference picture even for a zero-MV skip), so
+    /// streams meant for cross-decode should carry the explicit form.
+    ///
+    /// `true` (default) emits the explicit all-zero-band form (LeGall
+    /// 5,3, depth 1 — 13 zero-length bands, ~14 bytes per picture);
+    /// `false` keeps the compact `ZERO_RESIDUAL = 1` skip flag.
+    pub explicit_zero_residue: bool,
     /// **Per-block adaptive sub-pel-vs-integer-pel selection** for the
     /// **1-ref (P-picture)** path (round-73, mirrors the bipred
     /// `bipred_select_modes` adaptive precision landed in round-39).
@@ -1192,6 +1210,11 @@ impl Default for InterEncoderParams {
             bipred_mv_precision: 2,
             obmc_refine_passes: 2,
             residue: Some(ResidueParams::default_for(WaveletFilter::LeGall5_3, 3)),
+            // Explicit all-zero-band coding for zero-residue pictures:
+            // the reference decoder mishandles ZERO_RESIDUAL=1 skip
+            // pictures (round-408 black-box finding), so default to the
+            // cross-decoder-safe form.
+            explicit_zero_residue: true,
             // Per-block adaptive sub-pel-vs-int-pel for the 1-ref path
             // (round-73). Mirrors what `bipred_select_modes` does for
             // the 2-ref path. Strict superset of MV candidates → cannot
@@ -3027,6 +3050,35 @@ fn residue_quantise_coeff(x: i32, q: u32) -> i32 {
 /// Emit `transform_parameters` for the residue path. Mirrors
 /// [`crate::encoder_intra_core::write_core_transform_parameters`] —
 /// the inter decoder's residue path uses the same syntax (no
+/// Emit the zero-residue tail of an inter picture (§11.3), in the wire
+/// form selected by [`InterEncoderParams::explicit_zero_residue`]:
+///
+/// * explicit — `ZERO_RESIDUAL = 0`, LeGall-5,3 depth-1 transform
+///   parameters, default codeblocks, then 13 zero-`length` subband
+///   blocks (4 bands x 3 components). Decodes to an all-zero residue
+///   through the normal path on every decoder.
+/// * skip — the compact `ZERO_RESIDUAL = 1` flag. Spec-equivalent, but
+///   the reference decoder mis-reconstructs it (round-408 black-box
+///   finding), so this form is opt-in.
+fn write_zero_residue_tail(w: &mut BitWriter, explicit: bool) {
+    if explicit {
+        w.write_bool(false); // ZERO_RESIDUAL = 0
+        w.write_uint(wavelet_index(WaveletFilter::LeGall5_3));
+        w.write_uint(1); // dwt_depth
+        w.write_bool(false); // spatial_partition_flag
+        w.byte_align();
+        for _component in 0..3 {
+            for _band in 0..4 {
+                w.byte_align();
+                w.write_uint(0); // subband length 0 → all-zero band
+            }
+        }
+    } else {
+        w.write_bool(true); // ZERO_RESIDUAL = 1
+    }
+    w.byte_align();
+}
+
 /// `is_intra` distinction at the parameter level).
 fn write_residue_transform_parameters(w: &mut BitWriter, rp: &ResidueParams) {
     w.write_uint(wavelet_index(rp.wavelet));
@@ -3789,11 +3841,10 @@ pub fn encode_inter_picture(
         emit_residue_components(&mut w, residue, &raw_y, &raw_u, &raw_v);
         w.byte_align();
     } else {
-        // ZERO_RESIDUAL = true so we skip the entire transform_parameters
-        // / coefficient stream. The decoder treats the residue as zero
-        // everywhere and reconstruction = OBMC(reference).
-        w.write_bool(true);
-        w.byte_align();
+        // No residue: reconstruction = OBMC(reference). Wire form per
+        // `explicit_zero_residue` (the reference decoder mishandles the
+        // ZERO_RESIDUAL=1 skip form — round-408 black-box finding).
+        write_zero_residue_tail(&mut w, params.explicit_zero_residue);
     }
 
     w.finish()
@@ -3805,8 +3856,21 @@ fn write_picture_prediction_parameters(
     mv_precision: u32,
     num_refs: u32,
 ) {
-    // §11.2.2 block_parameters: index 1 (preset 8x8 / 4x4).
-    w.write_uint(1);
+    // §11.2.2 block_parameters. The values are Table 11.1's preset 1
+    // (xblen=yblen=8, xbsep=ybsep=4), but they are emitted as CUSTOM
+    // literals (index 0) rather than by preset index: black-box probing
+    // (round-408) showed the reference decoder resolves preset index 1
+    // to *non-overlapped* blocks — its boundary blend hard-switches at
+    // xbsep multiples instead of applying the spec's [1,3,5,7] ramp —
+    // while the identical parameters written literally decode
+    // bit-exactly on both decoders. Spelling the parameters out costs
+    // a few bits per picture and removes the only cross-decoder
+    // divergence our inter streams had left.
+    w.write_uint(0);
+    w.write_uint(PRESET1.0);
+    w.write_uint(PRESET1.1);
+    w.write_uint(PRESET1.2);
+    w.write_uint(PRESET1.3);
     // §11.2.5 motion_vector_precision (0=integer, 1=half, 2=quarter,
     // 3=eighth pel; spec caps at 3).
     debug_assert!(mv_precision <= 3, "mv_precision must be 0..=3");
@@ -5026,8 +5090,10 @@ pub fn encode_bipred_inter_picture(
         emit_residue_components(&mut w, residue, &raw_y, &raw_u, &raw_v);
         w.byte_align();
     } else {
-        w.write_bool(true);
-        w.byte_align();
+        // No residue: reconstruction = OBMC(reference). Wire form per
+        // `explicit_zero_residue` (the reference decoder mishandles the
+        // ZERO_RESIDUAL=1 skip form — round-408 black-box finding).
+        write_zero_residue_tail(&mut w, params.explicit_zero_residue);
     }
 
     w.finish()

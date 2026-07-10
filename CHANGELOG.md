@@ -19,6 +19,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Inter encoder: §11.2.2 block parameters are emitted as custom
+  literals instead of preset index 1, and zero-residue pictures carry
+  an explicit all-zero-band residual (`explicit_zero_residue`, default
+  on) instead of the `ZERO_RESIDUAL=1` skip flag — black-box probing
+  showed the reference decoder resolves preset index 1 to
+  non-overlapped blocks and mis-reconstructs skip pictures. With both
+  emissions aligned, our 1-ref inter chains (integer through
+  eighth-pel, with or without residue) cross-decode **bit-exactly**
+  through the reference decoder; the q0-residue chain is lossless
+  end-to-end (camera-pan and translating-square interop tests
+  tightened from ~15-20 dB floors to bit-exact) (round-408).
 - §15.8.10 out-of-frame sub-pel fetches now clamp the **integer-pel
   part** of the half-pel coordinate while preserving its half-pel
   fraction, fetching the nearest *filtered* edge row/column of the

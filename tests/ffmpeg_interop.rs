@@ -857,14 +857,17 @@ fn ffmpeg_decodes_our_inter_stream_translating_square() {
     }
     let psnr_y = psnr(inter_y, &y1);
     eprintln!("ffmpeg inter Y PSNR (homogeneous-profile chain): {psnr_y:.2} dB");
-    // Cross-decode floor: ffmpeg's inter path differs from ours in OBMC
-    // overlap weighting and half-pel reference filtering, so the
-    // cross-decode PSNR sits well below the brief's ≥ 30 dB
-    // self-roundtrip target. 15 dB still proves the MV grid, parse-code
-    // framing and intra reference all reached ffmpeg coherently.
+    // Round-408: with the encoder emitting literal §11.2.2 block
+    // parameters (the external oracle resolves preset *index* 1 to
+    // non-overlapped blocks) and an explicit all-zero-band residue tail
+    // (it mis-reconstructs ZERO_RESIDUAL=1 skip pictures), the default
+    // with-residue inter chain cross-decodes **bit-exactly**. The
+    // historical 15 dB floor was those two oracle quirks, not an OBMC
+    // convention gap.
     assert!(
-        psnr_y >= 15.0,
-        "ffmpeg inter Y PSNR {psnr_y:.2} dB below 15 dB cross-decode floor"
+        psnr_y.is_infinite(),
+        "ffmpeg inter cross-decode no longer bit-exact ({psnr_y:.2} dB) — \
+         the encoder/oracle convention alignment from round-408 regressed"
     );
 }
 
@@ -874,13 +877,10 @@ fn ffmpeg_decodes_our_inter_stream_translating_square() {
 /// reconstruct the inter frame with measurably less error than on the
 /// integer-pel-only path.
 ///
-/// The cross-decode delta is much smaller than the self-roundtrip
-/// uplift (~25 dB on the same fixture) because the encoder still
-/// emits hard 8x8 blocks without the §15.8.6 OBMC overlap window —
-/// ffmpeg's OBMC reconstruction therefore mixes the sub-pel-correct
-/// predictions across block boundaries and the absolute fidelity is
-/// still capped near ~20 dB. Once the OBMC overlap encode lands
-/// (#169), this delta should grow to match the self-roundtrip uplift.
+/// Since round-408 (literal §11.2.2 block parameters + explicit
+/// zero-residue tail) both variants cross-decode **bit-exactly** —
+/// the residue closes whatever the ME leaves, and the external
+/// oracle's prediction now matches ours byte-for-byte.
 #[test]
 fn ffmpeg_cross_decodes_camera_pan_with_subpel_me() {
     if !ffmpeg_available() {
@@ -973,15 +973,14 @@ fn ffmpeg_cross_decodes_camera_pan_with_subpel_me() {
         "camera-pan ffmpeg cross-decode: integer-pel = {psnr_int:.2} dB, \
          quarter-pel = {psnr_qpel:.2} dB"
     );
-    // Cross-decode acceptance: quarter-pel must measurably beat
-    // integer-pel. The bar is intentionally modest (≥ 0.5 dB) until
-    // OBMC overlap encoding lands — see the doc comment above.
+    // Round-408: with literal §11.2.2 block parameters + the explicit
+    // zero-residue tail, BOTH variants cross-decode bit-exactly through
+    // the external oracle (the old ~20 dB cap was the oracle's preset-1
+    // and skip-picture quirks). Pin the stronger property.
     assert!(
-        psnr_qpel >= psnr_int + 0.5,
-        "ffmpeg cross-decode quarter-pel PSNR {psnr_qpel:.2} dB did not \
-         beat integer-pel {psnr_int:.2} dB by ≥ 0.5 dB on the sub-pel \
-         camera-pan fixture (#168 acceptance — OBMC overlap will widen \
-         this gap further in #169)"
+        psnr_int.is_infinite() && psnr_qpel.is_infinite(),
+        "camera-pan cross-decode regressed from bit-exact: \
+         integer-pel = {psnr_int:.2} dB, quarter-pel = {psnr_qpel:.2} dB"
     );
 }
 
@@ -989,10 +988,10 @@ fn ffmpeg_cross_decodes_camera_pan_with_subpel_me() {
 /// our quarter-pel core-syntax inter stream at least as well with our
 /// §15.8.6 OBMC-aware ME refinement (`obmc_refine_passes = 2`, the
 /// default) as without it (`obmc_refine_passes = 0`, the no-OBMC
-/// baseline). On these synthetic 64×64 fixtures the cross-decode is
-/// structurally capped by ffmpeg's reconstruction (~20 dB on the
-/// camera-pan, ~19 dB on the translating-square) — the *self-roundtrip*
-/// uplift from OBMC-aware ME is much larger (3 dB → ∞ dB on
+/// baseline). Since round-408 both variants cross-decode bit-exactly
+/// (the default residue closes the loop and the external oracle's
+/// prediction matches ours byte-for-byte) — the *self-roundtrip*
+/// uplift from OBMC-aware ME is likewise large (3 dB → ∞ dB on
 /// `tests/encoder_inter_roundtrip.rs::intra_then_inter_obmc_refinement_beats_no_obmc_baseline`).
 /// This test simply asserts no cross-decode regression vs the no-OBMC
 /// baseline; the dramatic gain happens on our spec-correct decoder
@@ -1119,10 +1118,11 @@ fn ffmpeg_obmc_aware_me_does_not_regress_cross_decode() {
 /// the inter frame at *measurably* higher PSNR than the same encoder
 /// configured with `residue: None` (round-1 ZERO_RESIDUAL=true).
 ///
-/// The cross-decode uplift on the translating-square is large because
-/// the residue compensates for ffmpeg's slightly different OBMC blend:
-/// what we couldn't get from ME alone, the residue captures and ffmpeg
-/// adds back. Measured: ~19 dB → ~34 dB on the +4-pel translation.
+/// Since round-408 (literal §11.2.2 block parameters + explicit
+/// all-zero-band residue tail) the oracle's OBMC prediction matches
+/// ours byte-for-byte, so the q0 residue closes the loop exactly:
+/// with-residue cross-decode is bit-exact, while prediction-only sits
+/// at the ME quality floor (~32 dB on the +4-pel translation).
 #[test]
 fn ffmpeg_cross_decodes_inter_residue_beats_no_residue() {
     if !ffmpeg_available() {
@@ -1218,16 +1218,20 @@ fn ffmpeg_cross_decodes_inter_residue_beats_no_residue() {
         "translate(+4,0) ffmpeg cross-decode: no-residue = {psnr_no_res:.2} dB, \
          with-residue = {psnr_with_res:.2} dB"
     );
-    // Acceptance: residue must lift ffmpeg's cross-decode by ≥ 5 dB.
-    // On +4-pel translation the gap is ~14-15 dB (residue closes the
-    // OBMC-convention difference between our encoder and ffmpeg).
+    // Round-408 acceptance: the q0 residue closes the prediction-error
+    // loop exactly, and the oracle's prediction now matches ours
+    // byte-for-byte (literal block parameters + explicit zero-residue
+    // tail), so the with-residue chain must cross-decode **bit-exact**;
+    // the prediction-only chain still sits at the ME quality floor.
     assert!(
-        psnr_with_res >= psnr_no_res + 5.0,
-        "wavelet residue did not lift ffmpeg cross-decode by ≥ 5 dB \
-         on the +4-pel translating-square fixture: \
-         no-residue = {psnr_no_res:.2} dB, with-residue = {psnr_with_res:.2} dB. \
-         §11.3 residue acceptance: ffmpeg must reconstruct the residue \
-         and add it to its OBMC prediction"
+        psnr_with_res.is_infinite(),
+        "with-residue inter chain no longer bit-exact through the \
+         external oracle ({psnr_with_res:.2} dB)"
+    );
+    assert!(
+        psnr_no_res >= 25.0,
+        "prediction-only cross-decode fell below the 25 dB ME floor \
+         ({psnr_no_res:.2} dB)"
     );
 }
 
