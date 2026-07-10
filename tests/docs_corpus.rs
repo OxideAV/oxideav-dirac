@@ -628,6 +628,36 @@ fn corpus_interlaced_720x576_i_then_p_wavelet_5_3() {
     });
 }
 
+/// Out-of-frame sub-pel MC probes: the `i-then-p-320x240` intra anchor
+/// followed by four hand-crafted inter pictures, each with a *uniform*
+/// MV grid whose blocks overspill the picture edges (half-pel (-3,-3)
+/// top+left; quarter-pel (7,7) bottom+right; eighth-pel (-11,5); and a
+/// far-overreach half-pel (0,-33)) and an explicit all-zero residual.
+/// The reference YUV is the reference decoder's black-box output, so
+/// the fixture pins §15.8.10's edge-extension rule for fetches beyond
+/// the reference bounds: clamp the **integer-pel part** of the
+/// half-pel coordinate and preserve its half-pel fraction (see
+/// `oxideav_dirac::obmc::subpel_predict`). A regression back to the
+/// pseudocode's raw half-pel coordinate clip flips edge samples by
+/// ±1..3 LSB and trips this immediately.
+///
+/// The probes code the zero residual explicitly (`ZERO_RESIDUAL=0`,
+/// all bands `length=0`) because the reference decoder mis-reconstructs
+/// skip pictures (`zero_res=1`) — see the fixture's `notes.md`.
+#[test]
+fn corpus_edge_mc_probes_320x240() {
+    evaluate(&CorpusCase {
+        name: "edge-mc-probes-320x240",
+        width: 320,
+        height: 240,
+        n_frames: 5,
+        sub: Subsampling::Yuv420,
+        // Bit-exact from the day the fixture was staged (round-408, the
+        // same round the integer-part-clamp edge extension landed).
+        tier: Tier::BitExact,
+    });
+}
+
 /// 4:2:2 chroma subsampling: 720×576 SD-PAL interlaced, single intra
 /// picture, DD 9,7 wavelet depth 4. The only fixture with
 /// `chroma_format=1` — chroma planes decode at 360×576 (full-vertical,

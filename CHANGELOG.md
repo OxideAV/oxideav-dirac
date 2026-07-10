@@ -33,6 +33,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- docs_corpus: new `edge-mc-probes-320x240` fixture test — four
+  hand-crafted uniform-MV inter pictures overspilling every picture
+  edge at half/quarter/eighth-pel with explicit zero residuals,
+  reference-decoder ground truth, pinned `Tier::BitExact` (round-408).
 - docs_corpus: the quarter-pel inter fixture is promoted to
   `Tier::BitExact`; the whole 8-fixture corpus is now pinned bit-exact
   (round-408).
