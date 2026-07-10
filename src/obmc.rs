@@ -699,6 +699,21 @@ mod tests {
         assert_eq!(subpel_predict(&up, 3, 3, 3, 0, 2), 15);
     }
 
+    /// §15.8.10 eighth-pel (`mv_precision = 3`) sub-pixel prediction:
+    /// `shift = 2`, `denom = 4`, four weights summing to
+    /// `2^(2*3-2) = 16`, final `(val + 8) >> 4`. No docs-corpus fixture
+    /// reaches this precision, so it is pinned directly against the spec.
+    #[test]
+    fn subpel_predict_eighth_pel_matches_hand_computed_spec() {
+        let up = vec![0i32, 10, 20, 30, 40, 50, 60, 70, 80];
+        // u = v = 1 (eighth-pel units): hu=hv=0, ru=rv=1, denom=4.
+        //   w00=9, w01=3, w10=3, w11=1  (sum 16)
+        //   val = 9*up[0] + 3*up[1] + 3*up[3] + 1*up[4]
+        //       = 0 + 30 + 90 + 40 = 160
+        //   (160 + 8) >> 4 = 10
+        assert_eq!(subpel_predict(&up, 3, 3, 1, 1, 3), 10);
+    }
+
     #[test]
     fn subpel_predict_integer_position_copies() {
         // mv_precision=1 → half-pel; u=hv<<0 (all at integer) should read
