@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- §15.8.5 intra-block DC is now indexed by the full component (Y/C1/C2);
+  the C2 (V) plane of inter pictures used to predict every intra block
+  from the C1 (U) DC value. On the quarter-pel interlaced corpus fixture
+  the V plane's interior goes from 1263 wrong samples (max |err| 12) to
+  bit-exact and the whole-frame match rate rises from 99.68% to 99.91%
+  (round-404).
+
+### Other
+
+- docs_corpus: the quarter-pel inter fixture is now a `Tier::Bounded`
+  regression gate (99.90% floor) instead of an assert-nothing
+  `Tier::ReportOnly` (round-404).
+- obmc: hand-computed spec-compliance tests for the §15.8.10/§15.8.11
+  quarter-pel sub-pel MC primitives — the sub-pel path the corpus never
+  validated bit-exactly (round-404).
+
 ## [0.0.9](https://github.com/OxideAV/oxideav-dirac/compare/v0.0.8...v0.0.9) - 2026-07-03
 
 ### Other
