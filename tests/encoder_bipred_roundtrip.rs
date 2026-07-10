@@ -707,24 +707,15 @@ fn ffmpeg_cross_decodes_our_bipred_b_frame() {
     let bipred_y = &out[frame_size..frame_size + 64 * 64];
     let py = psnr(bipred_y, &ym);
     eprintln!("ffmpeg bipred B-frame cross-decode Y PSNR: {py:.2} dB");
-    // Cross-decode floor: 49 dB on this complementary-bars fixture.
-    // The bipred default is now `bipred_mv_precision = 2` (quarter-pel)
-    // with **per-block adaptive sub-pel-vs-integer-pel selection**
-    // (round-39): `bipred_select_modes` evaluates each MV at both its
-    // sub-pel-refined position and the nearest integer-pel peer,
-    // choosing whichever gives the lower SAD per block. Sharp-edge
-    // blocks (the bars in this fixture) snap back to integer-pel,
-    // matching the previous integer-pel-only baseline (~50 dB) and
-    // avoiding the 7+ dB regression that an unconditional sub-pel
-    // pipeline produced. Smooth-motion blocks (covered by the
-    // `ffmpeg_cross_decodes_camera_pan_bipred_with_subpel_gain` test
-    // below) pick up a +4 dB improvement.
+    // Round-408: with the encoder emitting literal §11.2.2 block
+    // parameters and explicit all-zero-band residues (the two external
+    // oracle quirks that capped historical cross-decode), the bipred
+    // 0x0A chain cross-decodes **bit-exactly** through the oracle.
     assert!(
-        py >= 49.0,
-        "ffmpeg bipred B-frame Y PSNR {py:.2} dB below 49 dB floor — \
-         per-block adaptive sub-pel-vs-integer-pel selection failed to \
-         pick integer-pel for the sharp-edge bars in this fixture; expected \
-         ~50 dB"
+        py.is_infinite(),
+        "ffmpeg bipred B-frame cross-decode no longer bit-exact \
+         ({py:.2} dB) — the round-408 encoder/oracle convention \
+         alignment regressed on the 2-ref path"
     );
 }
 
@@ -834,16 +825,19 @@ fn ffmpeg_cross_decodes_camera_pan_bipred_with_subpel_gain() {
     // round-39 per-block adaptive sub-pel selection keeps the qpel
     // variant in the same near-lossless regime (a regression there
     // historically cost 7+ dB of 8-tap-filter convention drift).
+    // Round-408 tightening: with literal §11.2.2 block parameters and
+    // the explicit zero-residue tail, both variants cross-decode
+    // bit-exactly.
     assert!(
-        psnr_int >= 60.0,
-        "bipred int-pel camera-pan cross-decode PSNR {psnr_int:.2} dB below \
-         60 dB — the qindex-0 residue no longer closes the loop"
+        psnr_int.is_infinite(),
+        "bipred int-pel camera-pan cross-decode no longer bit-exact \
+         ({psnr_int:.2} dB) — the qindex-0 residue no longer closes the loop"
     );
     assert!(
-        psnr_qpel >= 60.0,
-        "bipred qpel(adaptive) camera-pan cross-decode PSNR {psnr_qpel:.2} dB \
-         below 60 dB — round-39 per-block adaptive sub-pel selection \
-         regression"
+        psnr_qpel.is_infinite(),
+        "bipred qpel(adaptive) camera-pan cross-decode no longer bit-exact \
+         ({psnr_qpel:.2} dB) — per-block adaptive sub-pel selection or the \
+         round-408 encoder/oracle convention alignment regressed"
     );
 }
 

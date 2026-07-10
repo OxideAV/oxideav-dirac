@@ -54,6 +54,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- Bipred interop tests tightened: the 0x0A B-picture chains
+  (complementary-bars and camera-pan, integer and adaptive quarter-pel)
+  now assert **bit-exact** cross-decode through the reference decoder
+  (round-408).
 - docs_corpus: new `edge-mc-probes-320x240` fixture test — four
   hand-crafted uniform-MV inter pictures overspilling every picture
   edge at half/quarter/eighth-pel with explicit zero residuals,
