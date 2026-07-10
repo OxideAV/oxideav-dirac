@@ -55,15 +55,28 @@ pub fn fshr(a: i64, b: u32) -> i64 {
 pub const HALF_PEL_TAPS: [i32; 4] = [21, -7, 3, -1];
 
 /// §15.8.11 `interp2by2`. Given a reference plane `ref_plane` of size
-/// `w * h`, produce a half-pel interpolated plane of size
-/// `(2w - 1) * (2h - 1)`. Clipping is to `[-2^(depth-1), 2^(depth-1)-1]`.
+/// `w * h`, produce a half-pel interpolated plane of size `2w * 2h`.
+/// Clipping is to `[-2^(depth-1), 2^(depth-1)-1]`.
+///
+/// The §15.8.11 pseudocode array is `(2w - 1) x (2h - 1)`; the extra
+/// last odd row / column (indices `2w - 1`, `2h - 1`) are the
+/// **edge-extension half-pel samples**: the same 8-tap filter with its
+/// taps clamped into the reference (equivalently, the upconversion of
+/// the edge-extended integer array at the half-pel position just past
+/// the last sample). They are never addressed by in-frame fetches, but
+/// §15.8.10 permits motion vectors to reach beyond the reference edges
+/// with "values determined by edge extension" — and the black-box
+/// reference-decoder comparison on the docs corpus pins that rule as:
+/// clamp the *integer-pel* coordinate into the frame, keep the half-pel
+/// fraction, then fetch — which addresses these last odd samples for
+/// any fetch beyond the right/bottom edge (see [`subpel_predict`]).
 pub fn interp2by2(ref_plane: &[i32], w: usize, h: usize, depth: u32) -> (Vec<i32>, usize, usize) {
     debug_assert_eq!(ref_plane.len(), w * h);
     if w == 0 || h == 0 {
         return (Vec::new(), 0, 0);
     }
-    let up_w = 2 * w - 1;
-    let up_h = 2 * h - 1;
+    let up_w = 2 * w;
+    let up_h = 2 * h;
     // First: vertical upsampling → `ref2` (width = w, height = 2h-1).
     let mut ref2: Vec<i32> = vec![0; w * up_h];
     let half = if depth == 0 {
@@ -121,6 +134,23 @@ pub fn interp2by2(ref_plane: &[i32], w: usize, h: usize, depth: u32) -> (Vec<i32
 /// §15.8.10 `subpel_predict`. `(u, v)` is in units of 1 << mv_precision.
 /// When `mv_precision == 0` the caller should pick the integer pixel
 /// from the reference directly rather than calling this.
+///
+/// `upref` is the `2w x 2h` half-pel array from [`interp2by2`].
+///
+/// **Edge extension** (§15.8.10 "values lying outside shall be
+/// determined by edge extension"): a half-pel coordinate outside the
+/// array is resolved by clamping its **integer-pel part**
+/// (`floor(h / 2)`) into `[0, size - 1]` while keeping its half-pel
+/// fraction (`h & 1`), i.e. `pos = 2 * clamp(h >> 1) + (h & 1)`. The
+/// §15.8.10 pseudocode instead clips the raw half-pel coordinate into
+/// the `(2w - 1) x (2h - 1)` array, which silently *drops* the
+/// fraction at the edges; the two readings differ by ±1..3 LSB
+/// wherever a block overspills the reference. Black-box comparison
+/// against the reference decoder on the docs fixture corpus (uniform
+/// out-of-frame MV probe pictures at every precision, all four edges,
+/// near and far overreach) pins the integer-part-clamp reading —
+/// adopting it took the corpus' quarter-pel inter fixture from 99.91%
+/// to reference-exact.
 pub fn subpel_predict(
     upref: &[i32],
     up_w: usize,
@@ -140,10 +170,20 @@ pub fn subpel_predict(
     let w01 = (denom - rv) * ru;
     let w10 = rv * (denom - ru);
     let w11 = rv * ru;
-    let xpos = hu.clamp(0, (up_w as i64) - 1) as usize;
-    let xpos1 = (hu + 1).clamp(0, (up_w as i64) - 1) as usize;
-    let ypos = hv.clamp(0, (up_h as i64) - 1) as usize;
-    let ypos1 = (hv + 1).clamp(0, (up_h as i64) - 1) as usize;
+    // Integer-pel dimensions of the underlying reference.
+    let rw = (up_w / 2) as i64;
+    let rh = (up_h / 2) as i64;
+    // Edge extension: clamp the integer-pel part, keep the half-pel
+    // fraction. `h & 1` is non-negative for negative `h` as well
+    // (two's complement), so a fetch just above/left of the frame maps
+    // onto the first *filtered* half-pel row/column, and a fetch past
+    // the right/bottom edge onto the last one (index 2*size - 1).
+    let clamp_x = |hx: i64| -> usize { (2 * fshr(hx, 1).clamp(0, rw - 1) + (hx & 1)) as usize };
+    let clamp_y = |hy: i64| -> usize { (2 * fshr(hy, 1).clamp(0, rh - 1) + (hy & 1)) as usize };
+    let xpos = clamp_x(hu);
+    let xpos1 = clamp_x(hu + 1);
+    let ypos = clamp_y(hv);
+    let ypos1 = clamp_y(hv + 1);
     let val = w00 * upref[ypos * up_w + xpos] as i64
         + w01 * upref[ypos * up_w + xpos1] as i64
         + w10 * upref[ypos1 * up_w + xpos] as i64
@@ -641,7 +681,7 @@ mod tests {
     fn interp2by2_copies_even_coordinates() {
         let r: Vec<i32> = (0..16).collect();
         let (up, w, h) = interp2by2(&r, 4, 4, 8);
-        assert_eq!((w, h), (7, 7));
+        assert_eq!((w, h), (8, 8));
         // Even, even coordinates are copies.
         for y in 0..4 {
             for x in 0..4 {
@@ -663,21 +703,31 @@ mod tests {
     /// reference, with every value hand-computed from the spec's 8-tap
     /// filter `(-1,3,-7,21,21,-7,3,-1)` + `16` rounding + floor `>> 5`,
     /// clipped to `[-128, 127]`. Also exercises the edge extension: the
-    /// top and bottom odd rows read past the array and must clamp to the
-    /// nearest in-range sample. This is the sub-pel path the docs-corpus
-    /// never validated bit-exactly (its only quarter-pel fixture is
-    /// still `Tier::Bounded`), so it is pinned directly against the spec.
+    /// top and bottom odd rows read past the array and must clamp their
+    /// taps to the nearest in-range sample. The array now carries the
+    /// extra last odd row/column (the edge-extension half-pel sample
+    /// past the final pixel) required for reference-exact out-of-frame
+    /// fetches.
     #[test]
     fn interp2by2_halfpel_column_matches_hand_computed_spec() {
         // Single column [10, 20, 40, 80], depth 8.
         let r = vec![10i32, 20, 40, 80];
         let (up, up_w, up_h) = interp2by2(&r, 1, 4, 8);
-        assert_eq!((up_w, up_h), (1, 7));
+        assert_eq!((up_w, up_h), (2, 8));
         // Even rows copy; odd rows are the filtered half-pel values:
         //   q=1 (rows 0,1): (16 +21*30 -7*50 +3*90 -1*90) >> 5 = 476>>5 = 14
         //   q=3 (rows 1,2): (16 +21*60 -7*90 +3*90 -1*90) >> 5 = 826>>5 = 25
         //   q=5 (rows 2,3): (16 +21*120 -7*100 +3*90 -1*90) >> 5 = 2016>>5 = 63
-        assert_eq!(up, vec![10, 14, 20, 25, 40, 63, 80]);
+        //   q=7 (edge-extension row past the last pixel; upper taps all
+        //   clamp to row 3):
+        //     (16 +21*(80+80) -7*(40+80) +3*(20+80) -1*(10+80)) >> 5
+        //   = (16 + 3360 - 840 + 300 - 90) >> 5 = 2746 >> 5 = 85
+        // The single-column horizontal pass duplicates each row into the
+        // odd column (all taps clamp to column 0; (16 + 32v) >> 5 = v).
+        let col0: Vec<i32> = (0..8).map(|q| up[q * up_w]).collect();
+        let col1: Vec<i32> = (0..8).map(|q| up[q * up_w + 1]).collect();
+        assert_eq!(col0, vec![10, 14, 20, 25, 40, 63, 80, 85]);
+        assert_eq!(col1, col0);
     }
 
     /// §15.8.10 quarter-pel sub-pixel prediction: bilinear blend of the
@@ -686,17 +736,17 @@ mod tests {
     /// quarter-pel offset, where all four weights are 1.
     #[test]
     fn subpel_predict_quarter_pel_matches_hand_computed_spec() {
-        // 3x3 half-pel array.
-        let up = vec![0i32, 10, 20, 30, 40, 50, 60, 70, 80];
+        // 4x4 half-pel array (2x2 integer reference).
+        let up: Vec<i32> = (0..16).map(|i| i * 10).collect();
         // u = v = 1 (quarter-pel units): hu=hv=0, ru=rv=1.
         //   w00=w01=w10=w11 = 1
-        //   val = up[0]+up[1]+up[3]+up[4] = 0+10+30+40 = 80
-        //   (80 + 2) >> 2 = 20
-        assert_eq!(subpel_predict(&up, 3, 3, 1, 1, 2), 20);
+        //   val = up[0]+up[1]+up[4]+up[5] = 0+10+40+50 = 100
+        //   (100 + 2) >> 2 = 25
+        assert_eq!(subpel_predict(&up, 4, 4, 1, 1, 2), 25);
         // u=3, v=0: hu=1, ru=1, hv=0, rv=0 → w00=2, w01=2, w10=w11=0.
         //   val = 2*up[1] + 2*up[2] = 2*10 + 2*20 = 60
         //   (60 + 2) >> 2 = 15
-        assert_eq!(subpel_predict(&up, 3, 3, 3, 0, 2), 15);
+        assert_eq!(subpel_predict(&up, 4, 4, 3, 0, 2), 15);
     }
 
     /// §15.8.10 eighth-pel (`mv_precision = 3`) sub-pixel prediction:
@@ -705,27 +755,62 @@ mod tests {
     /// reaches this precision, so it is pinned directly against the spec.
     #[test]
     fn subpel_predict_eighth_pel_matches_hand_computed_spec() {
-        let up = vec![0i32, 10, 20, 30, 40, 50, 60, 70, 80];
+        let up: Vec<i32> = (0..16).map(|i| i * 10).collect();
         // u = v = 1 (eighth-pel units): hu=hv=0, ru=rv=1, denom=4.
         //   w00=9, w01=3, w10=3, w11=1  (sum 16)
-        //   val = 9*up[0] + 3*up[1] + 3*up[3] + 1*up[4]
-        //       = 0 + 30 + 90 + 40 = 160
-        //   (160 + 8) >> 4 = 10
-        assert_eq!(subpel_predict(&up, 3, 3, 1, 1, 3), 10);
+        //   val = 9*up[0] + 3*up[1] + 3*up[4] + 1*up[5]
+        //       = 0 + 30 + 120 + 50 = 200
+        //   (200 + 8) >> 4 = 13
+        assert_eq!(subpel_predict(&up, 4, 4, 1, 1, 3), 13);
     }
 
     #[test]
     fn subpel_predict_integer_position_copies() {
-        // mv_precision=1 → half-pel; u=hv<<0 (all at integer) should read
-        // upref at those coordinates directly.
-        let mut up = vec![0i32; 9];
-        for i in 0..9 {
-            up[i] = i as i32;
-        }
-        let v = subpel_predict(&up, 3, 3, 2, 2, 1);
+        // mv_precision=1 → half-pel; (u, v) already at half-pel grid
+        // positions should read upref at those coordinates directly.
+        let up: Vec<i32> = (0..16).collect();
+        let v = subpel_predict(&up, 4, 4, 2, 2, 1);
         // At half-pel precision, hu=hv=2 (half-pel coord). Remainder ru=rv=0.
         // shift=0; denom=1. w00 = 1*1 = 1, w01 = w10 = w11 = 0.
-        assert_eq!(v, up[2 * 3 + 2]);
+        assert_eq!(v, up[2 * 4 + 2]);
+    }
+
+    /// Out-of-frame edge extension in [`subpel_predict`]: the
+    /// integer-pel part of a half-pel coordinate is clamped into the
+    /// frame while its half-pel **fraction is preserved**, so a fetch
+    /// just outside an edge lands on the nearest *filtered* half-pel
+    /// row/column — not on the copied integer sample the raw §15.8.10
+    /// coordinate clip would select. Rule pinned by black-box probe
+    /// pictures against the reference decoder on the docs corpus
+    /// (uniform out-of-frame MVs, all four edges, precisions 1..3);
+    /// values below are hand-computed from the mapping
+    /// `pos = 2 * clamp(h >> 1, 0, size - 1) + (h & 1)`.
+    #[test]
+    fn subpel_predict_out_of_frame_keeps_halfpel_fraction() {
+        // 4x4 half-pel array over a 2x2 reference; distinct values.
+        let up: Vec<i32> = (0..16).collect();
+        // hu = -1 (half-pel, prec 1): integer part floor(-1/2) = -1 →
+        // clamp 0; fraction (-1 & 1) = 1 → column 1 (filtered), row 0.
+        assert_eq!(subpel_predict(&up, 4, 4, -1, 0, 1), up[1]);
+        // hv = -3: integer part floor(-3/2) = -2 → clamp 0; fraction 1
+        // → row 1. (A raw coordinate clip would give row 0.)
+        assert_eq!(subpel_predict(&up, 4, 4, 0, -3, 1), up[4]);
+        // hu = 4 (past the right edge; valid indices 0..3): integer
+        // part 2 → clamp 1; fraction 0 → column 2.
+        assert_eq!(subpel_predict(&up, 4, 4, 4, 0, 1), up[2]);
+        // hu = 5: integer part 2 → clamp 1; fraction 1 → column 3, the
+        // last odd (edge-extension) half-pel sample.
+        assert_eq!(subpel_predict(&up, 4, 4, 5, 0, 1), up[3]);
+        // hv = 7 far below: integer part 3 → clamp 1; fraction 1 →
+        // row 3.
+        assert_eq!(subpel_predict(&up, 4, 4, 0, 7, 1), up[3 * 4]);
+        // Quarter-pel straddling the top edge: u=0, v=-1 (prec 2):
+        // hv = floor(-1/2) = -1, rv = -1 - (-1<<1) = 1 → w00=w01 rows
+        // hv=-1 → row 1... wait: hv=-1 maps (clamp 0, frac 1) → row 1;
+        // hv+1=0 → row 0. w00 = (2-1)*(2-0) = 2 (row hv), w10 = 1*2 = 2
+        // (row hv+1); w01 = w11 = 0.
+        //   val = 2*up[1*4] + 2*up[0] = 2*4 + 0 = 8; (8 + 2) >> 2 = 2.
+        assert_eq!(subpel_predict(&up, 4, 4, 0, -1, 2), 2);
     }
 
     #[test]

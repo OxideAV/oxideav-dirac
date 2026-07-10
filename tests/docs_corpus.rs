@@ -461,16 +461,14 @@ fn evaluate(case: &CorpusCase) {
 // Per-fixture tests
 // ---------------------------------------------------------------------------
 //
-// As of round-118 every intra-only fixture decodes bit-exactly against
-// the ffmpeg reference and is pinned at `Tier::BitExact`:
-// `i-only-tiny`, `vc2-low-delay-tiny`, `vc2-low-delay-3pics`,
-// `interlaced-720x576-i-only` (depth-4 IDWT) and `chroma-422-720x576`
-// (4:2:2). The two 320×240 inter fixtures (`i-then-p`, `i-p-b`) are
-// bit-exact as well (integer-pel motion). The only non-bit-exact case
-// left is `interlaced-720x576-i-then-p-wavelet-5-3`, the sole
-// quarter-pel inter fixture, now pinned at `Tier::Bounded` (99.90%
-// floor) after the round-404 per-component intra-DC fix; its residual
-// is a sub-LSB picture-edge divergence (see that test's doc comment).
+// As of round-408 **every fixture in the corpus decodes bit-exactly**
+// against the reference and is pinned at `Tier::BitExact`: the five
+// intra-only cases (`i-only-tiny`, `vc2-low-delay-tiny`,
+// `vc2-low-delay-3pics`, `interlaced-720x576-i-only`,
+// `chroma-422-720x576`), the two integer-pel inter cases (`i-then-p`,
+// `i-p-b`) and — since the round-408 integer-part-clamp edge-extension
+// fix in the §15.8.10 sub-pel fetch — the quarter-pel
+// `interlaced-720x576-i-then-p-wavelet-5-3` case as well.
 //
 // Trace files (referenced in `evaluate()` via the `eprintln!` header)
 // live alongside each fixture and capture the per-step `PARSE_UNIT` /
@@ -604,23 +602,17 @@ fn corpus_interlaced_720x576_i_only() {
 /// (`mv_precision = 0`), which bypasses the §15.8.10/§15.8.11 sub-pel
 /// interpolation entirely.
 ///
-/// Round-404 closed the dominant divergence here: §15.8.5 indexes the
-/// intra-block DC by the full component `c`, but `block_mc` had
-/// collapsed both chroma planes onto DC index 1, so every intra block
-/// in the C2 (V) plane predicted from the C1 (U) DC. Fixing that took
-/// the V plane's interior from 1263 wrong samples (max |err| 12) to
-/// bit-exact and the overall match rate from 99.68% to 99.91%.
-///
-/// The residual (~0.09%, luma max |err| 5, chroma max |err| 2) is
-/// confined to the top and right picture-boundary strips — the region
-/// where blocks overspill the picture edge and motion vectors reach
-/// beyond the reference into the edge-extended half-pel array. Every
-/// sub-pel MC primitive (`interp2by2`, `subpel_predict`, `h_wt`/`v_wt`
-/// edge flattening) has been re-verified against the spec and the
-/// picture interior is bit-exact, so localising the remaining edge
-/// divergence needs an instrumented reference trace that emits
-/// per-block motion vectors — the current trace only carries structural
-/// events (see the report/DOCS-GAP note).
+/// Round-404 closed the dominant divergence (per-component intra-block
+/// DC, §15.8.5), leaving ~0.09% on the top/right picture-boundary
+/// strips. Round-408 closed that remainder: §15.8.10's out-of-frame
+/// sub-pel fetch clamps the **integer-pel part** of the half-pel
+/// coordinate while preserving its half-pel fraction (fetching the
+/// nearest *filtered* edge row/column), rather than clipping the raw
+/// half-pel coordinate as the pseudocode reads. The rule was pinned by
+/// black-box uniform-MV probe pictures against the reference decoder
+/// (see `oxideav_dirac::obmc::subpel_predict`). This fixture — whose P
+/// picture pans up-right, overspilling exactly those two edges — has
+/// been bit-exact since.
 /// Trace: docs/video/dirac/fixtures/interlaced-720x576-i-then-p-wavelet-5-3/trace.txt.gz
 #[test]
 fn corpus_interlaced_720x576_i_then_p_wavelet_5_3() {
@@ -630,15 +622,9 @@ fn corpus_interlaced_720x576_i_then_p_wavelet_5_3() {
         height: 576,
         n_frames: 2,
         sub: Subsampling::Yuv420,
-        // Regression gate: the round-404 per-component intra-DC fix put
-        // the match rate at 99.91% with luma max 5 / chroma max 2.
-        // Bounds sit just outside the measured values so a reopening of
-        // that (or any larger) gap trips the test.
-        tier: Tier::Bounded {
-            min_match_pct: 99.90,
-            max_luma: 6,
-            max_chroma: 3,
-        },
+        // Bit-exact since round-408 (integer-part-clamp edge extension
+        // in the §15.8.10 sub-pel fetch).
+        tier: Tier::BitExact,
     });
 }
 

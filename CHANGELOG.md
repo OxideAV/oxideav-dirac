@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- §15.8.10 out-of-frame sub-pel fetches now clamp the **integer-pel
+  part** of the half-pel coordinate while preserving its half-pel
+  fraction, fetching the nearest *filtered* edge row/column of the
+  half-pel array (which now carries the last odd edge-extension
+  row/column, `interp2by2` → `2w x 2h`). The previous raw half-pel
+  coordinate clip silently dropped the fraction at the picture edges,
+  diverging by ±1..3 LSB wherever a block's motion overspilled the
+  reference. Rule pinned by black-box uniform-MV probe pictures
+  (crafted bitstreams, every precision, all four edges, near/far
+  overreach) against the reference decoder. The last non-exact docs
+  corpus fixture — the quarter-pel up-right-panning
+  `interlaced-720x576-i-then-p-wavelet-5-3` — goes from 99.91% to
+  **reference-exact**; all 8/8 corpus fixtures are now bit-exact
+  (round-408).
+
 - §15.8.5 intra-block DC is now indexed by the full component (Y/C1/C2);
   the C2 (V) plane of inter pictures used to predict every intra block
   from the C1 (U) DC value. On the quarter-pel interlaced corpus fixture
@@ -18,6 +33,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- docs_corpus: the quarter-pel inter fixture is promoted to
+  `Tier::BitExact`; the whole 8-fixture corpus is now pinned bit-exact
+  (round-408).
+- obmc: hand-computed spec tests for the integer-part-clamp edge
+  extension in `subpel_predict` — out-of-frame fetches at every edge,
+  half- and quarter-pel (round-408).
 - docs_corpus: the quarter-pel inter fixture is now a `Tier::Bounded`
   regression gate (99.90% floor) instead of an assert-nothing
   `Tier::ReportOnly` (round-404).
