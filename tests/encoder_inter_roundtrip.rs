@@ -1627,3 +1627,80 @@ fn estimated_perspective_warp_roundtrips_bit_exact_and_saves_bytes() {
          {len_global} B (global) vs {len_block} B (block motion)"
     );
 }
+
+/// **Round-408 zero-residue wire forms.** With `residue: None` the
+/// encoder can code the all-zero residue two spec-equivalent ways:
+/// the default `explicit_zero_residue = true` emits `ZERO_RESIDUAL=0`
+/// followed by 13 zero-`length` subband blocks (the form the external
+/// oracle reconstructs correctly), while `false` emits the compact
+/// `ZERO_RESIDUAL=1` skip flag. Both must decode **identically**
+/// through our own decoder — the wire form is a serialization choice,
+/// not a semantic one — and the explicit form must cost only a small,
+/// bounded number of extra bytes.
+#[test]
+fn zero_residue_wire_forms_decode_identically() {
+    use oxideav_dirac::encoder_intra_core::{
+        encode_core_intra_then_inter_stream, CoreIntraEncoderParams,
+    };
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let intra_params = CoreIntraEncoderParams::default_intra(WaveletFilter::LeGall5_3, 3);
+    let (y0, u0, v0, y1, u1, v1) = synthetic_translating_pair_64(4, 0);
+    let intra = InterInputPicture {
+        picture_number: 0,
+        y: &y0,
+        u: &u0,
+        v: &v0,
+    };
+    let inter = InterInputPicture {
+        picture_number: 1,
+        y: &y1,
+        u: &u1,
+        v: &v1,
+    };
+
+    let decode = |stream: Vec<u8>| -> Vec<Vec<u8>> {
+        let mut reg = CodecRegistry::new();
+        oxideav_dirac::register_codecs(&mut reg);
+        let cp = CodecParameters::video(CodecId::new("dirac"));
+        let mut dec = reg.first_decoder(&cp).expect("make decoder");
+        dec.send_packet(&Packet::new(0, TimeBase::new(1, 25), stream))
+            .expect("send_packet");
+        let mut planes = Vec::new();
+        for _ in 0..2 {
+            match dec.receive_frame().expect("frame") {
+                Frame::Video(vf) => planes.extend(vf.planes.into_iter().map(|p| p.data)),
+                other => panic!("expected video frame, got {other:?}"),
+            }
+        }
+        planes
+    };
+
+    let explicit_params = InterEncoderParams {
+        residue: None,
+        ..InterEncoderParams::default()
+    };
+    let skip_params = InterEncoderParams {
+        residue: None,
+        explicit_zero_residue: false,
+        ..InterEncoderParams::default()
+    };
+    let explicit_stream =
+        encode_core_intra_then_inter_stream(&seq, &intra_params, &explicit_params, &intra, &inter);
+    let skip_stream =
+        encode_core_intra_then_inter_stream(&seq, &intra_params, &skip_params, &intra, &inter);
+
+    // The explicit form costs a handful of extra bytes (transform
+    // parameters + 13 zero-length band codes ≈ 14 bytes), never more.
+    let delta = explicit_stream.len() as i64 - skip_stream.len() as i64;
+    assert!(
+        (1..=32).contains(&delta),
+        "explicit zero-residue tail should cost 1..=32 extra bytes, measured {delta}"
+    );
+
+    let explicit_frames = decode(explicit_stream);
+    let skip_frames = decode(skip_stream);
+    assert_eq!(
+        explicit_frames, skip_frames,
+        "the two zero-residue wire forms must reconstruct identically"
+    );
+}
