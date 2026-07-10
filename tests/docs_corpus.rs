@@ -136,6 +136,16 @@ enum Tier {
     /// per-fixture stats are logged but the test does not fail.
     /// Promote to `BitExact` once the underlying gap is closed.
     ReportOnly,
+    /// Decode must match the reference to at least `min_match_pct` of
+    /// samples, with per-plane maxima no larger than `max_luma` /
+    /// `max_chroma`. A regression that reopens a closed sub-gap (e.g.
+    /// the §15.8.5 per-component intra-DC fix) trips this even though
+    /// the fixture is not yet fully bit-exact.
+    Bounded {
+        min_match_pct: f64,
+        max_luma: i32,
+        max_chroma: i32,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -412,6 +422,38 @@ fn evaluate(case: &CorpusCase) {
             // underlying decoder gap is closed.
             let _ = pct;
         }
+        Tier::Bounded {
+            min_match_pct,
+            max_luma,
+            max_chroma,
+        } => {
+            assert!(
+                pct >= min_match_pct,
+                "{}: match rate {:.4}% fell below the {:.4}% floor \
+                 (regression?) — Y max {} PSNR {:.2} dB, UV max {} PSNR {:.2} dB",
+                case.name,
+                pct,
+                min_match_pct,
+                agg.y_max,
+                agg.y_psnr(),
+                agg.uv_max,
+                agg.uv_psnr(),
+            );
+            assert!(
+                agg.y_max <= max_luma,
+                "{}: luma max error {} exceeds bound {}",
+                case.name,
+                agg.y_max,
+                max_luma,
+            );
+            assert!(
+                agg.uv_max <= max_chroma,
+                "{}: chroma max error {} exceeds bound {}",
+                case.name,
+                agg.uv_max,
+                max_chroma,
+            );
+        }
     }
 }
 
@@ -423,9 +465,12 @@ fn evaluate(case: &CorpusCase) {
 // the ffmpeg reference and is pinned at `Tier::BitExact`:
 // `i-only-tiny`, `vc2-low-delay-tiny`, `vc2-low-delay-3pics`,
 // `interlaced-720x576-i-only` (depth-4 IDWT) and `chroma-422-720x576`
-// (4:2:2). The remaining `Tier::ReportOnly` cases all carry inter
-// pictures (P / B), whose §13.2.1 inverse-quant offset and OBMC
-// reconstruction still diverge; promote each as that gap closes.
+// (4:2:2). The two 320×240 inter fixtures (`i-then-p`, `i-p-b`) are
+// bit-exact as well (integer-pel motion). The only non-bit-exact case
+// left is `interlaced-720x576-i-then-p-wavelet-5-3`, the sole
+// quarter-pel inter fixture, now pinned at `Tier::Bounded` (99.90%
+// floor) after the round-404 per-component intra-DC fix; its residual
+// is a sub-LSB picture-edge divergence (see that test's doc comment).
 //
 // Trace files (referenced in `evaluate()` via the `eprintln!` header)
 // live alongside each fixture and capture the per-step `PARSE_UNIT` /
@@ -552,7 +597,30 @@ fn corpus_interlaced_720x576_i_only() {
 
 /// Per-picture wavelet selection: intra at DD 9,7 (`wavelet_idx=0`)
 /// followed by inter at LeGall 5,3 (`wavelet_idx=1`). The only
-/// fixture in the corpus that exercises a wavelet other than DD 9,7.
+/// fixture in the corpus that exercises a wavelet other than DD 9,7 —
+/// and, more importantly for motion compensation, the only one whose
+/// inter picture uses **quarter-pel** motion (`mv_precision = 2`); the
+/// two bit-exact 320×240 inter fixtures both use integer-pel motion
+/// (`mv_precision = 0`), which bypasses the §15.8.10/§15.8.11 sub-pel
+/// interpolation entirely.
+///
+/// Round-404 closed the dominant divergence here: §15.8.5 indexes the
+/// intra-block DC by the full component `c`, but `block_mc` had
+/// collapsed both chroma planes onto DC index 1, so every intra block
+/// in the C2 (V) plane predicted from the C1 (U) DC. Fixing that took
+/// the V plane's interior from 1263 wrong samples (max |err| 12) to
+/// bit-exact and the overall match rate from 99.68% to 99.91%.
+///
+/// The residual (~0.09%, luma max |err| 5, chroma max |err| 2) is
+/// confined to the top and right picture-boundary strips — the region
+/// where blocks overspill the picture edge and motion vectors reach
+/// beyond the reference into the edge-extended half-pel array. Every
+/// sub-pel MC primitive (`interp2by2`, `subpel_predict`, `h_wt`/`v_wt`
+/// edge flattening) has been re-verified against the spec and the
+/// picture interior is bit-exact, so localising the remaining edge
+/// divergence needs an instrumented reference trace that emits
+/// per-block motion vectors — the current trace only carries structural
+/// events (see the report/DOCS-GAP note).
 /// Trace: docs/video/dirac/fixtures/interlaced-720x576-i-then-p-wavelet-5-3/trace.txt.gz
 #[test]
 fn corpus_interlaced_720x576_i_then_p_wavelet_5_3() {
@@ -562,7 +630,15 @@ fn corpus_interlaced_720x576_i_then_p_wavelet_5_3() {
         height: 576,
         n_frames: 2,
         sub: Subsampling::Yuv420,
-        tier: Tier::ReportOnly,
+        // Regression gate: the round-404 per-component intra-DC fix put
+        // the match rate at 99.91% with luma max 5 / chroma max 2.
+        // Bounds sit just outside the measured values so a reopening of
+        // that (or any larger) gap trips the test.
+        tier: Tier::Bounded {
+            min_match_pct: 99.90,
+            max_luma: 6,
+            max_chroma: 3,
+        },
     });
 }
 
