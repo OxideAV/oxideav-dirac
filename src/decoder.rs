@@ -97,10 +97,20 @@ impl DiracDecoder {
         let start = self.scan_cursor;
         // Snapshot each unit (pi + payload bytes) before processing so
         // we can mutate self after the walker's borrow ends.
-        let snap: Vec<(u8, usize, Vec<u8>)> = DataUnitIter::new(&self.buffer[start..])
-            .map(|u| (u.parse_info.parse_code, u.pi_offset, u.payload.to_vec()))
-            .collect();
-        for (parse_code, pi_offset, payload) in snap {
+        let snap: Vec<(crate::parse_info::ParseInfo, usize, Vec<u8>)> =
+            DataUnitIter::new(&self.buffer[start..])
+                .map(|u| (u.parse_info, u.pi_offset, u.payload.to_vec()))
+                .collect();
+        for (unit_pi, pi_offset, payload) in snap {
+            let parse_code = unit_pi.parse_code;
+            if crate::trace::enabled() {
+                crate::trace::emit(&crate::trace::format_parse_unit(
+                    start + pi_offset,
+                    parse_code,
+                    unit_pi.next_parse_offset,
+                    unit_pi.previous_parse_offset,
+                ));
+            }
             let pi = crate::parse_info::ParseInfo {
                 parse_code,
                 next_parse_offset: 0,
@@ -109,6 +119,9 @@ impl DiracDecoder {
             if pi.is_seq_header() {
                 match parse_sequence_header(&payload) {
                     Ok(sh) => {
+                        if crate::trace::enabled() {
+                            emit_sequence_trace(&sh);
+                        }
                         self.last_sequence = Some(sh);
                     }
                     Err(e) => {
@@ -283,6 +296,33 @@ impl Decoder for DiracDecoder {
         self.eof = true;
         self.scan()
     }
+}
+
+/// Emit the `SEQUENCE` trace line for a freshly parsed sequence header
+/// (trace contract base vocabulary; active only under `DIRAC_TRACE`).
+fn emit_sequence_trace(sh: &SequenceHeader) {
+    let chroma = match sh.video_params.chroma_format {
+        ChromaFormat::Yuv444 => 0,
+        ChromaFormat::Yuv422 => 1,
+        ChromaFormat::Yuv420 => 2,
+    };
+    let interlaced = matches!(
+        sh.video_params.source_sampling,
+        crate::video_format::ScanFormat::Interlaced
+    ) as u32;
+    crate::trace::emit(&format!(
+        "SEQUENCE\tprofile={}\tlevel={}\twidth={}\theight={}\tchroma_format={chroma}\tbit_depth={}\tinterlaced={interlaced}\ttop_field_first={}\tframerate={}/{}\tversion={}.{}",
+        sh.parse_parameters.profile,
+        sh.parse_parameters.level,
+        sh.luma_width,
+        sh.luma_height,
+        sh.luma_depth,
+        sh.video_params.top_field_first as u32,
+        sh.video_params.frame_rate_numer,
+        sh.video_params.frame_rate_denom,
+        sh.parse_parameters.version_major,
+        sh.parse_parameters.version_minor,
+    ));
 }
 
 /// Map a decoded Dirac picture (Y/U/V as `Vec<i32>` 0..2^depth) into

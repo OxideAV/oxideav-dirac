@@ -607,6 +607,23 @@ pub fn motion_compensate(
             );
         }
     }
+    // Optional MC_PLANE trace side-channel (`DIRAC_TRACE_MC`): checksum
+    // the OBMC prediction plane — after the 1/64 weight normalisation,
+    // before the residual add and before clipping — so an MC error can
+    // be told apart from a residual/IDWT error.
+    if crate::trace::mc_enabled() {
+        let pred: Vec<i16> = mc_tmp
+            .iter()
+            .map(|&v| fshr(v as i64 + 32, 6) as i16)
+            .collect();
+        crate::trace::emit(&crate::trace::format_mc_plane(
+            crate::trace::picture_number(),
+            params.component,
+            params.len_x,
+            params.len_y,
+            &pred,
+        ));
+    }
     let bit_depth = params.bit_depth();
     let half = if bit_depth == 0 {
         1i32

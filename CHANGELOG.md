@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Env-gated decode tracing (`DIRAC_TRACE`, `DIRAC_TRACE_FILE`,
+  `DIRAC_TRACE_MC`) implementing the docs trace-contract vocabulary:
+  `PARSE_UNIT` / `SEQUENCE` / `PICTURE` / `MOTION` / `MOTION_BLOCK` /
+  `MOTION_GLOBAL` / per-block `MOTION_MV` (final MV + predictor +
+  residual + DC per reference) and the opt-in `MC_PLANE` SHA-256 of the
+  pre-residual OBMC prediction plane (round-408).
+- `WaveletFilter::to_index` — inverse of `from_index` (round-408).
+
 ### Fixed
 
 - §15.8.10 out-of-frame sub-pel fetches now clamp the **integer-pel

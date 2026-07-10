@@ -195,6 +195,14 @@ pub fn parse_picture_prediction_parameters(
         if num_refs == 2 {
             global2 = Some(parse_global_motion_parameters(r));
         }
+        if crate::trace::enabled() {
+            if let Some(g) = &global1 {
+                crate::trace::emit(&crate::trace::format_motion_global(0, g, mv_precision));
+            }
+            if let Some(g) = &global2 {
+                crate::trace::emit(&crate::trace::format_motion_global(1, g, mv_precision));
+            }
+        }
     }
 
     // §11.2.7 picture_prediction_mode.
@@ -324,6 +332,20 @@ pub fn decode_block_motion_data(
         global2: params.global2.clone(),
     };
 
+    if crate::trace::enabled() {
+        crate::trace::emit(&crate::trace::format_motion(sbx, sby, num_refs));
+    }
+    // Predictor/residual capture for the MOTION_MV trace lines — only
+    // allocated when tracing is active.
+    let mut trace_sides: Option<Vec<[crate::trace::MvSide; 2]>> = if crate::trace::enabled() {
+        Some(vec![
+            [crate::trace::MvSide::default(); 2];
+            (bx * by) as usize
+        ])
+    } else {
+        None
+    };
+
     // 1. Superblock split modes.
     decode_sb_splits(r, &mut motion)?;
     // 2. Prediction modes — the §12.3.5 `block_ref_mode` reads BOTH the
@@ -342,15 +364,49 @@ pub fn decode_block_motion_data(
         },
     )?;
     // 3. Motion vectors.
-    decode_vector_elements(r, &mut motion, 1, 0)?;
-    decode_vector_elements(r, &mut motion, 1, 1)?;
+    decode_vector_elements(r, &mut motion, 1, 0, &mut trace_sides)?;
+    decode_vector_elements(r, &mut motion, 1, 1, &mut trace_sides)?;
     if num_refs == 2 {
-        decode_vector_elements(r, &mut motion, 2, 0)?;
-        decode_vector_elements(r, &mut motion, 2, 1)?;
+        decode_vector_elements(r, &mut motion, 2, 0, &mut trace_sides)?;
+        decode_vector_elements(r, &mut motion, 2, 1, &mut trace_sides)?;
     }
     // 4. DC values for intra blocks.
     for c in 0..3 {
         decode_dc_values(r, &mut motion, c)?;
+    }
+
+    // MOTION_BLOCK / MOTION_MV trace walk: superblocks in raster order,
+    // each superblock's coded blocks in raster/step order — the same
+    // per-block decode order the trace contract specifies. Emitted
+    // after the wire's per-field arith blocks (splits, modes, vectors,
+    // DCs) have all decoded, so every line carries the block's final
+    // reference mask, MVs and DC alongside the captured
+    // predictor/residual pair.
+    if let Some(sides) = &trace_sides {
+        for ysb in 0..motion.superblocks_y {
+            for xsb in 0..motion.superblocks_x {
+                let split = motion.split(xsb, ysb);
+                crate::trace::emit(&crate::trace::format_motion_block(xsb, ysb, split));
+                let block_count = 1u32 << split;
+                let step = 4 / block_count;
+                for q in 0..block_count {
+                    for p in 0..block_count {
+                        let bx_pos = 4 * xsb + p * step;
+                        let by_pos = 4 * ysb + q * step;
+                        let block = motion.get_block(bx_pos, by_pos);
+                        let idx = (by_pos * motion.blocks_x + bx_pos) as usize;
+                        crate::trace::emit(&crate::trace::format_motion_mv(
+                            xsb,
+                            ysb,
+                            bx_pos,
+                            by_pos,
+                            block,
+                            &sides[idx],
+                        ));
+                    }
+                }
+            }
+        }
     }
     Ok(motion)
 }
@@ -548,6 +604,7 @@ fn decode_vector_elements(
     motion: &mut PictureMotionData,
     ref_num: u32,
     dirn: u32,
+    trace_sides: &mut Option<Vec<[crate::trace::MvSide; 2]>>,
 ) -> Result<(), PictureError> {
     let length = r.read_uint() as usize;
     let (mut dec, _) = arith_from_reader(r, length);
@@ -568,7 +625,17 @@ fn decode_vector_elements(
                 for p in 0..block_count {
                     let bx = 4 * xsb + p * step;
                     let by = 4 * ysb + q * step;
-                    block_vector(&mut dec, &mut bank, motion, bx, by, ref_num, dirn, &follow);
+                    block_vector(
+                        &mut dec,
+                        &mut bank,
+                        motion,
+                        bx,
+                        by,
+                        ref_num,
+                        dirn,
+                        &follow,
+                        trace_sides,
+                    );
                     propagate(motion, bx, by, step, PropField::Vector);
                 }
             }
@@ -590,6 +657,7 @@ fn block_vector(
     ref_num: u32,
     dirn: u32,
     follow: &[usize],
+    trace_sides: &mut Option<Vec<[crate::trace::MvSide; 2]>>,
 ) {
     let block = motion.get_block(x, y);
     // Only decode a residual if this ref is used AND not a global block.
@@ -606,6 +674,20 @@ fn block_vector(
     // the same convention. Use `wrapping_add` so an out-of-spec stream
     // produces a wrong-but-bounded MV instead of panicking.
     let value = residual.wrapping_add(pred);
+    if let Some(sides) = trace_sides {
+        let side = &mut sides[(y * motion.blocks_x + x) as usize][(ref_num - 1) as usize];
+        side.coded = true;
+        match dirn {
+            0 => {
+                side.pred.0 = pred;
+                side.res.0 = residual;
+            }
+            _ => {
+                side.pred.1 = pred;
+                side.res.1 = residual;
+            }
+        }
+    }
     let block = motion.get_block_mut(x, y);
     let idx = (ref_num - 1) as usize;
     match dirn {

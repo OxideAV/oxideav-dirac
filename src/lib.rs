@@ -173,6 +173,7 @@ pub mod quant;
 pub mod sequence;
 pub mod stream;
 pub mod subband;
+pub(crate) mod trace;
 pub mod video_format;
 pub mod wavelet;
 

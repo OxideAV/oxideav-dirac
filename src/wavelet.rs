@@ -64,6 +64,20 @@ impl WaveletFilter {
         })
     }
 
+    /// Inverse of [`WaveletFilter::from_index`]: the
+    /// `state[WAVELET INDEX]` wire value (0..=6) for this filter.
+    pub fn to_index(self) -> u32 {
+        match self {
+            Self::DeslauriersDubuc9_7 => 0,
+            Self::LeGall5_3 => 1,
+            Self::DeslauriersDubuc13_7 => 2,
+            Self::Haar0 => 3,
+            Self::Haar1 => 4,
+            Self::Fidelity => 5,
+            Self::Daubechies9_7 => 6,
+        }
+    }
+
     /// `filter_shift()` (Tables 15.1-15.7): the number of bits to right
     /// shift after each 2-D synthesis pass.
     pub fn filter_shift(self) -> u32 {

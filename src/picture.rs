@@ -345,6 +345,7 @@ fn decode_low_delay_picture(
         return Err(PictureError::Truncated("picture number"));
     }
     let picture_number = r.read_uint_lit(4);
+    crate::trace::set_picture_number(picture_number);
 
     // §12.3 wavelet_transform: for intra pictures, no zero_residual flag.
     r.byte_align();
@@ -352,6 +353,20 @@ fn decode_low_delay_picture(
         parse_transform_parameters(&mut r, profile, sequence.parse_parameters.version_major)?;
 
     r.byte_align();
+
+    if crate::trace::enabled() {
+        emit_picture_trace(
+            picture_number,
+            parse_info.parse_code,
+            0,
+            0,
+            params.wavelet.to_index(),
+            params.dwt_depth,
+            params.slices_x,
+            params.slices_y,
+            false,
+        );
+    }
 
     let luma_w = sequence.luma_width;
     let luma_h = sequence.luma_height;
@@ -458,6 +473,34 @@ fn decode_low_delay_picture(
     })
 }
 
+/// Emit the `PICTURE` trace line (trace contract base vocabulary).
+/// `num_x` / `num_y` are the low-delay slice-grid dimensions (0 for
+/// core-syntax pictures); `wavelet` / `depth` are 0 when the picture
+/// carries no transform parameters (`zero_res=1`).
+#[allow(clippy::too_many_arguments)]
+fn emit_picture_trace(
+    pic_num: u32,
+    parse_code: u8,
+    num_refs: u32,
+    ref_pic_count: u32,
+    wavelet: u32,
+    depth: u32,
+    num_x: u32,
+    num_y: u32,
+    zero_res: bool,
+) {
+    let low_delay = ((parse_code & 0x88) == 0x88) as u32;
+    let hq = ((parse_code & 0xF8) == 0xE8) as u32;
+    let ld = ((parse_code & 0xF8) == 0xC8 || parse_code == 0x88) as u32;
+    let is_arith = ((parse_code & 0x48) == 0x08) as u32;
+    let dc_prediction = ((parse_code & 0x28) == 0x08) as u32;
+    crate::trace::emit(&format!(
+        "PICTURE\tpic_num={pic_num}\tparse_code=0x{parse_code:02x}\tpicture_type={}\tnum_refs={num_refs}\tref_pic_count={ref_pic_count}\twavelet_index={wavelet}\twavelet_depth={depth}\tlow_delay={low_delay}\thq={hq}\tld={ld}\tis_arith={is_arith}\tdc_prediction={dc_prediction}\tnum_x={num_x}\tnum_y={num_y}\tzero_res={}",
+        num_refs + 1,
+        zero_res as u32,
+    ));
+}
+
 /// Full core-syntax picture decode (AC or VLC, intra or inter).
 fn decode_core_syntax_picture(
     payload: &[u8],
@@ -474,6 +517,7 @@ fn decode_core_syntax_picture(
         return Err(PictureError::Truncated("picture number"));
     }
     let picture_number = r.read_uint_lit(4);
+    crate::trace::set_picture_number(picture_number);
 
     // Inter pictures: §9.6.1 reference deltas, §11.2 picture prediction
     // parameters + block motion data, then §11.3 wavelet residue
@@ -524,6 +568,11 @@ fn decode_core_syntax_picture(
     let chroma_w = sequence.chroma_width;
     let chroma_h = sequence.chroma_height;
 
+    // Wavelet index / depth captured for the PICTURE trace line (0/0
+    // when the picture carries no transform parameters).
+    let mut traced_wavelet = 0u32;
+    let mut traced_depth = 0u32;
+
     // Decode (or zero) the wavelet residue, returning cropped planes.
     let (mut y_plane, mut u_plane, mut v_plane) = if zero_residual {
         (
@@ -540,6 +589,8 @@ fn decode_core_syntax_picture(
         if dwt_depth > 6 {
             return Err(PictureError::UnsupportedDwtDepth(dwt_depth));
         }
+        traced_wavelet = w_idx;
+        traced_depth = dwt_depth;
         // §11.3.3 codeblock_parameters.
         let (codeblocks, codeblock_mode) =
             crate::picture_core::parse_codeblock_parameters(&mut r, dwt_depth)?;
@@ -570,6 +621,31 @@ fn decode_core_syntax_picture(
             crop_to(&v_data, chroma_w as usize, chroma_h as usize),
         )
     };
+
+    if crate::trace::enabled() {
+        let num_refs = parse_info.num_refs() as u32;
+        let ref_pic_count = match &inter_ctx {
+            Some(ctx) => {
+                find_ref(references, ctx.ref1_num).is_some() as u32
+                    + ctx
+                        .ref2_num
+                        .map(|n| find_ref(references, n).is_some() as u32)
+                        .unwrap_or(0)
+            }
+            None => 0,
+        };
+        emit_picture_trace(
+            picture_number,
+            parse_info.parse_code,
+            num_refs,
+            ref_pic_count,
+            traced_wavelet,
+            traced_depth,
+            0,
+            0,
+            zero_residual,
+        );
+    }
 
     // §15.8: motion-compensate (inter only) or just clip (intra).
     if let Some(ctx) = inter_ctx {
