@@ -679,7 +679,7 @@ fn motion_compensate_all(
         sequence.luma_height as usize,
         pred,
         motion,
-        false,
+        /* component */ 0,
         sequence.luma_depth,
         sequence.chroma_depth,
         chroma_h_ratio,
@@ -693,7 +693,7 @@ fn motion_compensate_all(
         sequence.chroma_height as usize,
         pred,
         motion,
-        true,
+        /* component */ 1,
         sequence.luma_depth,
         sequence.chroma_depth,
         chroma_h_ratio,
@@ -707,7 +707,7 @@ fn motion_compensate_all(
         sequence.chroma_height as usize,
         pred,
         motion,
-        true,
+        /* component */ 2,
         sequence.luma_depth,
         sequence.chroma_depth,
         chroma_h_ratio,
@@ -724,7 +724,7 @@ fn mc_one(
     comp_h: usize,
     pred: &crate::picture_inter::PicturePredictionParams,
     motion: &crate::picture_inter::PictureMotionData,
-    is_chroma: bool,
+    component: usize,
     luma_depth: u32,
     chroma_depth: u32,
     chroma_h_ratio: u32,
@@ -732,6 +732,7 @@ fn mc_one(
     ref1: (&[i32], usize, usize),
     ref2: Option<(&[i32], usize, usize)>,
 ) {
+    let is_chroma = component != 0;
     let (xblen, yblen, xbsep, ybsep) = if is_chroma {
         (
             (pred.luma_xblen / chroma_h_ratio) as usize,
@@ -758,6 +759,7 @@ fn mc_one(
         blocks_y: pred.blocks_y,
         mv_precision: pred.mv_precision,
         is_chroma,
+        component,
         chroma_h_ratio,
         chroma_v_ratio,
         refs_wt_precision: pred.refs_wt_precision,

@@ -2752,7 +2752,7 @@ fn build_obmc_prediction(
         sequence,
         pred,
         motion,
-        false,
+        /* component */ 0,
         chroma_h_ratio,
         chroma_v_ratio,
         ref_y,
@@ -2763,7 +2763,7 @@ fn build_obmc_prediction(
         sequence,
         pred,
         motion,
-        true,
+        /* component */ 1,
         chroma_h_ratio,
         chroma_v_ratio,
         ref_u,
@@ -2774,7 +2774,7 @@ fn build_obmc_prediction(
         sequence,
         pred,
         motion,
-        true,
+        /* component */ 2,
         chroma_h_ratio,
         chroma_v_ratio,
         ref_v,
@@ -2794,13 +2794,14 @@ fn build_obmc_prediction_one(
     sequence: &SequenceHeader,
     pred: &PicturePredictionParams,
     motion: &PictureMotionData,
-    is_chroma: bool,
+    component: usize,
     chroma_h_ratio: u32,
     chroma_v_ratio: u32,
     ref_plane: &[u8],
     comp_w: usize,
     comp_h: usize,
 ) -> Vec<i32> {
+    let is_chroma = component != 0;
     let depth = if is_chroma {
         sequence.chroma_depth
     } else {
@@ -2835,6 +2836,7 @@ fn build_obmc_prediction_one(
         blocks_y: pred.blocks_y,
         mv_precision: pred.mv_precision,
         is_chroma,
+        component,
         chroma_h_ratio,
         chroma_v_ratio,
         refs_wt_precision: pred.refs_wt_precision,
@@ -4761,7 +4763,7 @@ fn build_obmc_prediction_bipred(
         sequence,
         pred,
         motion,
-        false,
+        /* component */ 0,
         chroma_h_ratio,
         chroma_v_ratio,
         ref1_y,
@@ -4773,7 +4775,7 @@ fn build_obmc_prediction_bipred(
         sequence,
         pred,
         motion,
-        true,
+        /* component */ 1,
         chroma_h_ratio,
         chroma_v_ratio,
         ref1_u,
@@ -4785,7 +4787,7 @@ fn build_obmc_prediction_bipred(
         sequence,
         pred,
         motion,
-        true,
+        /* component */ 2,
         chroma_h_ratio,
         chroma_v_ratio,
         ref1_v,
@@ -4801,7 +4803,7 @@ fn build_obmc_prediction_one_bipred(
     sequence: &SequenceHeader,
     pred: &PicturePredictionParams,
     motion: &PictureMotionData,
-    is_chroma: bool,
+    component: usize,
     chroma_h_ratio: u32,
     chroma_v_ratio: u32,
     ref1_plane: &[u8],
@@ -4809,6 +4811,7 @@ fn build_obmc_prediction_one_bipred(
     comp_w: usize,
     comp_h: usize,
 ) -> Vec<i32> {
+    let is_chroma = component != 0;
     let depth = if is_chroma {
         sequence.chroma_depth
     } else {
@@ -4843,6 +4846,7 @@ fn build_obmc_prediction_one_bipred(
         blocks_y: pred.blocks_y,
         mv_precision: pred.mv_precision,
         is_chroma,
+        component,
         chroma_h_ratio,
         chroma_v_ratio,
         refs_wt_precision: pred.refs_wt_precision,

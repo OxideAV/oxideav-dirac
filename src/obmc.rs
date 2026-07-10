@@ -346,6 +346,13 @@ pub struct McParams {
     pub blocks_y: u32,
     pub mv_precision: u32,
     pub is_chroma: bool,
+    /// Component index for §15.8.5 intra-block DC lookup: `0` = luma (Y),
+    /// `1` = first chroma (C1 / U), `2` = second chroma (C2 / V). The
+    /// spec reads `state[BLOCK DATA][j][i][dc][c]` indexed by the full
+    /// component `c`, so C1 and C2 must select **different** DC values —
+    /// collapsing both chroma planes onto index 1 makes every intra
+    /// block in the V plane predict from the U plane's DC.
+    pub component: usize,
     pub chroma_h_ratio: u32,
     pub chroma_v_ratio: u32,
     pub refs_wt_precision: u32,
@@ -419,10 +426,12 @@ pub fn block_mc(
             let q = (y - ystart) as usize;
             let val: i64 = match mode {
                 RefPredMode::Intra => {
-                    // DC value per component — intra blocks use their
-                    // DC value directly (no reference weight).
-                    let dc_idx = if params.is_chroma { 1 } else { 0 };
-                    block.dc[dc_idx] as i64
+                    // §15.8.5: intra blocks use their per-component DC
+                    // value directly (no reference weight). `component`
+                    // is the full Y/C1/C2 index — C1 and C2 carry
+                    // distinct DC values, so this must not collapse both
+                    // chroma planes onto a single index.
+                    block.dc[params.component] as i64
                 }
                 RefPredMode::Ref1Only => {
                     let (p1, w1, h1) = ref1_plane.expect("ref1 required");
@@ -883,6 +892,7 @@ mod tests {
             blocks_y,
             mv_precision: 0,
             is_chroma: false,
+            component: 0,
             chroma_h_ratio: 1,
             chroma_v_ratio: 1,
             refs_wt_precision: 1,
@@ -964,6 +974,7 @@ mod tests {
             blocks_y,
             mv_precision: 0,
             is_chroma: false,
+            component: 0,
             chroma_h_ratio: 1,
             chroma_v_ratio: 1,
             refs_wt_precision: 1,
@@ -984,6 +995,85 @@ mod tests {
                     ref_plane[y * w + x],
                     "mismatch at ({x}, {y})"
                 );
+            }
+        }
+    }
+
+    /// §15.8.5 intra-block DC is indexed by the **full** component
+    /// `c` (Y / C1 / C2). An all-intra picture whose blocks carry three
+    /// distinct DC values (one per component) must reconstruct each
+    /// plane from *its own* DC. This pins the fix for the bug where
+    /// `block_mc` collapsed both chroma planes onto DC index 1, so the
+    /// C2 (V) plane predicted every intra block from the C1 (U) DC.
+    #[test]
+    fn intra_block_dc_is_selected_per_component() {
+        use crate::picture_inter::{BlockData, PictureMotionData, RefPredMode};
+        let w = 16usize;
+        let h = 16usize;
+        // Distinct DC per component, all inside the 8-bit signed range.
+        let dc_y = 11i32;
+        let dc_c1 = -20i32;
+        let dc_c2 = 47i32;
+        let blocks_x = 4;
+        let blocks_y = 4;
+        let mut blocks = Vec::with_capacity((blocks_x * blocks_y) as usize);
+        for _ in 0..blocks_x * blocks_y {
+            blocks.push(BlockData {
+                rmode: RefPredMode::Intra,
+                gmode: false,
+                mv: [(0, 0); 2],
+                dc: [dc_y, dc_c1, dc_c2],
+            });
+        }
+        let motion = PictureMotionData {
+            blocks_x,
+            blocks_y,
+            superblocks_x: 1,
+            superblocks_y: 1,
+            sb_split: vec![2],
+            blocks,
+            global1: None,
+            global2: None,
+        };
+        // Reference planes are irrelevant for intra blocks, but a
+        // reference must be supplied for the driver.
+        let ref_plane = vec![0i32; w * h];
+        for (component, want) in [(0usize, dc_y), (1, dc_c1), (2, dc_c2)] {
+            let params = McParams {
+                len_x: w,
+                len_y: h,
+                xblen: 8,
+                yblen: 8,
+                xbsep: 4,
+                ybsep: 4,
+                blocks_x,
+                blocks_y,
+                mv_precision: 0,
+                is_chroma: component != 0,
+                component,
+                chroma_h_ratio: 1,
+                chroma_v_ratio: 1,
+                refs_wt_precision: 1,
+                ref1_wt: 1,
+                ref2_wt: 1,
+                luma_depth: 8,
+                chroma_depth: 8,
+            };
+            let mut pic = vec![0i32; w * h];
+            motion_compensate(&mut pic, &params, &motion, Some((&ref_plane, w, h)), None);
+            // Every interior pixel reconstructs to this component's DC:
+            // the OBMC weights across overlapping all-intra blocks sum to
+            // 64, and the residue is zero.
+            for y in 1..(h - 1) {
+                for x in 1..(w - 1) {
+                    assert_eq!(
+                        pic[y * w + x],
+                        want,
+                        "component {component}: pixel ({x},{y}) should reconstruct \
+                         to its own DC {want}, got {}",
+                        pic[y * w + x]
+                    );
+                }
             }
         }
     }
