@@ -17,6 +17,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pre-residual OBMC prediction plane (round-408).
 - `WaveletFilter::to_index` — inverse of `from_index` (round-408).
 
+### Changed
+
+- Marked the crate's internal `pub` surface `#[doc(hidden)]` (wavelet /
+  OBMC / entropy / encoder / fragment / bit-IO plumbing exposed only for
+  the crate's own tests, benches, fuzz oracles and examples) so
+  cargo-semver-checks no longer treats it as stable API. The documented
+  stable surface is unchanged: the `decoder` entry points
+  (`make_decoder`, `DiracDecoder`), the registry hooks (`register`,
+  `register_codecs`, `CODEC_ID_STR`), and the `SequenceHeader` graph they
+  expose. This is a documentation/semver-visibility change only — no
+  item's visibility, signature or behaviour changed, so all callers keep
+  compiling.
+
 ### Fixed
 
 - Inter encoder: §11.2.2 block parameters are emitted as custom

@@ -102,6 +102,8 @@ pub struct SequenceHeader {
 }
 
 /// Error variants produced while parsing a sequence header.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseError {
     /// `base_video_format` index is outside the table we know.
@@ -136,6 +138,8 @@ impl std::error::Error for ParseError {}
 /// leading parse info). The slice should start at the sequence-header
 /// payload; any trailing bytes belonging to subsequent data units are
 /// ignored.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn parse_sequence_header(data: &[u8]) -> Result<SequenceHeader, ParseError> {
     let mut r = BitReader::new(data);
 

@@ -135,6 +135,8 @@ impl SignalRange {
 }
 
 /// Preset frame rate (§10.3.5, Table 10.3). Indices 1..=10.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn preset_frame_rate(index: u32) -> Option<(u32, u32)> {
     match index {
         1 => Some((24000, 1001)),
@@ -152,6 +154,8 @@ pub fn preset_frame_rate(index: u32) -> Option<(u32, u32)> {
 }
 
 /// Preset pixel aspect ratio (§10.3.6, Table 10.4). Indices 1..=6.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub fn preset_pixel_aspect_ratio(index: u32) -> Option<(u32, u32)> {
     match index {
         1 => Some((1, 1)),
@@ -167,6 +171,8 @@ pub fn preset_pixel_aspect_ratio(index: u32) -> Option<(u32, u32)> {
 /// Base video format defaults (Annex C, Tables C.1-C.3). Only the
 /// fields that are required to decode the bitstream are stored here;
 /// colour spec / clean-area metadata is carried along but not used.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BaseVideoFormat {
     pub name: &'static str,

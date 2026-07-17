@@ -156,25 +156,75 @@
 
 #![allow(clippy::needless_range_loop)]
 
+// The stable public surface is intentionally small: the decode entry
+// points (`decoder`), the registry hooks (`register`, `register_codecs`,
+// `CODEC_ID_STR`), and the sequence/video-format types those signatures
+// expose. Every other module below is internal wavelet / OBMC / entropy /
+// encoder / fragment plumbing that is only `pub` so the crate's own
+// tests, benches, fuzz oracles and examples can drive it directly; it is
+// marked `#[doc(hidden)]` so cargo-semver-checks does not treat it as
+// part of the stable API. `#[doc(hidden)]` changes documentation and
+// semver visibility only — it is not a visibility change, so all callers
+// keep compiling.
+
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod arith;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod bits;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod bitwriter;
 pub mod decoder;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod encoder;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod encoder_inter;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod encoder_intra_core;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod fragment;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod obmc;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod parse_info;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod picture;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod picture_core;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod picture_inter;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod quant;
+// Stays visible: `SequenceHeader` appears in the stable
+// `DiracDecoder::last_sequence` signature. Internal items inside are
+// hidden individually — cargo-semver-checks does not credit re-exports
+// out of a `#[doc(hidden)]` module.
 pub mod sequence;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod stream;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod subband;
 pub(crate) mod trace;
+// Stays visible: `ChromaFormat` / `ScanFormat` / `SignalRange` are
+// reachable through the stable `SequenceHeader`. Internal items inside
+// are hidden individually.
 pub mod video_format;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub mod wavelet;
 
 use oxideav_core::{CodecCapabilities, CodecId, CodecTag};
