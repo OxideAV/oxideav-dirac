@@ -53,6 +53,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   4:2:0) and 13-bit (VLC, 4:2:2, MSB-aligned surface) — the
   core-syntax decode path is now deep-colour-proven alongside the
   HQ/LD slice paths (round-417).
+- Three deep-colour fixtures staged in the docs corpus and pinned
+  `BitExact` in the corpus driver (now 12/12): HQ 10-bit (Table 10.5
+  preset 3) and 12-bit (preset 4) with reference-cross-decoded ground
+  truth, and HQ 16-bit via a §10.3.8 index-0 custom range with an
+  analytically-derivable ground truth. The corpus harness gained a
+  `bytes_per_sample` axis for the 2-byte-per-sample surfaces. The
+  shared deep test pattern was switched to a full-range multiplicative
+  mix (`(x*17 + y*31 + seed*7) * 2654435761 mod 2^d`) — the old
+  additive ramp topped out near 3087 and left every depth above
+  11 bits with its upper range unexercised (round-417).
 - 11/12-bit 4:2:2 and 4:4:4 streams now decode to the native
   `Yuv422P12Le` / `Yuv444P12Le` surfaces instead of clipping to
   10 bits (the fallback used before oxideav-core 0.1.30 gained those

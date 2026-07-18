@@ -69,17 +69,20 @@ fn plane_as_u16(data: &[u8]) -> Vec<u16> {
         .collect()
 }
 
-/// Deterministic high-bit-depth ramp filling `[0, 2^depth - 1]` so the
-/// full-range path (offset/excursion centred symmetrically) is exercised
-/// edge-to-edge. The pattern mixes the two coordinates plus a seed so
-/// neighbouring samples differ (a flat plane would hide many shift bugs).
+/// Deterministic high-bit-depth pattern filling `[0, 2^depth - 1]` so
+/// the full-range path (offset/excursion centred symmetrically) is
+/// exercised edge-to-edge. The coordinate mix is spread over the whole
+/// range by a large odd multiplier — a plain additive ramp on a 64×64
+/// picture tops out near 3087 and would leave every depth above 11
+/// bits with its upper range untouched (hiding shift/clip bugs in
+/// exactly the band deep colour adds).
 fn ramp_plane(w: usize, h: usize, depth: u32, seed: u32) -> Vec<u16> {
-    let max = (1u32 << depth) - 1;
+    let max = (1u64 << depth) - 1;
     let mut out = Vec::with_capacity(w * h);
     for y in 0..h {
         for x in 0..w {
-            let v = (x as u32 * 17 + y as u32 * 31 + seed * 7) % (max + 1);
-            out.push(v as u16);
+            let mix = x as u64 * 17 + y as u64 * 31 + seed as u64 * 7;
+            out.push(((mix * 2654435761) % (max + 1)) as u16);
         }
     }
     out
@@ -589,14 +592,17 @@ fn hq_10bit_bit_exact_across_all_dwt_depths() {
 
         // 10-bit coefficients are ~4× the 8-bit magnitude, so an HQ
         // slice's per-component byte run can exceed the 255-unit length
-        // byte at scaler 1. A larger `slice_size_scaler` widens the
-        // length-byte unit (`len_byte * scaler` bytes) without changing
-        // the decoded coefficients — qindex 0 stays bit-exact.
+        // byte at scaler 1 (and the 2×2 slice grid at depth 5 packs a
+        // 32×32-sample component run per slice). A larger
+        // `slice_size_scaler` widens the length-byte unit
+        // (`len_byte * scaler` bytes) without changing the decoded
+        // coefficients — qindex 0 stays bit-exact.
         let params = if depth <= 4 {
             let mut p = EncoderParams::default_hq(WaveletFilter::LeGall5_3, depth);
             p.slices_x = sx;
             p.slices_y = sy;
-            p.slice_size_scaler = 8;
+            // Depth 4 shares the 2×2 grid (32×32-sample slices).
+            p.slice_size_scaler = 16;
             p
         } else {
             EncoderParams {
@@ -605,7 +611,7 @@ fn hq_10bit_bit_exact_across_all_dwt_depths() {
                 slices_x: sx,
                 slices_y: sy,
                 slice_prefix_bytes: 0,
-                slice_size_scaler: 8,
+                slice_size_scaler: 16,
                 quant_matrix: zero_matrix(5),
                 custom_quant_matrix: true,
                 qindex: 0,

@@ -342,15 +342,17 @@ fn ffmpeg_decodes_our_hq_stream_lossless_q0() {
     assert!(v_psnr >= 48.0, "V PSNR {v_psnr:.2} dB below 48 dB");
 }
 
-/// Deterministic deep ramp shared with the high-bit-depth round-trip
-/// suite and the `emit_deep_stream` example: `x*17 + y*31 + seed*7
-/// mod 2^depth`.
+/// Deterministic deep pattern shared with the high-bit-depth
+/// round-trip suite and the `emit_deep_stream` example:
+/// `(x*17 + y*31 + seed*7) * 2654435761 mod 2^depth` — the large odd
+/// multiplier spreads the mix over the full range at every depth.
 fn deep_ramp(w: usize, h: usize, depth: u32, seed: u32) -> Vec<u16> {
     let max = (1u64 << depth) - 1;
     let mut out = Vec::with_capacity(w * h);
     for y in 0..h {
         for x in 0..w {
-            out.push(((x as u64 * 17 + y as u64 * 31 + seed as u64 * 7) % (max + 1)) as u16);
+            let mix = x as u64 * 17 + y as u64 * 31 + seed as u64 * 7;
+            out.push(((mix * 2654435761) % (max + 1)) as u16);
         }
     }
     out

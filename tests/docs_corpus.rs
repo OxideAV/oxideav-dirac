@@ -179,6 +179,15 @@ struct CorpusCase {
     n_frames: usize,
     sub: Subsampling,
     tier: Tier,
+    /// Bytes per stored sample, in both our decoder's output planes
+    /// and `expected.yuv`: 1 for the 8-bit fixtures, 2 for the
+    /// deep-colour fixtures (LE 16-bit words — `Yuv420P10/12/16Le`
+    /// packing on our side, the matching rawvideo layout in the
+    /// reference dump). The byte-level comparison is depth-agnostic
+    /// for the `BitExact` tier (equal samples ⇔ equal bytes); the
+    /// PSNR / max-error report lines are byte-based and only
+    /// meaningful for 1-byte fixtures.
+    bytes_per_sample: usize,
 }
 
 struct DecodeReport {
@@ -228,7 +237,7 @@ fn decode_fixture(case: &CorpusCase) -> Option<DecodeReport> {
         trace_for_log,
     );
 
-    let frame_size = case.sub.frame_bytes(case.width, case.height);
+    let frame_size = case.sub.frame_bytes(case.width, case.height) * case.bytes_per_sample;
     assert_eq!(
         yuv_ref.len(),
         case.n_frames * frame_size,
@@ -253,8 +262,8 @@ fn decode_fixture(case: &CorpusCase) -> Option<DecodeReport> {
     let _ = dec.flush();
 
     let (cw, ch) = case.sub.chroma_dims(case.width, case.height);
-    let y_size = case.width * case.height;
-    let uv_size = cw * ch;
+    let y_size = case.width * case.height * case.bytes_per_sample;
+    let uv_size = cw * ch * case.bytes_per_sample;
 
     // Drain every available `VideoFrame` first so we can sort them by
     // pts (== picture_number when the packet has no explicit pts, which
@@ -468,7 +477,9 @@ fn evaluate(case: &CorpusCase) {
 // `chroma-422-720x576`), the two integer-pel inter cases (`i-then-p`,
 // `i-p-b`) and — since the round-408 integer-part-clamp edge-extension
 // fix in the §15.8.10 sub-pel fetch — the quarter-pel
-// `interlaced-720x576-i-then-p-wavelet-5-3` case as well.
+// `interlaced-720x576-i-then-p-wavelet-5-3` case as well. Round-417
+// added the three deep-colour HQ fixtures (`hq-10bit-preset3`,
+// `hq-12bit-preset4`, `hq-16bit-fullrange`), bit-exact from staging.
 //
 // Trace files (referenced in `evaluate()` via the `eprintln!` header)
 // live alongside each fixture and capture the per-step `PARSE_UNIT` /
@@ -490,6 +501,7 @@ fn corpus_i_only_tiny_320x240() {
         // Bit-exact since round-118: the §5.4 unbiased-mean (`+1`)
         // rounding in intra DC subband prediction was corrected.
         tier: Tier::BitExact,
+        bytes_per_sample: 1,
     });
 }
 
@@ -511,6 +523,7 @@ fn corpus_i_then_p_320x240() {
         // inter pictures closed the residual ~1% pixel gap left after
         // round-125's §13.2.1 inter quant-offset fix.
         tier: Tier::BitExact,
+        bytes_per_sample: 1,
     });
 }
 
@@ -536,6 +549,7 @@ fn corpus_i_p_b_320x240() {
         // inter pictures. Both the P frame and the B frame now match
         // ffmpeg byte-for-byte across all three pictures (I, P, B).
         tier: Tier::BitExact,
+        bytes_per_sample: 1,
     });
 }
 
@@ -554,6 +568,7 @@ fn corpus_vc2_low_delay_tiny_320x240() {
         sub: Subsampling::Yuv420,
         // Bit-exact since round-118 (intra DC prediction `mean` fix).
         tier: Tier::BitExact,
+        bytes_per_sample: 1,
     });
 }
 
@@ -572,6 +587,7 @@ fn corpus_vc2_low_delay_3pics_320x240() {
         sub: Subsampling::Yuv420,
         // Bit-exact since round-118 (intra DC prediction `mean` fix).
         tier: Tier::BitExact,
+        bytes_per_sample: 1,
     });
 }
 
@@ -590,6 +606,7 @@ fn corpus_interlaced_720x576_i_only() {
         // Bit-exact since round-118 (intra DC prediction `mean` fix);
         // also confirms the depth-4 IDWT recursion is correct.
         tier: Tier::BitExact,
+        bytes_per_sample: 1,
     });
 }
 
@@ -625,6 +642,7 @@ fn corpus_interlaced_720x576_i_then_p_wavelet_5_3() {
         // Bit-exact since round-408 (integer-part-clamp edge extension
         // in the §15.8.10 sub-pel fetch).
         tier: Tier::BitExact,
+        bytes_per_sample: 1,
     });
 }
 
@@ -655,6 +673,7 @@ fn corpus_edge_mc_probes_320x240() {
         // Bit-exact from the day the fixture was staged (round-408, the
         // same round the integer-part-clamp edge extension landed).
         tier: Tier::BitExact,
+        bytes_per_sample: 1,
     });
 }
 
@@ -675,5 +694,66 @@ fn corpus_chroma_422_720x576_i_only() {
         // Bit-exact since round-118 (intra DC prediction `mean` fix);
         // also confirms 4:2:2 chroma-plane decode is correct.
         tier: Tier::BitExact,
+        bytes_per_sample: 1,
+    });
+}
+
+/// Round-417 deep-colour fixture #10: HQ-profile (parse 0xE8) 10-bit
+/// intra at 64×64 4:2:0, Table 10.5 signal-range preset 3. The
+/// `expected.yuv` ground truth is the *reference decoder's* output on
+/// an `oxideav-dirac`-encoded stream (black-box cross-validation) and
+/// equals the analytic source pattern exactly; planes are LE 16-bit
+/// words (low 10 bits — the `Yuv420P10Le` packing on both sides).
+#[test]
+fn corpus_hq_10bit_preset3_64x64() {
+    evaluate(&CorpusCase {
+        name: "hq-10bit-preset3-64x64",
+        width: 64,
+        height: 64,
+        n_frames: 1,
+        sub: Subsampling::Yuv420,
+        // Bit-exact from the day the fixture was staged (round-417).
+        tier: Tier::BitExact,
+        bytes_per_sample: 2,
+    });
+}
+
+/// Round-417 deep-colour fixture #11: HQ-profile 12-bit intra,
+/// Table 10.5 signal-range preset 4 — the deepest depth the reference
+/// decoder validates. Reference-cross-decoded ground truth,
+/// `Yuv420P12Le` packing.
+#[test]
+fn corpus_hq_12bit_preset4_64x64() {
+    evaluate(&CorpusCase {
+        name: "hq-12bit-preset4-64x64",
+        width: 64,
+        height: 64,
+        n_frames: 1,
+        sub: Subsampling::Yuv420,
+        // Bit-exact from the day the fixture was staged (round-417).
+        tier: Tier::BitExact,
+        bytes_per_sample: 2,
+    });
+}
+
+/// Round-417 deep-colour fixture #12: HQ-profile **16-bit** intra via
+/// a §10.3.8 custom (index 0) signal range — the only fixture
+/// exercising the index-0 wire format and the all-bits-significant
+/// `Yuv420P16Le` output surface. No external validator accepts
+/// index-0 ranges (see the fixture's `notes.md`), so the ground truth
+/// is the analytically-derivable source pattern (verified equal at
+/// staging time): `((x*17 + y*31 + seed*7) * 2654435761) mod 2^16`,
+/// Y/U/V seeds 1/5/9.
+#[test]
+fn corpus_hq_16bit_fullrange_64x64() {
+    evaluate(&CorpusCase {
+        name: "hq-16bit-fullrange-64x64",
+        width: 64,
+        height: 64,
+        n_frames: 1,
+        sub: Subsampling::Yuv420,
+        // Bit-exact by construction (q0 lossless; expected == pattern).
+        tier: Tier::BitExact,
+        bytes_per_sample: 2,
     });
 }

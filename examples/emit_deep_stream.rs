@@ -11,8 +11,9 @@
 //!
 //! Usage: `emit_deep_stream <depth 9..=16> [chroma 420|422|444] [path] [full|video]`
 //!
-//! The synthetic picture is the same deterministic ramp the crate's
-//! high-bit-depth round-trip tests use (`x*17 + y*31 + seed*7 mod 2^d`),
+//! The synthetic picture is the same deterministic full-range pattern
+//! the crate's high-bit-depth round-trip tests use
+//! (`(x*17 + y*31 + seed*7) * 2654435761 mod 2^d`; Y/U/V seeds 1/5/9),
 //! so `expected` pixels are reproducible from this source alone.
 
 use std::io::Write;
@@ -28,8 +29,8 @@ fn ramp_plane(w: usize, h: usize, depth: u32, seed: u32) -> Vec<u16> {
     let mut out = Vec::with_capacity(w * h);
     for y in 0..h {
         for x in 0..w {
-            let v = (x as u64 * 17 + y as u64 * 31 + seed as u64 * 7) % (max + 1);
-            out.push(v as u16);
+            let mix = x as u64 * 17 + y as u64 * 31 + seed as u64 * 7;
+            out.push(((mix * 2654435761) % (max + 1)) as u16);
         }
     }
     out
