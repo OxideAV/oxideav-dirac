@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Deep-colour decoder output: streams whose §10.5.2 `video_depth`
+  exceeds 12 bits (e.g. 13-16-bit §10.3.8 custom signal ranges) now
+  decode to the oxideav-core 16-bit surfaces `Yuv420P16Le` /
+  `Yuv422P16Le` / `Yuv444P16Le` (LE 16-bit words, all 16 bits
+  significant; 16-bit sources verbatim, 13-15-bit sources
+  MSB-aligned). The chroma-format × depth → storage-format choice is
+  exposed as `decoder::output_format_for` (round-417).
+- 11/12-bit 4:2:2 and 4:4:4 streams now decode to the native
+  `Yuv422P12Le` / `Yuv444P12Le` surfaces instead of clipping to
+  10 bits (the fallback used before oxideav-core 0.1.30 gained those
+  formats) — the two least-significant bits are no longer dropped
+  (round-417).
 - Env-gated decode tracing (`DIRAC_TRACE`, `DIRAC_TRACE_FILE`,
   `DIRAC_TRACE_MC`) implementing the docs trace-contract vocabulary:
   `PARSE_UNIT` / `SEQUENCE` / `PICTURE` / `MOTION` / `MOTION_BLOCK` /

@@ -49,10 +49,14 @@
 //!
 //! Output plumbing: the decoder front-end picks an oxideav-core
 //! [`PixelFormat`](oxideav_core::PixelFormat) from the sequence
-//! header's chroma format + luma bit depth. 8-bit streams emit
+//! header's chroma format + luma bit depth
+//! ([`decoder::output_format_for`]). 8-bit streams emit
 //! `Yuv420P / Yuv422P / Yuv444P`; 9-10-bit streams emit
-//! `Yuv*P10Le` (two bytes per sample, little-endian); 11-12-bit 4:2:0
-//! emits `Yuv420P12Le`. Frame `time_base` is derived from §10.3.5
+//! `Yuv*P10Le` (two bytes per sample, little-endian); 11-12-bit
+//! streams emit `Yuv*P12Le`; deeper streams (13-16-bit — §10.3.8
+//! custom signal ranges above 12 bits per component) emit the
+//! all-bits-significant `Yuv*P16Le` deep-colour surface, MSB-aligned
+//! for sub-16-bit depths. Frame `time_base` is derived from §10.3.5
 //! `frame_rate_numer / frame_rate_denom`, and an incoming packet's
 //! `pts` is carried through to the decoded frame (falling back to
 //! the §12.2 picture_number when absent).

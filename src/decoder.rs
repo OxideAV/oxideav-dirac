@@ -325,6 +325,34 @@ fn emit_sequence_trace(sh: &SequenceHeader) {
     ));
 }
 
+/// Pick the oxideav-core storage [`PixelFormat`] plus its per-sample
+/// storage bit width from the stream's chroma sampling and luma
+/// bit-depth (§10.3.3 chroma format, §10.5.2 video depth).
+///
+/// * `depth <= 8` — packed one-byte `Yuv*P` formats.
+/// * `9..=10` — `Yuv*P10Le` (LE 16-bit words, sample in the low 10 bits).
+/// * `11..=12` — `Yuv*P12Le` (LE 16-bit words, sample in the low 12 bits).
+/// * `> 12` — `Yuv*P16Le` (LE 16-bit words, **all 16 bits significant**).
+///   Any signal range whose §10.5.2 `video_depth` exceeds 12 lands
+///   here — including the deep-colour custom ranges (§10.3.8
+///   `index == 0`) above 12 bits per component.
+pub fn output_format_for(chroma: ChromaFormat, luma_depth: u32) -> (PixelFormat, u32) {
+    match (chroma, luma_depth) {
+        (ChromaFormat::Yuv420, d) if d <= 8 => (PixelFormat::Yuv420P, 8),
+        (ChromaFormat::Yuv422, d) if d <= 8 => (PixelFormat::Yuv422P, 8),
+        (ChromaFormat::Yuv444, d) if d <= 8 => (PixelFormat::Yuv444P, 8),
+        (ChromaFormat::Yuv420, d) if d <= 10 => (PixelFormat::Yuv420P10Le, 10),
+        (ChromaFormat::Yuv422, d) if d <= 10 => (PixelFormat::Yuv422P10Le, 10),
+        (ChromaFormat::Yuv444, d) if d <= 10 => (PixelFormat::Yuv444P10Le, 10),
+        (ChromaFormat::Yuv420, d) if d <= 12 => (PixelFormat::Yuv420P12Le, 12),
+        (ChromaFormat::Yuv422, d) if d <= 12 => (PixelFormat::Yuv422P12Le, 12),
+        (ChromaFormat::Yuv444, d) if d <= 12 => (PixelFormat::Yuv444P12Le, 12),
+        (ChromaFormat::Yuv420, _) => (PixelFormat::Yuv420P16Le, 16),
+        (ChromaFormat::Yuv422, _) => (PixelFormat::Yuv422P16Le, 16),
+        (ChromaFormat::Yuv444, _) => (PixelFormat::Yuv444P16Le, 16),
+    }
+}
+
 /// Map a decoded Dirac picture (Y/U/V as `Vec<i32>` 0..2^depth) into
 /// an oxideav-core `VideoFrame`.
 ///
@@ -332,10 +360,13 @@ fn emit_sequence_trace(sh: &SequenceHeader) {
 /// * 9- and 10-bit components use the little-endian 16-bit
 ///   `Yuv*P10Le` formats (the stored sample is in the low `depth` bits
 ///   of each 16-bit word, following the oxideav-core convention).
-/// * 11- and 12-bit 4:2:0 components use `Yuv420P12Le`. 11/12-bit
-///   4:2:2 / 4:4:4 fall back to `Yuv*P10Le` and clip to 10 bits for
-///   now — oxideav-core has no `Yuv422P12Le` / `Yuv444P12Le` variants
-///   at the moment, so clipping keeps us lossless below ~2^10.
+/// * 11- and 12-bit components use the `Yuv*P12Le` formats at every
+///   chroma sampling.
+/// * Deeper components (13 bits and up — e.g. 16-bit deep-colour
+///   custom signal ranges) use the `Yuv*P16Le` formats, where **all 16
+///   bits of each word are significant**: a 16-bit source passes
+///   through unchanged and a 13-15-bit source is left-shifted so its
+///   MSBs align with the full-scale top of the 16-bit field.
 ///
 /// §15.10 already pre-offsets each sample by `2^(bit_depth-1)` to make
 /// it non-negative, so `pic.y / u / v` values are in `[0, 2^depth - 1]`.
@@ -350,20 +381,7 @@ fn decoded_to_video_frame(
     // bit-depth. We assume luma_depth == chroma_depth in practice for
     // the formats oxideav-core exposes today; when they disagree we
     // conservatively key off luma, as that's the visible component.
-    let (format, store_depth) = match (seq.video_params.chroma_format, pic.luma_depth) {
-        (ChromaFormat::Yuv420, d) if d <= 8 => (PixelFormat::Yuv420P, 8),
-        (ChromaFormat::Yuv422, d) if d <= 8 => (PixelFormat::Yuv422P, 8),
-        (ChromaFormat::Yuv444, d) if d <= 8 => (PixelFormat::Yuv444P, 8),
-        (ChromaFormat::Yuv420, d) if d <= 10 => (PixelFormat::Yuv420P10Le, 10),
-        (ChromaFormat::Yuv422, d) if d <= 10 => (PixelFormat::Yuv422P10Le, 10),
-        (ChromaFormat::Yuv444, d) if d <= 10 => (PixelFormat::Yuv444P10Le, 10),
-        // 12-bit path (only 4:2:0 exists in core today). For 4:2:2 /
-        // 4:4:4 above 10 bits we clip to 10; it's still better than
-        // the old 8-bit demotion.
-        (ChromaFormat::Yuv420, _) => (PixelFormat::Yuv420P12Le, 12),
-        (ChromaFormat::Yuv422, _) => (PixelFormat::Yuv422P10Le, 10),
-        (ChromaFormat::Yuv444, _) => (PixelFormat::Yuv444P10Le, 10),
-    };
+    let (format, store_depth) = output_format_for(seq.video_params.chroma_format, pic.luma_depth);
     let _ = (format, time_base);
     let y = plane_from_i32(&pic.y, pic.luma_width, pic.luma_depth, store_depth);
     let u = plane_from_i32(&pic.u, pic.chroma_width, pic.chroma_depth, store_depth);
@@ -384,9 +402,14 @@ fn decoded_to_video_frame(
 ///   little-endian order, with the sample in the low `store_depth`
 ///   bits of each 16-bit word (oxideav-core convention; see
 ///   [`PixelFormat::Yuv420P10Le`] docs).
+/// * `store_depth == 16` writes two bytes per sample in little-endian
+///   order with **all 16 bits significant** (the `Yuv*P16Le`
+///   convention): a 16-bit source is stored verbatim, a shallower
+///   source is left-shifted by `16 - source_depth` so its MSBs align
+///   with the top of the full-scale field.
 ///
 /// The `stride` we return is the byte stride of one row — `width` for
-/// 8-bit formats and `2 * width` for 10/12-bit formats, since each
+/// 8-bit formats and `2 * width` for 10/12/16-bit formats, since each
 /// sample occupies two bytes.
 fn plane_from_i32(values: &[i32], width: usize, source_depth: u32, store_depth: u32) -> VideoPlane {
     match store_depth {
@@ -409,7 +432,7 @@ fn plane_from_i32(values: &[i32], width: usize, source_depth: u32, store_depth: 
                 data,
             }
         }
-        10 | 12 => {
+        10 | 12 | 16 => {
             // Store one 16-bit LE sample per coefficient, masking to
             // `store_depth` bits. If the source is wider than the
             // storage width, right-shift by the difference (e.g.
@@ -417,8 +440,11 @@ fn plane_from_i32(values: &[i32], width: usize, source_depth: u32, store_depth: 
             // bits). If source is narrower, left-shift the sample
             // into the top of the field, as is conventional for
             // mixing unlike-precision samples (e.g. 8-bit input into
-            // a 10-bit plane becomes val << 2).
-            let max_store = (1u32 << store_depth) - 1;
+            // a 10-bit plane becomes val << 2, and a 14-bit input
+            // into an all-bits-significant 16-bit plane val << 2 as
+            // well). A 16-bit source into a 16-bit plane is stored
+            // verbatim.
+            let max_store = ((1u64 << store_depth) - 1) as u32;
             let mut data = Vec::with_capacity(values.len() * 2);
             let (lshift, rshift) = if store_depth >= source_depth {
                 (store_depth - source_depth, 0u32)
@@ -632,9 +658,72 @@ mod tests {
         assert_eq!(frame.planes[0].data[1], 0x02);
     }
 
+    /// The chroma-format × luma-depth → storage-format matrix: every
+    /// §10.3.3 chroma sampling has a native surface at each §10.5.2
+    /// depth bucket, with everything above 12 bits landing on the
+    /// all-bits-significant `Yuv*P16Le` trio.
+    #[test]
+    fn output_format_matrix_covers_all_depth_buckets() {
+        use ChromaFormat::*;
+        let cases = [
+            (Yuv420, 8, PixelFormat::Yuv420P, 8),
+            (Yuv422, 8, PixelFormat::Yuv422P, 8),
+            (Yuv444, 8, PixelFormat::Yuv444P, 8),
+            (Yuv420, 10, PixelFormat::Yuv420P10Le, 10),
+            (Yuv422, 9, PixelFormat::Yuv422P10Le, 10),
+            (Yuv444, 10, PixelFormat::Yuv444P10Le, 10),
+            (Yuv420, 12, PixelFormat::Yuv420P12Le, 12),
+            (Yuv422, 11, PixelFormat::Yuv422P12Le, 12),
+            (Yuv444, 12, PixelFormat::Yuv444P12Le, 12),
+            (Yuv420, 13, PixelFormat::Yuv420P16Le, 16),
+            (Yuv422, 14, PixelFormat::Yuv422P16Le, 16),
+            (Yuv444, 16, PixelFormat::Yuv444P16Le, 16),
+        ];
+        for (chroma, depth, want_fmt, want_store) in cases {
+            let (fmt, store) = output_format_for(chroma, depth);
+            assert_eq!(
+                (fmt, store),
+                (want_fmt, want_store),
+                "chroma {chroma:?} depth {depth}"
+            );
+        }
+    }
+
+    /// A native 16-bit source stores each sample verbatim as an LE
+    /// 16-bit word — all 16 bits significant, no shift, no masking
+    /// loss at full scale 65535.
+    #[test]
+    fn plane_from_i32_16bit_native_verbatim() {
+        let values = [0i32, 65535, 32768, 1];
+        let p = plane_from_i32(&values, 4, 16, 16);
+        assert_eq!(p.stride, 8);
+        assert_eq!(p.data, vec![0x00, 0x00, 0xFF, 0xFF, 0x00, 0x80, 0x01, 0x00]);
+    }
+
+    /// A 14-bit source rendered into the all-bits-significant 16-bit
+    /// plane is left-shifted by 2 so its MSBs align with full scale
+    /// (16383 << 2 = 65532).
+    #[test]
+    fn plane_from_i32_14bit_to_16bit_left_shifts() {
+        let values = [0i32, 16383, 8192];
+        let p = plane_from_i32(&values, 3, 14, 16);
+        assert_eq!(p.stride, 6);
+        // 16383 << 2 = 65532 = 0xFFFC; 8192 << 2 = 32768 = 0x8000.
+        assert_eq!(p.data, vec![0x00, 0x00, 0xFC, 0xFF, 0x00, 0x80]);
+    }
+
+    /// A 13-bit source into the 16-bit plane shifts up by 3.
+    #[test]
+    fn plane_from_i32_13bit_to_16bit_left_shifts() {
+        let values = [8191i32, 1];
+        let p = plane_from_i32(&values, 2, 13, 16);
+        assert_eq!(p.stride, 4);
+        // 8191 << 3 = 65528 = 0xFFF8; 1 << 3 = 8.
+        assert_eq!(p.data, vec![0xF8, 0xFF, 0x08, 0x00]);
+    }
+
     /// A 12-bit 4:2:0 stream picks Yuv420P12Le; samples are packed as
-    /// 12-bit LE. oxideav-core has no 12-bit 4:2:2 / 4:4:4, so those
-    /// paths clip down to 10 — covered separately.
+    /// 12-bit LE.
     #[test]
     fn decoded_to_video_frame_12bit_420_picks_p12le() {
         let seq = fake_sequence(25, 1, 12);
@@ -656,6 +745,101 @@ mod tests {
         // 2048 = 0x800 -> 0x00, 0x08 in little-endian.
         assert_eq!(frame.planes[0].data[0], 0x00);
         assert_eq!(frame.planes[0].data[1], 0x08);
+    }
+
+    /// 12-bit 4:2:2 / 4:4:4 now store natively at 12 bits (no 10-bit
+    /// clip): a full-scale 4095 sample must survive verbatim.
+    #[test]
+    fn decoded_to_video_frame_12bit_422_444_store_natively() {
+        for (chroma, cw, ch) in [
+            (ChromaFormat::Yuv422, 32, 64),
+            (ChromaFormat::Yuv444, 64, 64),
+        ] {
+            let mut seq = fake_sequence(25, 1, 12);
+            seq.video_params.chroma_format = chroma;
+            seq.chroma_width = cw;
+            seq.chroma_height = ch;
+            let pic = DecodedPicture {
+                picture_number: 0,
+                luma_width: 64,
+                luma_height: 64,
+                chroma_width: cw as usize,
+                chroma_height: ch as usize,
+                y: vec![4095; 64 * 64],
+                u: vec![4095; (cw * ch) as usize],
+                v: vec![0; (cw * ch) as usize],
+                luma_depth: 12,
+                chroma_depth: 12,
+            };
+            let tb = time_base_from_frame_rate(&seq);
+            let frame = decoded_to_video_frame(&pic, &seq, None, tb);
+            // 4095 = 0x0FFF → 0xFF, 0x0F little-endian — the full
+            // 12-bit field, not the old 10-bit clip (which stored
+            // 1023 = 0xFF, 0x03).
+            assert_eq!(frame.planes[0].data[0], 0xFF, "{chroma:?} Y lo byte");
+            assert_eq!(frame.planes[0].data[1], 0x0F, "{chroma:?} Y hi byte");
+            assert_eq!(frame.planes[1].data[0], 0xFF, "{chroma:?} U lo byte");
+            assert_eq!(frame.planes[1].data[1], 0x0F, "{chroma:?} U hi byte");
+            assert_eq!(frame.planes[1].stride, (cw * 2) as usize);
+            assert_eq!(frame.planes[1].data.len(), (cw * ch * 2) as usize);
+        }
+    }
+
+    /// A 16-bit 4:2:0 stream picks Yuv420P16Le and stores each sample
+    /// as a full 16-bit LE word — the deep-colour output surface for
+    /// any §10.3.8 custom signal range above 12 bits.
+    #[test]
+    fn decoded_to_video_frame_16bit_420_picks_p16le() {
+        let seq = fake_sequence(25, 1, 16);
+        let pic = DecodedPicture {
+            picture_number: 0,
+            luma_width: 64,
+            luma_height: 64,
+            chroma_width: 32,
+            chroma_height: 32,
+            y: vec![65535; 64 * 64],
+            u: vec![32768; 32 * 32],
+            v: vec![1; 32 * 32],
+            luma_depth: 16,
+            chroma_depth: 16,
+        };
+        let tb = time_base_from_frame_rate(&seq);
+        let frame = decoded_to_video_frame(&pic, &seq, None, tb);
+        assert_eq!(frame.planes[0].stride, 128);
+        assert_eq!(frame.planes[0].data.len(), 64 * 64 * 2);
+        // 65535 → 0xFF, 0xFF; 32768 → 0x00, 0x80; 1 → 0x01, 0x00.
+        assert_eq!(&frame.planes[0].data[0..2], &[0xFF, 0xFF]);
+        assert_eq!(&frame.planes[1].data[0..2], &[0x00, 0x80]);
+        assert_eq!(&frame.planes[2].data[0..2], &[0x01, 0x00]);
+    }
+
+    /// A 14-bit 4:2:2 stream (custom signal range) lands on the 16-bit
+    /// surface with samples MSB-aligned (<< 2).
+    #[test]
+    fn decoded_to_video_frame_14bit_422_msb_aligns_into_p16le() {
+        let mut seq = fake_sequence(25, 1, 14);
+        seq.video_params.chroma_format = ChromaFormat::Yuv422;
+        seq.chroma_width = 32;
+        seq.chroma_height = 64;
+        let pic = DecodedPicture {
+            picture_number: 0,
+            luma_width: 64,
+            luma_height: 64,
+            chroma_width: 32,
+            chroma_height: 64,
+            y: vec![16383; 64 * 64],
+            u: vec![8192; 32 * 64],
+            v: vec![0; 32 * 64],
+            luma_depth: 14,
+            chroma_depth: 14,
+        };
+        let tb = time_base_from_frame_rate(&seq);
+        let frame = decoded_to_video_frame(&pic, &seq, None, tb);
+        // 16383 << 2 = 65532 = 0xFFFC; 8192 << 2 = 32768 = 0x8000.
+        assert_eq!(&frame.planes[0].data[0..2], &[0xFC, 0xFF]);
+        assert_eq!(&frame.planes[1].data[0..2], &[0x00, 0x80]);
+        assert_eq!(frame.planes[1].stride, 64);
+        assert_eq!(frame.planes[1].data.len(), 32 * 64 * 2);
     }
 
     /// A pure 8-bit stream emits an 8-bit planar frame with
