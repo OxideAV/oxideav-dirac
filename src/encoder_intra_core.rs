@@ -165,6 +165,35 @@ pub fn encode_core_intra_picture_vlc(
     encode_core_intra_picture_inner(sequence, params, picture_number, y, u, v, false)
 }
 
+/// `&[u16]` variant of [`encode_core_intra_picture`] for components
+/// deeper than 8 bits (`sequence.luma_depth` / `chroma_depth` up to
+/// 16 — §10.3.8 deep signal ranges). Samples are read as unsigned
+/// `[0, 2^depth - 1]` values and recentred by `2^(depth - 1)` exactly
+/// like the 8-bit path.
+pub fn encode_core_intra_picture_u16(
+    sequence: &SequenceHeader,
+    params: &CoreIntraEncoderParams,
+    picture_number: u32,
+    y: &[u16],
+    u: &[u16],
+    v: &[u16],
+) -> Vec<u8> {
+    encode_core_intra_picture_inner_u16(sequence, params, picture_number, y, u, v, true)
+}
+
+/// `&[u16]` variant of [`encode_core_intra_picture_vlc`] (parse code
+/// `0x4C`, §13.4.2.2 plain exp-Golomb entropy) for deep components.
+pub fn encode_core_intra_picture_vlc_u16(
+    sequence: &SequenceHeader,
+    params: &CoreIntraEncoderParams,
+    picture_number: u32,
+    y: &[u16],
+    u: &[u16],
+    v: &[u16],
+) -> Vec<u8> {
+    encode_core_intra_picture_inner_u16(sequence, params, picture_number, y, u, v, false)
+}
+
 /// Shared body for the AC (`0x0C`) and VLC (`0x4C`) core-intra encoders.
 /// `using_ac` selects the per-codeblock entropy path; the §12.2 picture
 /// header, §9.6.1 RETD, §11.3 transform parameters and §13.4.1 transform
@@ -176,6 +205,49 @@ fn encode_core_intra_picture_inner(
     y: &[u8],
     u: &[u8],
     v: &[u8],
+    using_ac: bool,
+) -> Vec<u8> {
+    encode_core_intra_picture_inner_with(
+        sequence,
+        params,
+        picture_number,
+        |idx| y[idx] as i32,
+        |idx| u[idx] as i32,
+        |idx| v[idx] as i32,
+        using_ac,
+    )
+}
+
+/// `&[u16]` twin of [`encode_core_intra_picture_inner`].
+fn encode_core_intra_picture_inner_u16(
+    sequence: &SequenceHeader,
+    params: &CoreIntraEncoderParams,
+    picture_number: u32,
+    y: &[u16],
+    u: &[u16],
+    v: &[u16],
+    using_ac: bool,
+) -> Vec<u8> {
+    encode_core_intra_picture_inner_with(
+        sequence,
+        params,
+        picture_number,
+        |idx| y[idx] as i32,
+        |idx| u[idx] as i32,
+        |idx| v[idx] as i32,
+        using_ac,
+    )
+}
+
+/// Shared sample-width-independent body: `fetch_*(idx)` reads the
+/// unsigned sample at the unpadded raster index, widened to `i32`.
+fn encode_core_intra_picture_inner_with(
+    sequence: &SequenceHeader,
+    params: &CoreIntraEncoderParams,
+    picture_number: u32,
+    fetch_y: impl Fn(usize) -> i32,
+    fetch_u: impl Fn(usize) -> i32,
+    fetch_v: impl Fn(usize) -> i32,
     using_ac: bool,
 ) -> Vec<u8> {
     let mut w = BitWriter::new();
@@ -204,9 +276,11 @@ fn encode_core_intra_picture_inner(
     let chroma_w = sequence.chroma_width;
     let chroma_h = sequence.chroma_height;
 
-    let mut y_qpy = forward_and_quantise(y, luma_w, luma_h, sequence.luma_depth, params);
-    let mut u_qpy = forward_and_quantise(u, chroma_w, chroma_h, sequence.chroma_depth, params);
-    let mut v_qpy = forward_and_quantise(v, chroma_w, chroma_h, sequence.chroma_depth, params);
+    let mut y_qpy = forward_and_quantise_with(fetch_y, luma_w, luma_h, sequence.luma_depth, params);
+    let mut u_qpy =
+        forward_and_quantise_with(fetch_u, chroma_w, chroma_h, sequence.chroma_depth, params);
+    let mut v_qpy =
+        forward_and_quantise_with(fetch_v, chroma_w, chroma_h, sequence.chroma_depth, params);
 
     // Quantise + forward-DC-predict each component's level-0 LL band.
     // The decoder inverts the DC prediction unconditionally for intra
@@ -274,8 +348,8 @@ fn wavelet_index(filter: WaveletFilter) -> u32 {
 /// value at each codeblock's running quantiser (see
 /// [`encode_subband_ac`]). With `qindex == 0` and mode 0, qf = 4 →
 /// `4*|x|/4 = |x|` (identity, bit-exact roundtrip).
-fn forward_and_quantise(
-    plane: &[u8],
+fn forward_and_quantise_with(
+    fetch: impl Fn(usize) -> i32,
     comp_w: u32,
     comp_h: u32,
     depth: u32,
@@ -288,7 +362,7 @@ fn forward_and_quantise(
         for x in 0..pw {
             let src_x = x.min(comp_w as usize - 1);
             let src_y = y.min(comp_h as usize - 1);
-            let v = plane[src_y * comp_w as usize + src_x] as i32 - half;
+            let v = fetch(src_y * comp_w as usize + src_x) - half;
             pic.set(y, x, v);
         }
     }
@@ -879,6 +953,63 @@ pub fn encode_single_core_intra_stream_vlc(
     out.extend_from_slice(&sh_payload);
     // `0x4C`: core-syntax, intra reference, num_refs = 0, NO arithmetic
     // coding (Table 9.1). `using_ac()` = `(0x4C & 0x48) == 0x08` → false.
+    write_parse_info(&mut out, 0x4C, pic_unit_len as u32, sh_unit_len as u32);
+    out.extend_from_slice(&pic_payload);
+    write_parse_info(&mut out, 0x10, 0, pic_unit_len as u32);
+    out
+}
+
+/// `&[u16]` variant of [`encode_single_core_intra_stream`] — a
+/// single-frame [seq_hdr | `0x0C` AC core-intra | EOS] stream from
+/// deep (`> 8`-bit, up to 16-bit) components. Pair with a sequence
+/// whose §10.3.8 signal range derives the matching §10.5.2 depths.
+pub fn encode_single_core_intra_stream_u16(
+    sequence: &SequenceHeader,
+    params: &CoreIntraEncoderParams,
+    picture_number: u32,
+    y: &[u16],
+    u: &[u16],
+    v: &[u16],
+) -> Vec<u8> {
+    let sh_payload = crate::encoder::encode_sequence_header(sequence);
+    let pic_payload = encode_core_intra_picture_u16(sequence, params, picture_number, y, u, v);
+
+    let pi_size = 13usize;
+    let sh_unit_len = pi_size + sh_payload.len();
+    let pic_unit_len = pi_size + pic_payload.len();
+
+    let mut out = Vec::with_capacity(sh_unit_len + pic_unit_len + pi_size);
+    write_parse_info(&mut out, 0x00, sh_unit_len as u32, 0);
+    out.extend_from_slice(&sh_payload);
+    // `0x0C`: core-syntax, AC, intra reference, num_refs = 0.
+    write_parse_info(&mut out, 0x0C, pic_unit_len as u32, sh_unit_len as u32);
+    out.extend_from_slice(&pic_payload);
+    write_parse_info(&mut out, 0x10, 0, pic_unit_len as u32);
+    out
+}
+
+/// `&[u16]` variant of [`encode_single_core_intra_stream_vlc`] — the
+/// `0x4C` plain exp-Golomb entropy path from deep components.
+pub fn encode_single_core_intra_stream_vlc_u16(
+    sequence: &SequenceHeader,
+    params: &CoreIntraEncoderParams,
+    picture_number: u32,
+    y: &[u16],
+    u: &[u16],
+    v: &[u16],
+) -> Vec<u8> {
+    let sh_payload = crate::encoder::encode_sequence_header(sequence);
+    let pic_payload = encode_core_intra_picture_vlc_u16(sequence, params, picture_number, y, u, v);
+
+    let pi_size = 13usize;
+    let sh_unit_len = pi_size + sh_payload.len();
+    let pic_unit_len = pi_size + pic_payload.len();
+
+    let mut out = Vec::with_capacity(sh_unit_len + pic_unit_len + pi_size);
+    write_parse_info(&mut out, 0x00, sh_unit_len as u32, 0);
+    out.extend_from_slice(&sh_payload);
+    // `0x4C`: core-syntax, intra reference, num_refs = 0, NO arithmetic
+    // coding (Table 9.1).
     write_parse_info(&mut out, 0x4C, pic_unit_len as u32, sh_unit_len as u32);
     out.extend_from_slice(&pic_payload);
     write_parse_info(&mut out, 0x10, 0, pic_unit_len as u32);

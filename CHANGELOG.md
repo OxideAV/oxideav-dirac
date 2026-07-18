@@ -44,6 +44,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   depth, so full-range and >12-bit streams cannot be externally
   cross-checked — those depths are pinned by the self-roundtrip suite
   (round-417).
+- Core-syntax intra `&[u16]` encode entry points
+  (`encode_core_intra_picture_u16` / `_vlc_u16`,
+  `encode_single_core_intra_stream_u16` / `_vlc_u16`) — the Dirac
+  `0x0C` (Annex B arithmetic) and `0x4C` (§13.4.2.2 exp-Golomb)
+  picture coders from deep components. q0 round-trips are bit-exact
+  through the registered decoder at 16-bit (AC, 4:2:0 + 4:4:4; VLC,
+  4:2:0) and 13-bit (VLC, 4:2:2, MSB-aligned surface) — the
+  core-syntax decode path is now deep-colour-proven alongside the
+  HQ/LD slice paths (round-417).
 - 11/12-bit 4:2:2 and 4:4:4 streams now decode to the native
   `Yuv422P12Le` / `Yuv444P12Le` surfaces instead of clipping to
   10 bits (the fallback used before oxideav-core 0.1.30 gained those

@@ -319,6 +319,74 @@ fn hq_13_to_15bit_full_range_q0_bit_exact_msb_aligned() {
     }
 }
 
+/// Core-syntax (Dirac, parse `0x0C`) AC-coded intra at 16-bit: the
+/// §13.4 codeblock walk, Annex B arithmetic coder and §13.4.2 DC
+/// prediction are all depth-independent, so a q0 encode → decode
+/// round-trip through the registered decoder must be bit-exact on the
+/// deep-colour surface — this pins the *core-syntax* decode path at
+/// depth 16, which the HQ/LD slice tests never touch.
+#[test]
+fn core_intra_ac_16bit_q0_bit_exact() {
+    use oxideav_dirac::encoder_intra_core::{
+        encode_single_core_intra_stream_u16, CoreIntraEncoderParams,
+    };
+    let (w, h) = (64u32, 64u32);
+    let sr = SignalRange::PRESET_16BIT_FULL;
+    for chroma in [ChromaFormat::Yuv420, ChromaFormat::Yuv444] {
+        let (cw, ch) = chroma_dims(w, h, chroma);
+        let y = ramp_plane(w as usize, h as usize, 16, 13);
+        let u = ramp_plane(cw as usize, ch as usize, 16, 17);
+        let v = ramp_plane(cw as usize, ch as usize, 16, 21);
+        let seq = make_minimal_sequence_with_signal_range(w, h, chroma, sr);
+        let params = CoreIntraEncoderParams::default_intra(WaveletFilter::LeGall5_3, 3);
+        let stream = encode_single_core_intra_stream_u16(&seq, &params, 0, &y, &u, &v);
+        let frame = decode_one(stream);
+        let gy = plane_as_u16(&frame.planes[0].data);
+        let gu = plane_as_u16(&frame.planes[1].data);
+        let gv = plane_as_u16(&frame.planes[2].data);
+        let tag = format!("core AC 16-bit {chroma:?}");
+        assert_planes_eq(&format!("{tag} Y"), &gy, &y);
+        assert_planes_eq(&format!("{tag} U"), &gu, &u);
+        assert_planes_eq(&format!("{tag} V"), &gv, &v);
+    }
+}
+
+/// Core-syntax VLC (parse `0x4C`, §13.4.2.2 plain exp-Golomb) intra at
+/// 16-bit 4:2:0 and 13-bit 4:2:2 (MSB-aligned surface): the
+/// non-arithmetic entropy path at deep depths, strictly lossless at
+/// qindex 0.
+#[test]
+fn core_intra_vlc_deep_q0_bit_exact() {
+    use oxideav_dirac::encoder_intra_core::{
+        encode_single_core_intra_stream_vlc_u16, CoreIntraEncoderParams,
+    };
+    let (w, h) = (64u32, 64u32);
+    for (depth, chroma) in [(16u32, ChromaFormat::Yuv420), (13u32, ChromaFormat::Yuv422)] {
+        let max = ((1u64 << depth) - 1) as u32;
+        let sr = SignalRange {
+            luma_offset: 1 << (depth - 1),
+            luma_excursion: max,
+            chroma_offset: 1 << (depth - 1),
+            chroma_excursion: max,
+        };
+        let (cw, ch) = chroma_dims(w, h, chroma);
+        let y = ramp_plane(w as usize, h as usize, depth, 14);
+        let u = ramp_plane(cw as usize, ch as usize, depth, 18);
+        let v = ramp_plane(cw as usize, ch as usize, depth, 22);
+        let seq = make_minimal_sequence_with_signal_range(w, h, chroma, sr);
+        let params = CoreIntraEncoderParams::default_intra(WaveletFilter::LeGall5_3, 3);
+        let stream = encode_single_core_intra_stream_vlc_u16(&seq, &params, 0, &y, &u, &v);
+        let frame = decode_one(stream);
+        let gy = unshift_p16(&plane_as_u16(&frame.planes[0].data), depth);
+        let gu = unshift_p16(&plane_as_u16(&frame.planes[1].data), depth);
+        let gv = unshift_p16(&plane_as_u16(&frame.planes[2].data), depth);
+        let tag = format!("core VLC {depth}-bit {chroma:?}");
+        assert_planes_eq(&format!("{tag} Y"), &gy, &y);
+        assert_planes_eq(&format!("{tag} U"), &gu, &u);
+        assert_planes_eq(&format!("{tag} V"), &gv, &v);
+    }
+}
+
 /// PSNR over a 10-bit (`max = 1023`) sample pair. `INFINITY` on an exact
 /// match. The peak is the 10-bit maximum so the dB figure is comparable
 /// to an 8-bit PSNR scaled for the deeper range.
