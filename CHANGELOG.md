@@ -32,6 +32,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   × 6 reversible wavelets; 13-15-bit recovered through the documented
   MSB alignment), 12-bit 4:2:2/4:4:4 is now bit-exact end-to-end, and
   the LD slice path is verified at 16-bit (round-417).
+- `emit_deep_stream` example — emits a single-frame deep-colour
+  (9-16-bit) HQ intra elementary stream from the deterministic test
+  ramp, with `full` (custom §10.3.8 range) and `video` (Table 10.5
+  preset) signal-range modes, for black-box probing and fixture
+  staging (round-417).
+- Black-box cross-validation of the deep `&[u16]` HQ encoder: 10- and
+  12-bit Table-10.5-preset streams decode **bit-exactly** through the
+  reference decoder (gated interop test). Probing showed the reference
+  rejects spec-legal §10.3.8 `index == 0` custom signal ranges at any
+  depth, so full-range and >12-bit streams cannot be externally
+  cross-checked — those depths are pinned by the self-roundtrip suite
+  (round-417).
 - 11/12-bit 4:2:2 and 4:4:4 streams now decode to the native
   `Yuv422P12Le` / `Yuv444P12Le` surfaces instead of clipping to
   10 bits (the fallback used before oxideav-core 0.1.30 gained those

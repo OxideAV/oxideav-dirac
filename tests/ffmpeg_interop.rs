@@ -342,6 +342,103 @@ fn ffmpeg_decodes_our_hq_stream_lossless_q0() {
     assert!(v_psnr >= 48.0, "V PSNR {v_psnr:.2} dB below 48 dB");
 }
 
+/// Deterministic deep ramp shared with the high-bit-depth round-trip
+/// suite and the `emit_deep_stream` example: `x*17 + y*31 + seed*7
+/// mod 2^depth`.
+fn deep_ramp(w: usize, h: usize, depth: u32, seed: u32) -> Vec<u16> {
+    let max = (1u64 << depth) - 1;
+    let mut out = Vec::with_capacity(w * h);
+    for y in 0..h {
+        for x in 0..w {
+            out.push(((x as u64 * 17 + y as u64 * 31 + seed as u64 * 7) % (max + 1)) as u16);
+        }
+    }
+    out
+}
+
+/// Cross-validate our deep `&[u16]` HQ encoder against the black-box
+/// reference decoder at 10 and 12 bits — the deepest depths the
+/// validator accepts. The §10.3.8 signal range must be a Table 10.5
+/// *preset* (index 3 / 4): black-box probing (round-417) showed the
+/// validator rejects spec-legal `index == 0` custom ranges outright
+/// ("error parsing sequence header") at any depth, so full-range
+/// and deeper-than-12-bit streams cannot be externally cross-checked
+/// at all — those depths are covered by the self-roundtrip suite
+/// instead.
+///
+/// The raw output is requested at the matching `yuv420p10le` /
+/// `yuv420p12le` rawvideo format (LE 16-bit words, sample in the low
+/// `depth` bits) which is byte-identical to our own `Yuv420P10Le` /
+/// `Yuv420P12Le` packing, so the comparison is a straight u16 equality
+/// against the input ramp: at qindex 0 the stream must be lossless
+/// through the *reference* decoder, not just through ours.
+#[test]
+fn ffmpeg_decodes_our_deep_preset_hq_streams_bit_exact() {
+    if !ffmpeg_available() {
+        eprintln!("ffmpeg not available; skipping deep HQ interop test");
+        return;
+    }
+    use oxideav_dirac::encoder::{
+        encode_single_hq_intra_stream_u16, make_minimal_sequence_with_signal_range, EncoderParams,
+    };
+    use oxideav_dirac::video_format::SignalRange;
+    use oxideav_dirac::wavelet::WaveletFilter;
+
+    for (depth, sr, pix_fmt) in [
+        (10u32, SignalRange::PRESET_10BIT_VIDEO, "yuv420p10le"),
+        (12u32, SignalRange::PRESET_12BIT_VIDEO, "yuv420p12le"),
+    ] {
+        let (w, h) = (64usize, 64usize);
+        let (cw, ch) = (32usize, 32usize);
+        let y = deep_ramp(w, h, depth, 1);
+        let u = deep_ramp(cw, ch, depth, 5);
+        let v = deep_ramp(cw, ch, depth, 9);
+        let seq =
+            make_minimal_sequence_with_signal_range(w as u32, h as u32, ChromaFormat::Yuv420, sr);
+        assert_eq!(seq.luma_depth, depth);
+        let mut params = EncoderParams::default_hq(WaveletFilter::LeGall5_3, 3);
+        params.slice_size_scaler = 32;
+        let stream = encode_single_hq_intra_stream_u16(&seq, &params, 0, &y, &u, &v);
+
+        let tmpdir = std::env::temp_dir();
+        let drc = tmpdir.join(format!("oxideav_dirac_interop_deep{depth}.drc"));
+        let yuv = tmpdir.join(format!("oxideav_dirac_interop_deep{depth}.yuv"));
+        std::fs::write(&drc, &stream).expect("write drc");
+
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "dirac",
+                "-i",
+            ])
+            .arg(&drc)
+            .args(["-f", "rawvideo", "-pix_fmt", pix_fmt])
+            .arg(&yuv)
+            .status()
+            .expect("run ffmpeg");
+        assert!(
+            status.success(),
+            "ffmpeg decode failed at {depth}-bit — deep HQ stream malformed"
+        );
+
+        let out = std::fs::read(&yuv).expect("read ffmpeg yuv");
+        assert_eq!(out.len(), 2 * (w * h + 2 * cw * ch), "{depth}-bit size");
+        let words: Vec<u16> = out
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        let (oy, rest) = words.split_at(w * h);
+        let (ou, ov) = rest.split_at(cw * ch);
+        assert_eq!(oy, &y[..], "{depth}-bit Y not lossless through reference");
+        assert_eq!(ou, &u[..], "{depth}-bit U not lossless through reference");
+        assert_eq!(ov, &v[..], "{depth}-bit V not lossless through reference");
+    }
+}
+
 /// Round-trip our LD encoder through ffmpeg's vc2 decoder. Round 8
 /// landed at ~12.7 dB PSNR because of an off-by-one in the slice
 /// `slice_y_length` field width — the Dirac spec's `intlog2(8*sb - 7)`
