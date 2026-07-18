@@ -16,6 +16,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   significant; 16-bit sources verbatim, 13-15-bit sources
   MSB-aligned). The chroma-format × depth → storage-format choice is
   exposed as `decoder::output_format_for` (round-417).
+- `DiracDecoder::output_pixel_format` — the output `PixelFormat` the
+  decoder will emit for the current sequence header, queryable after
+  the first `send_packet` (round-417).
+- `DiracDecoder` now overrides `Decoder::receive_arena_frame` with a
+  correct `FrameHeader`: real §10.5.1 picture width / height from the
+  sequence header and the true output pixel format (including the
+  10/12-bit and deep-colour 16-bit surfaces), instead of the
+  trait-default plane-count guess (round-417).
 - 11/12-bit 4:2:2 and 4:4:4 streams now decode to the native
   `Yuv422P12Le` / `Yuv444P12Le` surfaces instead of clipping to
   10 bits (the fallback used before oxideav-core 0.1.30 gained those

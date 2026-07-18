@@ -91,6 +91,19 @@ impl DiracDecoder {
         self.last_sequence.as_ref()
     }
 
+    /// The oxideav-core [`PixelFormat`] this decoder emits for pictures
+    /// of the most recently parsed sequence header, or `None` before
+    /// any header has been seen. Derived from the header's §10.3.3
+    /// chroma format and §10.5.2 luma depth via [`output_format_for`] —
+    /// the same choice `receive_frame` uses to pack planes, so callers
+    /// wiring the frame into format-aware plumbing can consult this
+    /// after the first `send_packet`.
+    pub fn output_pixel_format(&self) -> Option<PixelFormat> {
+        self.last_sequence
+            .as_ref()
+            .map(|s| output_format_for(s.video_params.chroma_format, s.luma_depth).0)
+    }
+
     /// Walk any new bytes appended to the buffer. We remember how far
     /// we've walked so subsequent calls don't reprocess old units.
     fn scan(&mut self) -> Result<()> {
@@ -295,6 +308,50 @@ impl Decoder for DiracDecoder {
     fn flush(&mut self) -> Result<()> {
         self.eof = true;
         self.scan()
+    }
+
+    /// Arena-backed variant of `receive_frame` with a **correct**
+    /// [`oxideav_core::arena::FrameHeader`]: real picture width /
+    /// height from the sequence header (§10.5.1 — field-coded streams
+    /// report the per-picture field height) and the true output
+    /// [`PixelFormat`] from [`output_format_for`], including the
+    /// 10/12-bit and deep-colour 16-bit surfaces the trait-default
+    /// implementation cannot guess from plane shapes alone.
+    fn receive_arena_frame(&mut self) -> Result<oxideav_core::arena::sync::Frame> {
+        let frame = self.receive_frame()?;
+        let v = match frame {
+            Frame::Video(v) => v,
+            _ => {
+                return Err(Error::invalid(
+                    "dirac: receive_arena_frame: non-video frame from a video decoder",
+                ))
+            }
+        };
+        // `receive_frame` only succeeds after a sequence header has
+        // been parsed, so `last_sequence` is populated here.
+        let seq = self.last_sequence.as_ref().ok_or_else(|| {
+            Error::invalid("dirac: receive_arena_frame: frame decoded without a sequence header")
+        })?;
+        let (format, _) = output_format_for(seq.video_params.chroma_format, seq.luma_depth);
+
+        let total_bytes: usize = v.planes.iter().map(|p| p.data.len()).sum();
+        let pool = oxideav_core::arena::sync::ArenaPool::with_alloc_count_cap(
+            1,
+            total_bytes,
+            (v.planes.len() as u32).saturating_add(1),
+        );
+        let arena = pool.lease()?;
+        let mut plane_offsets: Vec<(usize, usize)> = Vec::with_capacity(v.planes.len());
+        let mut cursor = 0usize;
+        for plane in &v.planes {
+            let dst = arena.alloc::<u8>(plane.data.len())?;
+            dst.copy_from_slice(&plane.data);
+            plane_offsets.push((cursor, plane.data.len()));
+            cursor += plane.data.len();
+        }
+        let header =
+            oxideav_core::arena::FrameHeader::new(seq.luma_width, seq.luma_height, format, v.pts);
+        oxideav_core::arena::sync::FrameInner::new(arena, &plane_offsets, header)
     }
 }
 
