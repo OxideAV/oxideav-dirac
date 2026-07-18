@@ -15,7 +15,9 @@ framework but usable standalone.
 Dirac is a large codec (wavelet transforms + custom arithmetic coder +
 motion compensation). This crate covers the full intra path bit-exactly,
 a working inter path, encoders for both VC-2 profiles and the Dirac
-core syntax, and the VC-2 v3 fragmented-picture path.
+core syntax, and the VC-2 v3 fragmented-picture path. The docs
+fixture corpus (12 fixtures, 8-bit through 16-bit deep colour) decodes
+12/12 bit-exact.
 
 ### Decode
 
@@ -31,7 +33,7 @@ core syntax, and the VC-2 v3 fragmented-picture path.
 | High-bit-depth / deep-colour intra **decode** | §10.5.2 `video_depth`-parameterised reconstruction proven end-to-end at 10-bit (HQ, all 3 chromas × 6 reversible wavelets; all `dwt_depth` 1..=5; §12.4.4 asymmetric transform), 12-bit (HQ, all 3 chromas — native `Yuv*P12Le` since round-417) and **13-16-bit deep colour** (HQ, 16-bit across all 3 chromas × 6 wavelets, 13/14/15-bit MSB-aligned — all bit-exact) via full-range `&[u16]` encode → decode round-trips. Output surfaces: `Yuv*P` / `Yuv*P10Le` / `Yuv*P12Le` / all-bits-significant `Yuv*P16Le` per `decoder::output_format_for`; `DiracDecoder::output_pixel_format` + an exact-header `receive_arena_frame` expose the choice to callers |
 | Dirac core-syntax inter **decode** | OBMC motion compensation + §11.3 residue — **reference-exact on every inter fixture in the docs corpus** (integer-pel `i-then-p` / `i-p-b`, and since round-408 the quarter-pel interlaced LeGall-5,3 fixture as well). Round-408 pinned §15.8.10's out-of-frame edge extension by black-box probe bitstreams: clamp the *integer-pel part* of the half-pel coordinate, keep the half-pel fraction (the pseudocode's raw coordinate clip drops it, ±1..3 LSB at overspilled edges). The `edge-mc-probes-320x240` corpus fixture guards the rule at every MV precision on all four edges; §15.8.10/§15.8.11 sub-pel primitives are also pinned against hand-computed spec values |
 | Decode tracing | Env-gated `DIRAC_TRACE` / `DIRAC_TRACE_FILE` instrumentation emitting the docs trace-contract event vocabulary — `PARSE_UNIT`, `SEQUENCE`, `PICTURE`, `MOTION`, `MOTION_BLOCK`, `MOTION_GLOBAL`, and per-block `MOTION_MV` lines (final MV + predictor + residual + DC per reference), plus the opt-in `DIRAC_TRACE_MC` `MC_PLANE` SHA-256 of the pre-residual OBMC prediction plane — so decode divergences can be localised to a block or split MC-vs-residual without external tooling |
-| VC-2 v3 fragmented pictures | §14.2 fragment headers, §14.3/§14.4 reassembly, §14.5 trailing DC kick, and the `FragmentedPictureDecoder` driver — bit-exact-equivalent to the non-fragmented path on LD and HQ, including the asymmetric transform |
+| VC-2 v3 fragmented pictures | §14.2 fragment headers, §14.3/§14.4 reassembly, §14.5 trailing DC kick, and the `FragmentedPictureDecoder` driver — bit-exact-equivalent to the non-fragmented path on LD and HQ, including the asymmetric transform and (round-417) 16-bit deep-colour pictures |
 
 ### Encode
 
