@@ -21,8 +21,7 @@
 //!   underlying gap (LD profile, OBMC inter, 4:2:2, interlaced,
 //!   per-picture wavelet switch, …).
 //!
-//! Workspace policy: NO external library code (libschroedinger,
-//! libdirac, libavcodec, …) was consulted while writing this driver.
+//! Workspace policy: this driver was written from the specs alone.
 //! Spec authority: SMPTE ST 2042-1 / -2 (VC-2) and the Dirac BBC
 //! specification. The `trace.txt` files are an aid for the human
 //! implementer when localising divergences — the driver references
