@@ -24,6 +24,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sequence header and the true output pixel format (including the
   10/12-bit and deep-colour 16-bit surfaces), instead of the
   trait-default plane-count guess (round-417).
+- `SignalRange::PRESET_14BIT_FULL` / `PRESET_16BIT_FULL` — full-range
+  deep-colour signal ranges (emitted as §10.3.8 custom ranges,
+  `preset_idx = 0`) whose `2^(d-1)` offsets centre the §15.10 output
+  offset exactly. HQ intra encode → decode round-trips are q0
+  bit-exact at 13/14/15/16 bits (16-bit across all 3 chroma samplings
+  × 6 reversible wavelets; 13-15-bit recovered through the documented
+  MSB alignment), 12-bit 4:2:2/4:4:4 is now bit-exact end-to-end, and
+  the LD slice path is verified at 16-bit (round-417).
 - 11/12-bit 4:2:2 and 4:4:4 streams now decode to the native
   `Yuv422P12Le` / `Yuv444P12Le` surfaces instead of clipping to
   10 bits (the fallback used before oxideav-core 0.1.30 gained those

@@ -123,6 +123,32 @@ impl SignalRange {
         chroma_excursion: 4095,
     };
 
+    /// Full-range 14-bit signal range, emitted as a §10.3.8 custom
+    /// signal range (`preset_idx = 0`). §10.5.2
+    /// `video_depth = intlog2(16383 + 1) = 14`; the `2^13` offsets
+    /// match the §15.10 output offset so a full `[0, 16383]` component
+    /// round-trips symmetrically. Streams at this depth decode to the
+    /// all-bits-significant `Yuv*P16Le` deep-colour surface.
+    pub const PRESET_14BIT_FULL: Self = Self {
+        luma_offset: 8192,
+        luma_excursion: 16383,
+        chroma_offset: 8192,
+        chroma_excursion: 16383,
+    };
+
+    /// Full-range 16-bit signal range, emitted as a §10.3.8 custom
+    /// signal range (`preset_idx = 0`). §10.5.2
+    /// `video_depth = intlog2(65535 + 1) = 16`; the `2^15` offsets
+    /// match the §15.10 output offset so a full `[0, 65535]` component
+    /// round-trips symmetrically. This is the deepest component depth
+    /// the `Yuv*P16Le` output surface represents losslessly.
+    pub const PRESET_16BIT_FULL: Self = Self {
+        luma_offset: 32768,
+        luma_excursion: 65535,
+        chroma_offset: 32768,
+        chroma_excursion: 65535,
+    };
+
     pub fn preset(index: u32) -> Option<Self> {
         match index {
             1 => Some(Self::PRESET_8BIT_FULL),

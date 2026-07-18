@@ -1,5 +1,8 @@
 //! Round-345 — high-bit-depth (10/12-bit) intra encode → decode
-//! round-trip coverage.
+//! round-trip coverage; round-417 extends it to the deep-colour
+//! 13-16-bit depths that decode onto the all-bits-significant
+//! `Yuv*P16Le` surfaces (16-bit verbatim, 13-15-bit MSB-aligned), and
+//! to the now-native 12-bit 4:2:2/4:4:4 `Yuv*P12Le` paths.
 //!
 //! `docs/video/dirac/dirac-fixtures-and-traces.md` lists **bit depths >
 //! 8 (10, 12, 16)** as an explicit corpus gap: every upstream sample we
@@ -140,9 +143,8 @@ fn hq_10bit_full_range_q0_bit_exact_across_wavelets_and_chromas() {
     }
 }
 
-/// HQ intra, 12-bit full-range, 4:2:0 — core has a `Yuv420P12Le` storage
-/// format so the full 12-bit field survives round-trip without the
-/// 10-bit demotion the 4:2:2/4:4:4 >10-bit paths take.
+/// HQ intra, 12-bit full-range, 4:2:0 — the `Yuv420P12Le` storage
+/// format carries the full 12-bit field bit-exactly.
 #[test]
 fn hq_12bit_full_range_q0_bit_exact_420() {
     let (w, h) = (64u32, 64u32);
@@ -171,6 +173,149 @@ fn hq_12bit_full_range_q0_bit_exact_420() {
         assert_planes_eq(&format!("{tag} Y"), &gy, &y);
         assert_planes_eq(&format!("{tag} U"), &gu, &u);
         assert_planes_eq(&format!("{tag} V"), &gv, &v);
+    }
+}
+
+/// HQ intra, 12-bit full-range, 4:2:2 and 4:4:4 — round-417: with
+/// oxideav-core's `Yuv422P12Le` / `Yuv444P12Le` the decoder no longer
+/// clips these chroma samplings to 10 bits, so the round-trip is now
+/// bit-exact at 12 bits everywhere (this used to be impossible: the
+/// two low bits died in the 10-bit demotion).
+#[test]
+fn hq_12bit_full_range_q0_bit_exact_422_444() {
+    let (w, h) = (64u32, 64u32);
+    let sr = SignalRange::PRESET_12BIT_FULL;
+    for chroma in [ChromaFormat::Yuv422, ChromaFormat::Yuv444] {
+        let (cw, ch) = chroma_dims(w, h, chroma);
+        let y = ramp_plane(w as usize, h as usize, 12, 4);
+        let u = ramp_plane(cw as usize, ch as usize, 12, 8);
+        let v = ramp_plane(cw as usize, ch as usize, 12, 12);
+        let seq = make_minimal_sequence_with_signal_range(w, h, chroma, sr);
+        assert_eq!(seq.luma_depth, 12);
+
+        let mut params = EncoderParams::default_hq(WaveletFilter::LeGall5_3, 3);
+        params.slice_size_scaler = 8;
+        let stream = encode_single_hq_intra_stream_u16(&seq, &params, 0, &y, &u, &v);
+        let frame = decode_one(stream);
+        let gy = plane_as_u16(&frame.planes[0].data);
+        let gu = plane_as_u16(&frame.planes[1].data);
+        let gv = plane_as_u16(&frame.planes[2].data);
+        let tag = format!("HQ 12-bit {chroma:?}");
+        assert_planes_eq(&format!("{tag} Y"), &gy, &y);
+        assert_planes_eq(&format!("{tag} U"), &gu, &u);
+        assert_planes_eq(&format!("{tag} V"), &gv, &v);
+    }
+}
+
+/// Undo the decoder's deep-colour MSB alignment: a `depth`-bit source
+/// stored on the all-bits-significant 16-bit surface sits in the top
+/// `depth` bits of each word (`sample << (16 - depth)`), so the
+/// original sample is recovered by the inverse shift. For `depth == 16`
+/// this is the identity — the surface is exactly the sample.
+fn unshift_p16(plane: &[u16], depth: u32) -> Vec<u16> {
+    let sh = 16 - depth;
+    plane.iter().map(|&v| v >> sh).collect()
+}
+
+/// The deep-colour headline: HQ intra at **16-bit** full range must be
+/// bit-exact at qindex 0 across all three chroma samplings and the six
+/// reversible wavelets, decoding onto the `Yuv*P16Le` surface where
+/// every word is the sample verbatim. This is the §10.3.8 custom
+/// signal range with excursion 65535 → §10.5.2 `video_depth = 16`,
+/// the deepest depth the output surface represents losslessly.
+#[test]
+fn hq_16bit_full_range_q0_bit_exact_across_wavelets_and_chromas() {
+    let (w, h) = (64u32, 64u32);
+    let sr = SignalRange::PRESET_16BIT_FULL;
+    for chroma in [
+        ChromaFormat::Yuv420,
+        ChromaFormat::Yuv422,
+        ChromaFormat::Yuv444,
+    ] {
+        let (cw, ch) = chroma_dims(w, h, chroma);
+        let y = ramp_plane(w as usize, h as usize, 16, 1);
+        let u = ramp_plane(cw as usize, ch as usize, 16, 5);
+        let v = ramp_plane(cw as usize, ch as usize, 16, 9);
+        let seq = make_minimal_sequence_with_signal_range(w, h, chroma, sr);
+        assert_eq!(seq.luma_depth, 16, "16-bit full range → luma_depth 16");
+        assert_eq!(seq.chroma_depth, 16);
+
+        for filter in [
+            WaveletFilter::DeslauriersDubuc9_7,
+            WaveletFilter::LeGall5_3,
+            WaveletFilter::DeslauriersDubuc13_7,
+            WaveletFilter::Haar0,
+            WaveletFilter::Haar1,
+            WaveletFilter::Daubechies9_7,
+        ] {
+            // 16-bit coefficients are ~256× the 8-bit magnitude; widen
+            // the HQ slice length-byte unit accordingly (decoded
+            // coefficients are unaffected — qindex 0 stays bit-exact).
+            let mut params = EncoderParams::default_hq(filter, 3);
+            params.slice_size_scaler = 32;
+            let stream = encode_single_hq_intra_stream_u16(&seq, &params, 0, &y, &u, &v);
+            let frame = decode_one(stream);
+
+            let gy = plane_as_u16(&frame.planes[0].data);
+            let gu = plane_as_u16(&frame.planes[1].data);
+            let gv = plane_as_u16(&frame.planes[2].data);
+            let tag = format!("HQ 16-bit {chroma:?} {filter:?}");
+            assert_planes_eq(&format!("{tag} Y"), &gy, &y);
+            assert_planes_eq(&format!("{tag} U"), &gu, &u);
+            assert_planes_eq(&format!("{tag} V"), &gv, &v);
+        }
+    }
+}
+
+/// 13-, 14- and 15-bit custom full ranges land on the same 16-bit
+/// surface with the samples MSB-aligned (`<< (16 - depth)`); undoing
+/// the alignment must recover the input bit-exactly at qindex 0. Each
+/// depth pairs with a different chroma sampling so the intermediate
+/// depths sweep the whole surface trio.
+#[test]
+fn hq_13_to_15bit_full_range_q0_bit_exact_msb_aligned() {
+    let (w, h) = (64u32, 64u32);
+    for (depth, chroma) in [
+        (13u32, ChromaFormat::Yuv420),
+        (14u32, ChromaFormat::Yuv422),
+        (15u32, ChromaFormat::Yuv444),
+    ] {
+        let max = ((1u64 << depth) - 1) as u32;
+        let sr = SignalRange {
+            luma_offset: 1 << (depth - 1),
+            luma_excursion: max,
+            chroma_offset: 1 << (depth - 1),
+            chroma_excursion: max,
+        };
+        let (cw, ch) = chroma_dims(w, h, chroma);
+        let y = ramp_plane(w as usize, h as usize, depth, 2);
+        let u = ramp_plane(cw as usize, ch as usize, depth, 6);
+        let v = ramp_plane(cw as usize, ch as usize, depth, 10);
+        let seq = make_minimal_sequence_with_signal_range(w, h, chroma, sr);
+        assert_eq!(seq.luma_depth, depth);
+
+        let mut params = EncoderParams::default_hq(WaveletFilter::LeGall5_3, 3);
+        params.slice_size_scaler = 32;
+        let stream = encode_single_hq_intra_stream_u16(&seq, &params, 0, &y, &u, &v);
+        let frame = decode_one(stream);
+        // Two bytes per sample on the 16-bit surface.
+        assert_eq!(frame.planes[0].data.len(), (w * h * 2) as usize);
+        let gy = unshift_p16(&plane_as_u16(&frame.planes[0].data), depth);
+        let gu = unshift_p16(&plane_as_u16(&frame.planes[1].data), depth);
+        let gv = unshift_p16(&plane_as_u16(&frame.planes[2].data), depth);
+        let tag = format!("HQ {depth}-bit {chroma:?}");
+        assert_planes_eq(&format!("{tag} Y"), &gy, &y);
+        assert_planes_eq(&format!("{tag} U"), &gu, &u);
+        assert_planes_eq(&format!("{tag} V"), &gv, &v);
+
+        // The alignment itself: a full-scale sample must occupy the
+        // top `depth` bits (low `16 - depth` bits zero).
+        let raw = plane_as_u16(&frame.planes[0].data);
+        let low_mask = (1u16 << (16 - depth)) - 1;
+        assert!(
+            raw.iter().all(|&s| s & low_mask == 0),
+            "{tag}: low bits of the MSB-aligned surface must be zero"
+        );
     }
 }
 
@@ -229,10 +374,88 @@ fn ld_10bit_full_range_high_fidelity_420() {
     );
 }
 
+/// LD intra at 16-bit full range: the §13.5.1 DC-prediction LD slice
+/// path at the deepest representable depth. Same shape as the 10-bit
+/// LD test — a generous per-slice byte budget keeps the qindex-0
+/// coefficients unclipped, and a 16-bit-peak PSNR floor guards the
+/// reconstruction (bit-exactness is asserted when the budget holds,
+/// via the exact-match INFINITY case).
+#[test]
+fn ld_16bit_full_range_high_fidelity_420() {
+    let (w, h) = (64u32, 64u32);
+    let sr = SignalRange::PRESET_16BIT_FULL;
+    let chroma = ChromaFormat::Yuv420;
+    let (cw, ch) = chroma_dims(w, h, chroma);
+    let y = ramp_plane(w as usize, h as usize, 16, 3);
+    let u = ramp_plane(cw as usize, ch as usize, 16, 7);
+    let v = ramp_plane(cw as usize, ch as usize, 16, 11);
+    let seq = make_minimal_sequence_ld_with_signal_range(w, h, chroma, sr);
+    assert_eq!(seq.luma_depth, 16);
+
+    // 8×8 slice grid; 16-bit coefficients need ~2 more bytes per
+    // sample than the 10-bit test's 512-byte budget allowed.
+    let params = LdEncoderParams::default_ld(WaveletFilter::LeGall5_3, 3, 8, 8, 2048);
+    let stream = encode_single_ld_intra_stream_u16(&seq, &params, 0, &y, &u, &v);
+    let frame = decode_one(stream);
+    let gy = plane_as_u16(&frame.planes[0].data);
+    let gu = plane_as_u16(&frame.planes[1].data);
+    let gv = plane_as_u16(&frame.planes[2].data);
+
+    // 16-bit peak PSNR (peak 65535); INFINITY on bit-exact.
+    let psnr16 = |a: &[u16], b: &[u16]| -> f64 {
+        let sse: u64 = a
+            .iter()
+            .zip(b)
+            .map(|(&x, &y)| {
+                let d = x as i64 - y as i64;
+                (d * d) as u64
+            })
+            .sum();
+        if sse == 0 {
+            return f64::INFINITY;
+        }
+        let mse = sse as f64 / a.len() as f64;
+        20.0 * (65535.0f64).log10() - 10.0 * mse.log10()
+    };
+    let py = psnr16(&gy, &y);
+    let pu = psnr16(&gu, &u);
+    let pv = psnr16(&gv, &v);
+    assert!(
+        py >= 50.0 && pu >= 50.0 && pv >= 50.0,
+        "LD 16-bit reconstruction PSNR too low (Y {py:.2} U {pu:.2} V {pv:.2} dB)"
+    );
+}
+
 /// A flat mid-grey 10-bit plane (value 512 = 2^9, the bi-polar zero
 /// after the full-range recentre) must reconstruct exactly: this
 /// isolates the §15.10 output offset (`+2^(depth-1)`) from any
 /// coefficient activity, so a wrong offset would shift every sample.
+/// The 16-bit analogue of the flat mid-grey probe: value 32768 = 2^15
+/// is the bi-polar zero after the full-range recentre, so a wrong
+/// §15.10 offset (or a wrong 16-bit surface shift) would move every
+/// sample.
+#[test]
+fn hq_16bit_flat_midgrey_offset_is_exact() {
+    let (w, h) = (32u32, 32u32);
+    let sr = SignalRange::PRESET_16BIT_FULL;
+    let chroma = ChromaFormat::Yuv420;
+    let (cw, ch) = chroma_dims(w, h, chroma);
+    let y = vec![32768u16; (w * h) as usize];
+    let u = vec![32768u16; (cw * ch) as usize];
+    let v = vec![32768u16; (cw * ch) as usize];
+    let seq = make_minimal_sequence_with_signal_range(w, h, chroma, sr);
+    let mut params = EncoderParams::default_hq(WaveletFilter::LeGall5_3, 3);
+    params.slice_size_scaler = 32;
+    let stream = encode_single_hq_intra_stream_u16(&seq, &params, 0, &y, &u, &v);
+    let frame = decode_one(stream);
+    let gy = plane_as_u16(&frame.planes[0].data);
+    assert!(
+        gy.iter().all(|&s| s == 32768),
+        "flat 16-bit mid-grey must reconstruct to 32768 everywhere; got {:?}…",
+        &gy[..8.min(gy.len())]
+    );
+}
+
 #[test]
 fn hq_10bit_flat_midgrey_offset_is_exact() {
     let (w, h) = (32u32, 32u32);
@@ -388,6 +611,14 @@ fn full_range_presets_have_expected_depths() {
     // intlog2(excursion + 1).
     assert_eq!(SignalRange::PRESET_10BIT_FULL.luma_excursion + 1, 1024);
     assert_eq!(SignalRange::PRESET_12BIT_FULL.luma_excursion + 1, 4096);
+    assert_eq!(SignalRange::PRESET_14BIT_FULL.luma_excursion + 1, 16384);
+    assert_eq!(
+        SignalRange::PRESET_16BIT_FULL.luma_excursion as u64 + 1,
+        65536
+    );
+    // The deep offsets centre the bi-polar recentre exactly.
+    assert_eq!(SignalRange::PRESET_14BIT_FULL.luma_offset, 8192);
+    assert_eq!(SignalRange::PRESET_16BIT_FULL.luma_offset, 32768);
     // Distinct from the standard video-range presets.
     assert_ne!(
         SignalRange::PRESET_10BIT_FULL,
