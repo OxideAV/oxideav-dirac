@@ -548,3 +548,137 @@ fn truncated_gibberish_terminates() {
         }
     }
 }
+
+// -------------------------------------------------------------------
+// Round-417: deep-colour (16-bit) stream robustness
+// -------------------------------------------------------------------
+
+/// Build a known-good 1-picture **16-bit** HQ stream (§10.3.8 index-0
+/// custom full range) we can truncate / mutate. The deep path adds
+/// the 16-bit output packing and ~256× coefficient magnitudes, so it
+/// deserves its own hostile-input walk.
+fn good_deep_hq_stream() -> Vec<u8> {
+    use oxideav_dirac::encoder::{
+        encode_single_hq_intra_stream_u16, make_minimal_sequence_with_signal_range,
+    };
+    use oxideav_dirac::video_format::SignalRange;
+    let seq = make_minimal_sequence_with_signal_range(
+        64,
+        64,
+        ChromaFormat::Yuv420,
+        SignalRange::PRESET_16BIT_FULL,
+    );
+    let mut params = EncoderParams::default_hq(WaveletFilter::LeGall5_3, 3);
+    params.slice_size_scaler = 32;
+    let mk = |n: usize, seed: u64| -> Vec<u16> {
+        (0..n)
+            .map(|i| (((i as u64 + seed) * 2654435761) % 65536) as u16)
+            .collect()
+    };
+    let y = mk(64 * 64, 1);
+    let u = mk(32 * 32, 5);
+    let v = mk(32 * 32, 9);
+    encode_single_hq_intra_stream_u16(&seq, &params, 0, &y, &u, &v)
+}
+
+/// Truncation walk over the 16-bit stream: every prefix must decode a
+/// frame or fail cleanly.
+#[test]
+fn deep_hq_truncation_walk_terminates_cleanly() {
+    let stream = good_deep_hq_stream();
+    for len in 0..stream.len() {
+        let (_frames, _res) = drive(&stream[..len]);
+    }
+}
+
+/// Single-byte mutation walk over the 16-bit stream: garbled pixels
+/// or a clean error are both fine; a panic is a decoder bug. (The
+/// full stream is ~20 KB; walking one mutation per byte × 3 values is
+/// the same budget the 8-bit LD walk uses.)
+#[test]
+fn deep_hq_mutation_walk_terminates_cleanly() {
+    let stream = good_deep_hq_stream();
+    for i in 0..stream.len() {
+        for val in [0x00u8, 0xFF, !stream[i]] {
+            if stream[i] == val {
+                continue;
+            }
+            let mut m = stream.clone();
+            m[i] = val;
+            let (_frames, _res) = drive(&m);
+        }
+    }
+}
+
+/// A hostile sequence header whose §10.3.8 custom excursions push the
+/// §10.5.2 video depth past 16 bits (up to 32 for `u32::MAX`) must be
+/// rejected cleanly by the front-end capability bound — never reach
+/// the IDWT with un-guaranteed i32 headroom. Sweeps a 17-bit, a
+/// 24-bit and the maximal 32-bit excursion, on both components.
+#[test]
+fn over_16bit_video_depth_rejected_cleanly() {
+    use oxideav_dirac::encoder::{encode_sequence_header, write_parse_info};
+    use oxideav_dirac::sequence::{
+        ParseParameters, PictureCodingMode, SequenceHeader, VideoParams,
+    };
+    use oxideav_dirac::video_format::{ScanFormat, SignalRange};
+
+    for (le, ce) in [
+        (131071u32, 65535u32), // 17-bit luma
+        (65535, 16777215),     // 24-bit chroma
+        (u32::MAX, u32::MAX),  // 32-bit both
+    ] {
+        let vp = VideoParams {
+            frame_width: 64,
+            frame_height: 64,
+            chroma_format: ChromaFormat::Yuv420,
+            source_sampling: ScanFormat::Progressive,
+            top_field_first: false,
+            frame_rate_numer: 25,
+            frame_rate_denom: 1,
+            pixel_aspect_ratio_numer: 1,
+            pixel_aspect_ratio_denom: 1,
+            clean_width: 64,
+            clean_height: 64,
+            clean_left_offset: 0,
+            clean_top_offset: 0,
+            signal_range: SignalRange {
+                luma_offset: 0,
+                luma_excursion: le,
+                chroma_offset: 0,
+                chroma_excursion: ce,
+            },
+        };
+        let seq = SequenceHeader {
+            parse_parameters: ParseParameters {
+                version_major: 2,
+                version_minor: 0,
+                profile: 3,
+                level: 0,
+            },
+            base_video_format_index: 0,
+            video_params: vp,
+            picture_coding_mode: PictureCodingMode::Frames,
+            luma_width: 64,
+            luma_height: 64,
+            chroma_width: 32,
+            chroma_height: 32,
+            luma_depth: 17, // parse recomputes; placeholder
+            chroma_depth: 17,
+        };
+        let sh_payload = encode_sequence_header(&seq);
+        let mut stream = Vec::new();
+        write_parse_info(&mut stream, 0x00, (13 + sh_payload.len()) as u32, 0);
+        stream.extend_from_slice(&sh_payload);
+        write_parse_info(&mut stream, 0x10, 0, (13 + sh_payload.len()) as u32);
+
+        let (frames, res) = drive(&stream);
+        assert_eq!(frames, 0, "no frames from a depth-rejected stream");
+        match res {
+            Err(Error::Unsupported(_)) => {}
+            other => panic!(
+                "excursions ({le}, {ce}): expected Unsupported for >16-bit video depth, got {other:?}"
+            ),
+        }
+    }
+}

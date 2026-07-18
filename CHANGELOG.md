@@ -67,6 +67,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   full-range HQ picture split into one data fragment per slice
   reassembles bit-exactly against the non-fragmented decode (and the
   lossless source), at a non-default `slice_size_scaler` (round-417).
+- Decoder capability bound: sequence headers whose §10.5.2 video depth
+  exceeds 16 bits (hostile §10.3.8 custom excursions can signal up to
+  32) are rejected with a clean `Unsupported` error instead of
+  reaching the IDWT with un-guaranteed `i32` headroom. New fuzz-oracle
+  walks cover the deep path: full truncation and single-byte-mutation
+  sweeps over a 16-bit HQ stream, plus the over-16-bit-depth rejection
+  sweep (round-417).
 - 11/12-bit 4:2:2 and 4:4:4 streams now decode to the native
   `Yuv422P12Le` / `Yuv444P12Le` surfaces instead of clipping to
   10 bits (the fallback used before oxideav-core 0.1.30 gained those
@@ -95,6 +102,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `BitWriter::write_uint(u32::MAX)` no longer panics: `u32::MAX` is a
+  legal §A.3.2 exp-Golomb uint whose magnitude field `value + 1 = 2^32`
+  is 33 bits, but the u32-domain increment wrapped to 0 and underflowed
+  the code-length computation. The writer now works in u64 and emits
+  the full 65-bit code (round-417).
 - Inter encoder: §11.2.2 block parameters are emitted as custom
   literals instead of preset index 1, and zero-residue pictures carry
   an explicit all-zero-band residual (`explicit_zero_residue`, default

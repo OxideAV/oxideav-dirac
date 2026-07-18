@@ -132,6 +132,22 @@ impl DiracDecoder {
             if pi.is_seq_header() {
                 match parse_sequence_header(&payload) {
                     Ok(sh) => {
+                        // Capability bound: §10.5.2 derives the video
+                        // depth from the (unbounded) §10.3.8 excursion
+                        // fields, so a hostile header can signal up to
+                        // 32-bit components. 16 bits is the deepest
+                        // depth any Dirac/VC-2 signal-range convention
+                        // reaches and the deepest the `Yuv*P16Le`
+                        // output surface represents; beyond it the
+                        // decode pipeline's i32 headroom is no longer
+                        // guaranteed. Reject cleanly instead of risking
+                        // arithmetic overflow deep in the IDWT.
+                        if sh.luma_depth > 16 || sh.chroma_depth > 16 {
+                            return Err(Error::unsupported(format!(
+                                "dirac: video depth {}/{} exceeds the supported 16-bit maximum",
+                                sh.luma_depth, sh.chroma_depth
+                            )));
+                        }
                         if crate::trace::enabled() {
                             emit_sequence_trace(&sh);
                         }
@@ -477,7 +493,10 @@ fn plane_from_i32(values: &[i32], width: usize, source_depth: u32, store_depth: 
             let max_src = if source_depth == 0 {
                 0
             } else {
-                ((1u64 << source_depth) - 1) as i32
+                // The decoder front-end caps depths at 16; the `min`
+                // keeps the cast positive (and the clamp well-formed)
+                // even for out-of-contract callers.
+                ((1u64 << source_depth.min(30)) - 1) as i32
             };
             let mut data = Vec::with_capacity(values.len());
             for &v in values {

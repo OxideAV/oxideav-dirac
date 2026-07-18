@@ -127,14 +127,19 @@ impl BitWriter {
         //
         // E.g. value=0 -> value+1=1 (just the MSB) -> encode as "1".
         //      value=2 -> value+1=3 (bits "11")    -> "0 1 1" -> "011".
-        let n = value.wrapping_add(1);
-        let bit_len = 32 - n.leading_zeros();
+        //
+        // Widen to u64 before the +1: `u32::MAX` is a legal §A.3.2
+        // uint whose magnitude field `value + 1 = 2^32` is 33 bits —
+        // the previous u32-domain increment wrapped to 0 there and
+        // underflowed the length computation.
+        let n = value as u64 + 1;
+        let bit_len = 64 - n.leading_zeros();
         // The top bit of `n` is always 1 and isn't transmitted as data;
         // the (bit_len - 1) lower bits are each preceded by a `0`
         // "follow" bit, then a final `1` follow bit terminates.
         for i in (0..bit_len - 1).rev() {
             self.write_bit(0);
-            self.write_bit((n >> i) & 1);
+            self.write_bit(((n >> i) & 1) as u32);
         }
         self.write_bit(1);
     }
@@ -182,14 +187,48 @@ mod tests {
 
     #[test]
     fn exp_golomb_write_matches_read() {
-        // Spot-check against Table A.1 via roundtrip.
-        for &v in &[0u32, 1, 2, 3, 4, 5, 6, 7, 100, 1023, 1_000_000] {
+        // Spot-check against Table A.1 via roundtrip. `2^31 - 1` is
+        // the largest value the (deliberately depth-bounded) reader
+        // reproduces exactly.
+        for &v in &[
+            0u32,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            100,
+            1023,
+            1_000_000,
+            i32::MAX as u32,
+        ] {
             let mut w = BitWriter::new();
             w.write_uint(v);
             let out = w.finish();
             let mut r = BitReader::new(&out);
             assert_eq!(r.read_uint(), v, "uint {v}");
         }
+    }
+
+    /// `u32::MAX` is a legal §A.3.2 uint whose magnitude field
+    /// `value + 1 = 2^32` needs 33 bits — the writer must emit the
+    /// full 65-bit code (32 follow/data pairs + terminator) rather
+    /// than underflow (the pre-round-417 u32-domain `value + 1`
+    /// wrapped to 0). The bounded reader intentionally saturates on
+    /// such codes, so only the writer side is length-checked here.
+    #[test]
+    fn exp_golomb_u32_max_emits_full_length_code() {
+        let mut w = BitWriter::new();
+        w.write_uint(u32::MAX);
+        let out = w.finish();
+        // 65 bits → 9 bytes once padded.
+        assert_eq!(out.len(), 9);
+        // 32 leading (0, data) pairs where every data bit of 2^32's
+        // lower 32 bits is 0 → 64 zero bits, then the 1 terminator.
+        assert!(out[..8].iter().all(|&b| b == 0));
+        assert_eq!(out[8], 0b1000_0000);
     }
 
     #[test]
