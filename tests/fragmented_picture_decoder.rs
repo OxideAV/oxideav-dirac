@@ -929,3 +929,101 @@ fn assembler_public_path_resolves() {
     let _x: Option<AssemblerError> = None;
     let _tp: Option<TransformParameters> = None;
 }
+
+/// Round-417 deep colour through the §14 fragment path: a **16-bit**
+/// full-range HQ picture (the `&[u16]` encoder + §10.3.8 index-0
+/// custom signal range) split into one data fragment per slice must
+/// reassemble to the same `DecodedPicture` the non-fragmented decode
+/// yields — the fragment state machine carries slice *bytes* and is
+/// depth-agnostic, but nothing proved that end-to-end above 8 bits
+/// until now. Deep coefficients need a wider slice length-byte unit
+/// (`slice_size_scaler = 32`), which also exercises the dissector's
+/// scaler-based slice walk at a non-default scaler.
+#[test]
+fn hq_q0_16bit_one_data_fragment_per_slice_bit_exact_vs_non_fragmented() {
+    use oxideav_dirac::encoder::{
+        encode_single_hq_intra_stream_u16, make_minimal_sequence_with_signal_range,
+    };
+    use oxideav_dirac::video_format::SignalRange;
+
+    let w: u32 = 16;
+    let h: u32 = 16;
+    let deep_plane = |w: usize, h: usize, seed: u64| -> Vec<u16> {
+        let mut v = Vec::with_capacity(w * h);
+        for y in 0..h {
+            for x in 0..w {
+                let mix = x as u64 * 17 + y as u64 * 31 + seed * 7;
+                v.push(((mix * 2654435761) % 65536) as u16);
+            }
+        }
+        v
+    };
+    let y = deep_plane(w as usize, h as usize, 3);
+    let u = deep_plane((w / 2) as usize, (h / 2) as usize, 9);
+    let v = deep_plane((w / 2) as usize, (h / 2) as usize, 17);
+
+    let seq = make_minimal_sequence_with_signal_range(
+        w,
+        h,
+        ChromaFormat::Yuv420,
+        SignalRange {
+            luma_offset: 32768,
+            luma_excursion: 65535,
+            chroma_offset: 32768,
+            chroma_excursion: 65535,
+        },
+    );
+    assert_eq!(seq.luma_depth, 16);
+    let mut params = EncoderParams::default_hq(WaveletFilter::LeGall5_3, 2);
+    params.slice_size_scaler = 32;
+    let stream = encode_single_hq_intra_stream_u16(&seq, &params, 43, &y, &u, &v);
+    let round = parse_and_decode(&stream);
+
+    let dissect_params = HqDissectParams::symmetric(
+        params.slices_x,
+        params.slices_y,
+        params.slice_prefix_bytes,
+        params.slice_size_scaler,
+    );
+    let (picture_number, tp_range, slices) =
+        dissect_hq_picture_payload(round.picture_payload, &dissect_params);
+    assert_eq!(picture_number, 43);
+
+    let tp_bytes = &round.picture_payload[tp_range.clone()];
+    let setup_payload = setup_fragment_payload(picture_number, tp_bytes);
+    let setup_pi = ParseInfo {
+        parse_code: 0xEC,
+        next_parse_offset: (ParseInfo::SIZE + setup_payload.len()) as u32,
+        previous_parse_offset: 0,
+    };
+
+    let mut dec = FragmentedPictureDecoder::new(&round.sequence);
+    dec.on_setup_fragment(&setup_pi, &setup_payload)
+        .expect("setup");
+
+    let mut idx = 0;
+    for sy in 0..params.slices_y {
+        for sx in 0..params.slices_x {
+            let slice_bytes = &round.picture_payload[slices[idx].clone()];
+            let payload =
+                data_fragment_payload(picture_number, 1, sx as u16, sy as u16, slice_bytes);
+            let pi = ParseInfo {
+                parse_code: 0xEC,
+                next_parse_offset: (ParseInfo::SIZE + payload.len()) as u32,
+                previous_parse_offset: 0,
+            };
+            dec.on_data_fragment(&pi, &payload).expect("data");
+            idx += 1;
+        }
+    }
+    assert!(dec.assembler().fragmented_picture_done());
+
+    let frag_pic = dec.finish().expect("finish");
+    assert_eq!(frag_pic.y, round.reference.y, "Y mismatch");
+    assert_eq!(frag_pic.u, round.reference.u, "U mismatch");
+    assert_eq!(frag_pic.v, round.reference.v, "V mismatch");
+    // And the reference itself is the lossless source (§15.10 offset
+    // already applied → samples are the unsigned input verbatim).
+    let want_y: Vec<i32> = y.iter().map(|&s| s as i32).collect();
+    assert_eq!(frag_pic.y, want_y, "16-bit Y not lossless");
+}

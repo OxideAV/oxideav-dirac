@@ -63,6 +63,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mix (`(x*17 + y*31 + seed*7) * 2654435761 mod 2^d`) — the old
   additive ramp topped out near 3087 and left every depth above
   11 bits with its upper range unexercised (round-417).
+- The §14 fragmented-picture path is deep-colour-proven: a 16-bit
+  full-range HQ picture split into one data fragment per slice
+  reassembles bit-exactly against the non-fragmented decode (and the
+  lossless source), at a non-default `slice_size_scaler` (round-417).
 - 11/12-bit 4:2:2 and 4:4:4 streams now decode to the native
   `Yuv422P12Le` / `Yuv444P12Le` surfaces instead of clipping to
   10 bits (the fallback used before oxideav-core 0.1.30 gained those
