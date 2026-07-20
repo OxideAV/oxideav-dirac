@@ -42,6 +42,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   monotone qindex escalation under a tight budget, and full q0
   bit-exactness at a floor budget (16-bit Cbr lands within ~2.4% of
   the per-picture target over the fixture sequence).
+- Corpus: the r417 deep-colour fixture trio (10-bit preset-3, 12-bit
+  preset-4, 16-bit custom-full-range) now anchors self-encoded inter
+  pins — each fixture's decoded picture becomes the HQ anchor of a
+  freshly encoded deterministic P chain whose panned inter picture
+  round-trips bit-exactly (skips gracefully without `docs/`).
 
 ### Fixed
 

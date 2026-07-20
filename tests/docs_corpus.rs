@@ -756,3 +756,133 @@ fn corpus_hq_16bit_fullrange_64x64() {
         bytes_per_sample: 2,
     });
 }
+
+// ---- Deep-colour fixture-anchored inter pins (round-419) -------------
+
+/// Round-419: use the r417 deep-colour fixture trio as **inter
+/// anchors**. Each fixture's decoded picture becomes the HQ intra
+/// anchor of a freshly self-encoded P chain (`0xEC` + `0x09`, residue
+/// qindex 0) whose inter picture is a clamped translation of the
+/// anchor content — pinning that deep-colour inter encode composes
+/// with real corpus-anchored content (not just synthetic planes) at
+/// 10, 12 and 16 bits, and that the encode is deterministic.
+///
+/// Skips (like every corpus test) when `docs/` is absent — the
+/// standalone crate checkout has no fixtures.
+#[test]
+fn deep_fixture_anchored_inter_p_chains_bit_exact() {
+    use oxideav_dirac::encoder::{make_minimal_sequence_with_signal_range, EncoderParams};
+    use oxideav_dirac::encoder_inter::{
+        encode_intra_then_inter_stream, InterEncoderParams, InterInputPicture,
+    };
+    use oxideav_dirac::video_format::{ChromaFormat, SignalRange};
+    use oxideav_dirac::wavelet::WaveletFilter;
+
+    let plane_as_u16 = |data: &[u8]| -> Vec<u16> {
+        data.chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect()
+    };
+    // Clamped translate: dst(x, y) = src(clamp(x + dx), clamp(y + dy)).
+    let translate = |src: &[u16], w: usize, h: usize, dx: i64, dy: i64| -> Vec<u16> {
+        let mut out = Vec::with_capacity(w * h);
+        for y in 0..h as i64 {
+            for x in 0..w as i64 {
+                let sx = (x + dx).clamp(0, w as i64 - 1) as usize;
+                let sy = (y + dy).clamp(0, h as i64 - 1) as usize;
+                out.push(src[sy * w + sx]);
+            }
+        }
+        out
+    };
+
+    let cases: [(&str, SignalRange); 3] = [
+        (
+            "hq-10bit-preset3-64x64",
+            SignalRange::preset(3).expect("Table 10.5 preset 3"),
+        ),
+        (
+            "hq-12bit-preset4-64x64",
+            SignalRange::preset(4).expect("Table 10.5 preset 4"),
+        ),
+        ("hq-16bit-fullrange-64x64", SignalRange::PRESET_16BIT_FULL),
+    ];
+
+    for (name, sr) in cases {
+        let drc_path = fixture_dir(name).join("input.drc");
+        let drc = match fs::read(&drc_path) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!(
+                    "skip {name}: missing {} ({e}). docs/ corpus is in the \
+                     workspace umbrella repo.",
+                    drc_path.display()
+                );
+                return;
+            }
+        };
+
+        // Decode the fixture picture — the anchor source.
+        let mut dec = DiracDecoder::new(CodecId::new(oxideav_dirac::CODEC_ID_STR));
+        let pkt = Packet::new(0, TimeBase::new(1, 25), drc);
+        dec.send_packet(&pkt).expect("fixture send_packet");
+        let anchor_frame = match dec.receive_frame().expect("fixture decode") {
+            Frame::Video(v) => v,
+            other => panic!("{name}: expected video frame, got {other:?}"),
+        };
+        let ay = plane_as_u16(&anchor_frame.planes[0].data);
+        let au = plane_as_u16(&anchor_frame.planes[1].data);
+        let av = plane_as_u16(&anchor_frame.planes[2].data);
+        assert_eq!(ay.len(), 64 * 64, "{name}: fixture luma size");
+        assert_eq!(au.len(), 32 * 32, "{name}: fixture chroma size");
+
+        // Inter picture: the anchor content panned by (+4, +2) luma
+        // pels (chroma at half rate, 4:2:0).
+        let iy = translate(&ay, 64, 64, 4, 2);
+        let iu = translate(&au, 32, 32, 2, 1);
+        let iv = translate(&av, 32, 32, 2, 1);
+
+        let seq = make_minimal_sequence_with_signal_range(64, 64, ChromaFormat::Yuv420, sr);
+        let intra_params = EncoderParams::default_hq(WaveletFilter::LeGall5_3, 3);
+        let inter_params = InterEncoderParams::default(); // residue ON, q0
+        let intra = InterInputPicture {
+            picture_number: 0,
+            y: &ay[..],
+            u: &au[..],
+            v: &av[..],
+        };
+        let inter = InterInputPicture {
+            picture_number: 1,
+            y: &iy[..],
+            u: &iu[..],
+            v: &iv[..],
+        };
+        let stream =
+            encode_intra_then_inter_stream(&seq, &intra_params, &inter_params, &intra, &inter);
+        // Determinism pin: a second encode of the same inputs is
+        // byte-identical.
+        let stream2 =
+            encode_intra_then_inter_stream(&seq, &intra_params, &inter_params, &intra, &inter);
+        assert_eq!(
+            stream, stream2,
+            "{name}: inter encode must be deterministic"
+        );
+
+        let mut dec2 = DiracDecoder::new(CodecId::new(oxideav_dirac::CODEC_ID_STR));
+        let pkt2 = Packet::new(0, TimeBase::new(1, 25), stream);
+        dec2.send_packet(&pkt2).expect("pin send_packet");
+        let f0 = match dec2.receive_frame().expect("pin anchor decode") {
+            Frame::Video(v) => v,
+            other => panic!("{name}: expected video frame, got {other:?}"),
+        };
+        let f1 = match dec2.receive_frame().expect("pin inter decode") {
+            Frame::Video(v) => v,
+            other => panic!("{name}: expected video frame, got {other:?}"),
+        };
+        assert_eq!(plane_as_u16(&f0.planes[0].data), ay, "{name}: anchor Y");
+        assert_eq!(plane_as_u16(&f1.planes[0].data), iy, "{name}: inter Y");
+        assert_eq!(plane_as_u16(&f1.planes[1].data), iu, "{name}: inter U");
+        assert_eq!(plane_as_u16(&f1.planes[2].data), iv, "{name}: inter V");
+        eprintln!("{name}: fixture-anchored deep inter P chain bit-exact");
+    }
+}
