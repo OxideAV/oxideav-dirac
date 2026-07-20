@@ -53,6 +53,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (all-zero / saturated / same-frame flat-SAD landscapes), and a
   16-bit bipred precision sweep — all deterministic clean round-trips
   with debug overflow checks live.
+- Deep auto global motion: the sequence driver's per-picture
+  estimator (`auto_global_motion`) is pinned on a 12-bit whole-frame
+  pan sequence — applied on every inter picture (fraction ≥ 0.5
+  telemetry) with the rate-controlled stream still q0 bit-exact.
 
 ### Fixed
 

@@ -403,3 +403,62 @@ fn tight_budget_16bit_escalates_qindex_and_decodes() {
     );
     assert_eq!(decode_frames(tight_stream).len(), 4);
 }
+
+/// Per-picture **auto global motion** on a deep sequence: whole-frame
+/// 12-bit pans must trip the estimator on every inter picture
+/// (`global_applied = true`, fraction ≥ threshold), and the resulting
+/// rate-controlled stream still decodes bit-exactly at a q0 floor
+/// budget — rate control measured the same global stream it emitted.
+#[test]
+fn auto_global_motion_12bit_applies_and_stays_bit_exact() {
+    use oxideav_dirac::encoder_inter::{AutoGlobalMotion, GlobalMotionModel};
+
+    let (seq, frames) = fixture(12, SignalRange::PRESET_12BIT_FULL);
+    let pics = input_pictures(&frames);
+    let intra = EncoderParams::default_hq(WaveletFilter::LeGall5_3, 3);
+    let inter = InterEncoderParams {
+        mv_precision: 0,
+        auto_global_motion: Some(AutoGlobalMotion {
+            model: GlobalMotionModel::Pan,
+            min_fraction: 0.5,
+        }),
+        ..InterEncoderParams::default()
+    };
+    let target = q0_floor_bytes(&seq, &inter, &frames);
+
+    let (stream, report) = encode_inter_sequence_with_residue_target_report(
+        &seq,
+        &intra,
+        &inter,
+        &pics,
+        target,
+        InterRateControl::PerPicture,
+    );
+    assert_eq!(report.len(), 3);
+    for e in &report {
+        let fraction = e
+            .global_fraction
+            .expect("auto estimation must run on every inter picture");
+        assert!(
+            fraction >= 0.5,
+            "picture {}: whole-frame 12-bit pan only scored fraction {fraction:.2}",
+            e.picture_number
+        );
+        assert!(
+            e.global_applied,
+            "picture {}: estimate above threshold must be applied",
+            e.picture_number
+        );
+        assert_eq!(e.qindex, 0, "q0 floor budget must not escalate");
+    }
+
+    let decoded = decode_frames(stream);
+    assert_eq!(decoded.len(), 4);
+    for (i, (df, sf)) in decoded.iter().zip(frames.iter()).enumerate() {
+        assert_eq!(
+            plane_as_u16(&df.planes[0].data),
+            sf.y,
+            "frame {i} Y bit-exact with auto global motion"
+        );
+    }
+}
