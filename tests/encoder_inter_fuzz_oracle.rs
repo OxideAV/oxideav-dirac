@@ -853,3 +853,207 @@ fn estimated_global_model_degenerate_inputs_never_panic() {
         }
     }
 }
+
+// -------------------------------------------------------------------
+// Deep-colour (u16) fuzz arms — round-419
+// -------------------------------------------------------------------
+
+/// Full-range custom signal range for an arbitrary depth `d` (§10.3.8:
+/// offset `2^(d-1)`, excursion `2^d − 1`) — lets the sweep hit
+/// non-preset depths like 13-bit.
+fn full_range_sr(depth: u32) -> oxideav_dirac::video_format::SignalRange {
+    oxideav_dirac::video_format::SignalRange {
+        luma_offset: 1 << (depth - 1),
+        luma_excursion: (1 << depth) - 1,
+        chroma_offset: 1 << (depth - 1),
+        chroma_excursion: (1 << depth) - 1,
+    }
+}
+
+/// Deep 64x64 4:2:0 frame from a seeded xorshift, spanning the full
+/// `[0, 2^depth)` range.
+fn deep_noise_64(depth: u32, seed: u32) -> (Vec<u16>, Vec<u16>, Vec<u16>) {
+    let mut s = seed.max(1);
+    let max = (1u64 << depth) - 1;
+    let mut gen = |n: usize| -> Vec<u16> {
+        (0..n)
+            .map(|_| (xs32(&mut s) as u64 % (max + 1)) as u16)
+            .collect()
+    };
+    (gen(64 * 64), gen(32 * 32), gen(32 * 32))
+}
+
+/// Deep solid frame (zero-energy fixture at deep amplitudes).
+fn deep_solid_64(fill: u16, depth: u32) -> (Vec<u16>, Vec<u16>, Vec<u16>) {
+    let mid = 1u16 << (depth - 1);
+    (vec![fill; 64 * 64], vec![mid; 32 * 32], vec![mid; 32 * 32])
+}
+
+fn deep_pair_inputs<'a>(
+    a: &'a (Vec<u16>, Vec<u16>, Vec<u16>),
+    b: &'a (Vec<u16>, Vec<u16>, Vec<u16>),
+) -> (InterInputPicture<'a, u16>, InterInputPicture<'a, u16>) {
+    (
+        InterInputPicture {
+            picture_number: 0,
+            y: &a.0,
+            u: &a.1,
+            v: &a.2,
+        },
+        InterInputPicture {
+            picture_number: 1,
+            y: &b.0,
+            u: &b.1,
+            v: &b.2,
+        },
+    )
+}
+
+/// **Deep-colour parameter sweep.** Depth {10, 13, 16} × precision
+/// {0, 2, 3} × OBMC passes {0, 2} × residue {None, q0, q64} against
+/// noise pairs whose samples span the full deep range — every case
+/// must produce a deterministic 2-frame round-trip with no panic and
+/// no overflow (debug asserts are live in test builds).
+#[test]
+fn deep_u16_parameter_sweep_never_panics() {
+    use oxideav_dirac::encoder::make_minimal_sequence_with_signal_range;
+    let ip = intra_params();
+    let mut case = 0usize;
+    for depth in [10u32, 13, 16] {
+        let seq = make_minimal_sequence_with_signal_range(
+            64,
+            64,
+            ChromaFormat::Yuv420,
+            full_range_sr(depth),
+        );
+        let f0 = deep_noise_64(depth, 0x1234_5678 ^ depth);
+        let f1 = deep_noise_64(depth, 0x8765_4321 ^ depth);
+        for mvp in [0u32, 2, 3] {
+            for passes in [0u32, 2] {
+                for residue in [
+                    None,
+                    Some(ResidueParams::default_for(WaveletFilter::LeGall5_3, 3)),
+                    Some({
+                        let mut rp = ResidueParams::default_for(WaveletFilter::LeGall5_3, 2);
+                        rp.qindex = 64;
+                        rp
+                    }),
+                ] {
+                    case += 1;
+                    let params = InterEncoderParams {
+                        mv_precision: mvp,
+                        bipred_mv_precision: mvp,
+                        obmc_refine_passes: passes,
+                        residue: residue.clone(),
+                        ..InterEncoderParams::default()
+                    };
+                    let (intra, inter) = deep_pair_inputs(&f0, &f1);
+                    let label = format!(
+                        "deep sweep case {case} (depth {depth}, mvp {mvp}, passes {passes}, \
+                         residue {:?})",
+                        residue.as_ref().map(|r| r.qindex)
+                    );
+                    let stream = encode_intra_then_inter_stream(&seq, &ip, &params, &intra, &inter);
+                    assert_decodes_to(&stream, 2, &label);
+                    let stream2 =
+                        encode_intra_then_inter_stream(&seq, &ip, &params, &intra, &inter);
+                    assert_eq!(stream, stream2, "{label}: encode must be deterministic");
+                }
+            }
+        }
+    }
+}
+
+/// **Deep pathological pixel inputs.** All-zero, all-`2^depth − 1`
+/// (saturated), solid-vs-noise and same-frame degenerate pairs at 16
+/// bits — the flat SAD landscapes and saturated residues must
+/// terminate cleanly (this sweep is what surfaced the round-419
+/// `obmc_block_sse` i32 squaring overflow).
+#[test]
+fn deep_u16_pathological_inputs_never_panic() {
+    use oxideav_dirac::encoder::make_minimal_sequence_with_signal_range;
+    let seq =
+        make_minimal_sequence_with_signal_range(64, 64, ChromaFormat::Yuv420, full_range_sr(16));
+    let ip = intra_params();
+    let noise = deep_noise_64(16, 0xDEAD_BEEF);
+    let cases: [(
+        &str,
+        (Vec<u16>, Vec<u16>, Vec<u16>),
+        (Vec<u16>, Vec<u16>, Vec<u16>),
+    ); 5] = [
+        ("zero-vs-zero", deep_solid_64(0, 16), deep_solid_64(0, 16)),
+        (
+            "max-vs-max",
+            deep_solid_64(65535, 16),
+            deep_solid_64(65535, 16),
+        ),
+        (
+            "zero-vs-max",
+            deep_solid_64(0, 16),
+            deep_solid_64(65535, 16),
+        ),
+        ("solid-vs-noise", deep_solid_64(32768, 16), noise.clone()),
+        ("same-frame", noise.clone(), noise.clone()),
+    ];
+    for (name, f0, f1) in &cases {
+        for mvp in [0u32, 2] {
+            let params = InterEncoderParams {
+                mv_precision: mvp,
+                bipred_mv_precision: mvp,
+                ..InterEncoderParams::default()
+            };
+            let (intra, inter) = deep_pair_inputs(f0, f1);
+            let label = format!("deep pathological {name} (mvp {mvp})");
+            let stream = encode_intra_then_inter_stream(&seq, &ip, &params, &intra, &inter);
+            assert_decodes_to(&stream, 2, &label);
+        }
+    }
+}
+
+/// **Deep bipred fuzz.** 16-bit noise triplet through the core-syntax
+/// 0x0C + 0x0C + 0x0A chain across the bipred precision axis — clean
+/// 3-frame round-trip, deterministic.
+#[test]
+fn deep_u16_bipred_sweep_never_panics() {
+    use oxideav_dirac::encoder::make_minimal_sequence_with_signal_range;
+    use oxideav_dirac::encoder_intra_core::{
+        encode_core_intra_then_bipred_stream, CoreIntraEncoderParams,
+    };
+    let seq =
+        make_minimal_sequence_with_signal_range(64, 64, ChromaFormat::Yuv420, full_range_sr(16));
+    let cip = CoreIntraEncoderParams::default_intra(WaveletFilter::LeGall5_3, 3);
+    let fa = deep_noise_64(16, 0x0F0F_0F0F);
+    let fb = deep_noise_64(16, 0xF0F0_F0F0);
+    let fm = deep_noise_64(16, 0x3C3C_3C3C);
+    for bmp in [0u32, 1, 2, 3] {
+        let params = InterEncoderParams {
+            bipred_mv_precision: bmp,
+            ..InterEncoderParams::default()
+        };
+        let intra_a = InterInputPicture {
+            picture_number: 0,
+            y: &fa.0,
+            u: &fa.1,
+            v: &fa.2,
+        };
+        let intra_b = InterInputPicture {
+            picture_number: 2,
+            y: &fb.0,
+            u: &fb.1,
+            v: &fb.2,
+        };
+        let bipred = InterInputPicture {
+            picture_number: 1,
+            y: &fm.0,
+            u: &fm.1,
+            v: &fm.2,
+        };
+        let label = format!("deep bipred sweep (bmp {bmp})");
+        let stream =
+            encode_core_intra_then_bipred_stream(&seq, &cip, &params, &intra_a, &intra_b, &bipred);
+        assert_decodes_to(&stream, 3, &label);
+        let stream2 =
+            encode_core_intra_then_bipred_stream(&seq, &cip, &params, &intra_a, &intra_b, &bipred);
+        assert_eq!(stream, stream2, "{label}: encode must be deterministic");
+    }
+}

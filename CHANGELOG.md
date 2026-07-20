@@ -47,6 +47,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pins — each fixture's decoded picture becomes the HQ anchor of a
   freshly encoded deterministic P chain whose panned inter picture
   round-trips bit-exactly (skips gracefully without `docs/`).
+- Fuzz: three deep-colour arms in the inter-encoder oracle — a
+  depth {10, 13, 16} × precision × OBMC-passes × residue-config
+  parameter sweep on full-range noise, 16-bit pathological inputs
+  (all-zero / saturated / same-frame flat-SAD landscapes), and a
+  16-bit bipred precision sweep — all deterministic clean round-trips
+  with debug overflow checks live.
 
 ### Fixed
 
