@@ -29,6 +29,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   4:2:0/4:2:2/4:4:4; the core-syntax stream drivers
   `encode_core_intra_then_inter_stream` /
   `encode_core_intra_then_bipred_stream` are now sample-generic too).
+- Deep-colour §11.3.3 codeblock-grid residue and §11.2.6 global
+  motion: 16-bit P pictures with a per-level codeblock partition,
+  whole-picture global pan at 10-bit, per-reference global models on a
+  16-bit bipred B, and the pan **estimator** driven from a 12-bit ME
+  grid all round-trip bit-exactly at residue qindex 0.
+
+### Fixed
+
+- `obmc_block_sse` squared the per-pixel reconstruction error in
+  `i32`; at 16-bit the difference spans ±2^17 and the square
+  overflowed. Widen to `i64` before squaring (identical scores for
+  8-bit content).
 
 - Deep-colour decoder output: streams whose §10.5.2 `video_depth`
   exceeds 12 bits (e.g. 13-16-bit §10.3.8 custom signal ranges) now

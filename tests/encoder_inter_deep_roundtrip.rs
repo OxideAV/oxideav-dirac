@@ -26,12 +26,14 @@
 use oxideav_core::{CodecId, CodecParameters, CodecRegistry, Frame, Packet, TimeBase, VideoFrame};
 use oxideav_dirac::encoder::{make_minimal_sequence_with_signal_range, EncoderParams};
 use oxideav_dirac::encoder_inter::{
-    encode_intra_then_inter_stream, InterEncoderParams, InterInputPicture,
+    encode_intra_then_inter_stream, estimate_global_motion_config, GlobalMotionConfig,
+    GlobalMotionModel, InterEncoderParams, InterInputPicture, ResidueParams,
 };
 use oxideav_dirac::encoder_intra_core::{
     encode_core_intra_then_bipred_stream, encode_core_intra_then_inter_stream,
     CoreIntraEncoderParams,
 };
+use oxideav_dirac::picture_inter::GlobalParams;
 use oxideav_dirac::video_format::{ChromaFormat, SignalRange};
 use oxideav_dirac::wavelet::WaveletFilter;
 
@@ -327,4 +329,252 @@ fn bipred_chain_10bit_q0_bit_exact() {
 #[test]
 fn bipred_chain_16bit_q0_bit_exact() {
     assert_bipred_chain_bit_exact(16, SignalRange::PRESET_16BIT_FULL);
+}
+
+// ---- Deep codeblock-grid residue + global motion (round-419) ---------
+
+/// §11.3.3 codeblock spatial partition on a deep P picture: 16-bit
+/// source, mode-0 codeblock grid (2×2 per detail level), residue at
+/// qindex 0 — still bit-exact (the codeblock walk is a byte-for-byte
+/// mirror of the intra-core encoder at any sample depth).
+#[test]
+fn p_chain_16bit_codeblock_residue_q0_bit_exact() {
+    let (w, h) = (64usize, 64usize);
+    let chroma = ChromaFormat::Yuv420;
+    let seq = make_minimal_sequence_with_signal_range(
+        w as u32,
+        h as u32,
+        chroma,
+        SignalRange::PRESET_16BIT_FULL,
+    );
+    let intra_params = EncoderParams::default_hq(WaveletFilter::LeGall5_3, 3);
+    let mut rp = ResidueParams::default_for(WaveletFilter::LeGall5_3, 3);
+    rp.codeblocks = Some(vec![(1, 1), (2, 2), (2, 2), (2, 2)]);
+    rp.codeblock_mode = 0;
+    let inter_params = InterEncoderParams {
+        residue: Some(rp),
+        ..InterEncoderParams::default()
+    };
+
+    let (y0, u0, v0, y1, u1, v1) = deep_translating_pair(w, h, chroma, 16, 4, 2);
+    let intra = InterInputPicture {
+        picture_number: 0,
+        y: &y0[..],
+        u: &u0[..],
+        v: &v0[..],
+    };
+    let inter = InterInputPicture {
+        picture_number: 1,
+        y: &y1[..],
+        u: &u1[..],
+        v: &v1[..],
+    };
+    let stream = encode_intra_then_inter_stream(&seq, &intra_params, &inter_params, &intra, &inter);
+    let frames = decode_stream(stream);
+    assert_eq!(frames.len(), 2);
+    assert_plane_eq("cb 16-bit inter Y", &frames[1].planes[0].data, &y1);
+    assert_plane_eq("cb 16-bit inter U", &frames[1].planes[1].data, &u1);
+    assert_plane_eq("cb 16-bit inter V", &frames[1].planes[2].data, &v1);
+}
+
+/// Whole-frame deep pan: sample an infinite deterministic texture at a
+/// `(dx, dy)` offset so frame 1 is a true translation of frame 0 with
+/// fresh content entering at the edges.
+fn deep_pan_pair(
+    w: usize,
+    h: usize,
+    depth: u32,
+    dx: i64,
+    dy: i64,
+) -> (Vec<u16>, Vec<u16>, Vec<u16>, Vec<u16>) {
+    let max = (1u64 << depth) - 1;
+    let tex = |x: i64, y: i64| -> u16 {
+        let mix = (x + 512) as u64 * 17 + (y + 512) as u64 * 31;
+        ((mix * 2654435761) % (max + 1)) as u16
+    };
+    let mut y0 = Vec::with_capacity(w * h);
+    let mut y1 = Vec::with_capacity(w * h);
+    for y in 0..h as i64 {
+        for x in 0..w as i64 {
+            y0.push(tex(x, y));
+            y1.push(tex(x + dx, y + dy));
+        }
+    }
+    let mid = vec![1u16 << (depth - 1); (w / 2) * (h / 2)];
+    (y0, y1, mid.clone(), mid)
+}
+
+/// §11.2.6 global motion on a deep P picture: whole-picture pan field
+/// at 10-bit, integer-pel, residue qindex 0 — bit-exact through the
+/// decoder's §15.8.8 `global_mv` path at deep sample values.
+#[test]
+fn p_chain_10bit_whole_picture_global_pan_q0_bit_exact() {
+    let (w, h) = (64usize, 64usize);
+    let chroma = ChromaFormat::Yuv420;
+    let seq = make_minimal_sequence_with_signal_range(
+        w as u32,
+        h as u32,
+        chroma,
+        SignalRange::PRESET_10BIT_FULL,
+    );
+    let intra_params = EncoderParams::default_hq(WaveletFilter::LeGall5_3, 3);
+    // Zero affine matrix → constant field `pan_tilt + (1, 1)`.
+    // pan_tilt (3, -1) ⇒ field (4, 0): prediction reads ref at (x+4, y),
+    // matching a source that panned by sampling `tex(x + 4, y)`.
+    let inter_params = InterEncoderParams {
+        mv_precision: 0,
+        global_motion: Some(GlobalMotionConfig {
+            global1: GlobalParams {
+                pan_tilt: (3, -1),
+                zrs: [[0, 0], [0, 0]],
+                zrs_exp: 0,
+                perspective: (0, 0),
+                persp_exp: 0,
+            },
+            global2: None,
+            block_gmode: None, // whole picture global
+        }),
+        ..InterEncoderParams::default()
+    };
+
+    let (y0, y1, c0, c1) = deep_pan_pair(w, h, 10, 4, 0);
+    let intra = InterInputPicture {
+        picture_number: 0,
+        y: &y0[..],
+        u: &c0[..],
+        v: &c0[..],
+    };
+    let inter = InterInputPicture {
+        picture_number: 1,
+        y: &y1[..],
+        u: &c1[..],
+        v: &c1[..],
+    };
+    let stream = encode_intra_then_inter_stream(&seq, &intra_params, &inter_params, &intra, &inter);
+    let frames = decode_stream(stream);
+    assert_eq!(frames.len(), 2);
+    assert_plane_eq("global 10-bit inter Y", &frames[1].planes[0].data, &y1);
+    assert_plane_eq("global 10-bit inter U", &frames[1].planes[1].data, &c1);
+    assert_plane_eq("global 10-bit inter V", &frames[1].planes[2].data, &c1);
+}
+
+/// Bipred with a §11.2.6 global model per reference at 16-bit: ref-A
+/// pans by (+4, 0), ref-B by (-4, 0) relative to the B picture, each
+/// reference carries its own pan field, every block global — bit-exact
+/// through the 2-ref global path at deep sample values.
+#[test]
+fn bipred_16bit_global_both_refs_q0_bit_exact() {
+    let (w, h) = (64usize, 64usize);
+    let seq = make_minimal_sequence_with_signal_range(
+        w as u32,
+        h as u32,
+        ChromaFormat::Yuv420,
+        SignalRange::PRESET_16BIT_FULL,
+    );
+    let intra_params = CoreIntraEncoderParams::default_intra(WaveletFilter::LeGall5_3, 3);
+    // B picture at pan offset 0; ref-A sampled at -4 (so the field
+    // mapping B → A reads ref at (x - 4) ⇒ pan_tilt (-5, -1)); ref-B
+    // sampled at +4 (field (4, 0) ⇒ pan_tilt (3, -1)).
+    let (yb_pic, ya, c0, _c1) = deep_pan_pair(w, h, 16, -4, 0);
+    let (_, yb, _, _) = deep_pan_pair(w, h, 16, 4, 0);
+    let pan = |dx: i32| GlobalParams {
+        pan_tilt: (dx - 1, -1),
+        zrs: [[0, 0], [0, 0]],
+        zrs_exp: 0,
+        perspective: (0, 0),
+        persp_exp: 0,
+    };
+    let inter_params = InterEncoderParams {
+        bipred_mv_precision: 0,
+        global_motion: Some(GlobalMotionConfig {
+            global1: pan(-4),
+            global2: Some(pan(4)),
+            block_gmode: None,
+        }),
+        ..InterEncoderParams::default()
+    };
+    let intra_a = InterInputPicture {
+        picture_number: 0,
+        y: &ya[..],
+        u: &c0[..],
+        v: &c0[..],
+    };
+    let intra_b = InterInputPicture {
+        picture_number: 2,
+        y: &yb[..],
+        u: &c0[..],
+        v: &c0[..],
+    };
+    let bipred = InterInputPicture {
+        picture_number: 1,
+        y: &yb_pic[..],
+        u: &c0[..],
+        v: &c0[..],
+    };
+    let stream = encode_core_intra_then_bipred_stream(
+        &seq,
+        &intra_params,
+        &inter_params,
+        &intra_a,
+        &intra_b,
+        &bipred,
+    );
+    let frames = decode_stream(stream);
+    assert_eq!(frames.len(), 3);
+    assert_plane_eq(
+        "global bipred 16-bit B Y",
+        &frames[2].planes[0].data,
+        &yb_pic,
+    );
+}
+
+/// Global-model **estimation** from a deep ME grid: on a whole-frame
+/// 12-bit pan the pan estimator must mark a large majority of blocks
+/// global, and applying the estimated config must still round-trip
+/// bit-exactly (the encoder mirrors its own effective parameters).
+#[test]
+fn estimate_global_pan_12bit_high_fraction_and_bit_exact() {
+    let (w, h) = (64usize, 64usize);
+    let seq = make_minimal_sequence_with_signal_range(
+        w as u32,
+        h as u32,
+        ChromaFormat::Yuv420,
+        SignalRange::PRESET_12BIT_FULL,
+    );
+    let intra_params = EncoderParams::default_hq(WaveletFilter::LeGall5_3, 3);
+    let base_params = InterEncoderParams {
+        mv_precision: 0,
+        ..InterEncoderParams::default()
+    };
+    let (y0, y1, c0, c1) = deep_pan_pair(w, h, 12, 4, 0);
+    let (cfg, fraction) =
+        estimate_global_motion_config(&seq, &base_params, &y1, &y0, GlobalMotionModel::Pan);
+    assert!(
+        fraction >= 0.8,
+        "pan estimator marked only {fraction:.2} of blocks global on a whole-frame 12-bit pan"
+    );
+    let inter_params = InterEncoderParams {
+        global_motion: Some(cfg),
+        ..base_params
+    };
+    let intra = InterInputPicture {
+        picture_number: 0,
+        y: &y0[..],
+        u: &c0[..],
+        v: &c0[..],
+    };
+    let inter = InterInputPicture {
+        picture_number: 1,
+        y: &y1[..],
+        u: &c1[..],
+        v: &c1[..],
+    };
+    let stream = encode_intra_then_inter_stream(&seq, &intra_params, &inter_params, &intra, &inter);
+    let frames = decode_stream(stream);
+    assert_eq!(frames.len(), 2);
+    assert_plane_eq(
+        "estimated-pan 12-bit inter Y",
+        &frames[1].planes[0].data,
+        &y1,
+    );
 }

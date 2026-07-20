@@ -1958,8 +1958,10 @@ fn obmc_block_sse<S: InterSample>(
             let recon_signed = ((total + 32) >> 6).clamp(lo, hi);
             let src_signed =
                 cur[y as usize * cur_w as usize + x as usize].to_i32() - S::NOMINAL_HALF;
-            let d = recon_signed - src_signed;
-            sse += (d * d) as i64;
+            // Widen before squaring: at 16-bit the difference spans
+            // ±2^17 and its square overflows i32.
+            let d = (recon_signed - src_signed) as i64;
+            sse += d * d;
         }
     }
     sse
