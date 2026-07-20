@@ -48,6 +48,105 @@ use crate::subband::{padded_component_dims, Orient, SubbandData};
 use crate::video_format::ChromaFormat;
 use crate::wavelet::{dwt, WaveletFilter};
 
+mod sealed {
+    /// Seals [`super::InterSample`] to the two source-sample widths the
+    /// Dirac core syntax can express (§10.5.2 `video_depth` caps the
+    /// component depth at 16 bits for the `Yuv*P16Le` output surfaces).
+    pub trait Sealed {}
+    impl Sealed for u8 {}
+    impl Sealed for u16 {}
+}
+
+/// Source-sample abstraction for the inter encoder (deep-colour
+/// support). The whole ME / OBMC / residue pipeline is generic over the
+/// input sample width: `u8` carries classic 8-bit video, `u16` carries
+/// 9-16-bit deep colour. The *encoded* depth always comes from
+/// `SequenceHeader::{luma,chroma}_depth` (§10.5.2 `video_depth` from
+/// the §10.3.8 signal-range excursions) — the sample type only decides
+/// how the source planes are read and which headroom constants the
+/// ME-side scoring uses.
+///
+/// Sealed: `u8` and `u16` are the only implementations (16 bits is the
+/// deepest component depth the §10.5.2 `video_depth` formula reaches on
+/// the signal ranges this crate emits).
+pub trait InterSample: Copy + sealed::Sealed + 'static {
+    /// Widen one source sample to the `i32` arithmetic domain.
+    fn to_i32(self) -> i32;
+
+    /// Clip depth handed to the §15.8.11 half-pel upsampler when the
+    /// ME search scores against **unsigned** source samples
+    /// ([`build_upref`]): one bit above the sample width, so the spec's
+    /// `[-2^(d-1), 2^(d-1)-1]` clip holds the full unsigned range plus
+    /// the 8-tap filter's small overshoot. `9` for `u8` (clip
+    /// `[-256, 255]`), `17` for `u16` (clip `[-65536, 65535]`).
+    const ME_UPREF_DEPTH: u32;
+
+    /// Mid-range offset used by the ME-side *signed* decoder-mirroring
+    /// paths ([`build_upref_signed`], the OBMC-aware SSE scoring):
+    /// `2^(width-1)` — `128` for `u8`, `32768` for `u16`. This is an
+    /// encoder-side scoring convention only; the residue math that
+    /// reaches the wire recentres by the **sequence** depth
+    /// (`2^(depth-1)`), exactly like the decoder's §15.4 reference
+    /// buffer. For deep sources whose sequence depth is below 16 the
+    /// scoring offset differs from the decoder's by a constant shift,
+    /// which cancels in every SAD/SSE difference — only the rarely-hit
+    /// clip bounds move, and those affect ME quality, never
+    /// conformance.
+    const NOMINAL_HALF: i32;
+
+    /// Encode the HQ intra **anchor** picture for the sequence drivers
+    /// ([`encode_intra_then_inter_stream`],
+    /// [`encode_inter_sequence_with_residue_target`]), dispatching to
+    /// the matching-width VC-2 HQ intra entry point.
+    #[doc(hidden)]
+    fn encode_hq_intra_anchor(
+        sequence: &SequenceHeader,
+        params: &crate::encoder::EncoderParams,
+        picture_number: u32,
+        y: &[Self],
+        u: &[Self],
+        v: &[Self],
+    ) -> Vec<u8>;
+}
+
+impl InterSample for u8 {
+    #[inline]
+    fn to_i32(self) -> i32 {
+        self as i32
+    }
+    const ME_UPREF_DEPTH: u32 = 9;
+    const NOMINAL_HALF: i32 = 128;
+    fn encode_hq_intra_anchor(
+        sequence: &SequenceHeader,
+        params: &crate::encoder::EncoderParams,
+        picture_number: u32,
+        y: &[Self],
+        u: &[Self],
+        v: &[Self],
+    ) -> Vec<u8> {
+        crate::encoder::encode_hq_intra_picture(sequence, params, picture_number, y, u, v)
+    }
+}
+
+impl InterSample for u16 {
+    #[inline]
+    fn to_i32(self) -> i32 {
+        self as i32
+    }
+    const ME_UPREF_DEPTH: u32 = 17;
+    const NOMINAL_HALF: i32 = 32768;
+    fn encode_hq_intra_anchor(
+        sequence: &SequenceHeader,
+        params: &crate::encoder::EncoderParams,
+        picture_number: u32,
+        y: &[Self],
+        u: &[Self],
+        v: &[Self],
+    ) -> Vec<u8> {
+        crate::encoder::encode_hq_intra_picture_u16(sequence, params, picture_number, y, u, v)
+    }
+}
+
 /// Encoder-side inter parameters.
 #[derive(Debug, Clone)]
 pub struct InterEncoderParams {
@@ -371,11 +470,11 @@ impl GlobalMotionConfig {
 /// clear win; on scattered motion it approaches `0` and block motion
 /// alone is better (the config would spend `using_global` header bits +
 /// one gmode flag per block for nothing).
-pub fn estimate_global_pan_config(
+pub fn estimate_global_pan_config<S: InterSample>(
     sequence: &SequenceHeader,
     params: &InterEncoderParams,
-    cur_y: &[u8],
-    ref_y: &[u8],
+    cur_y: &[S],
+    ref_y: &[S],
 ) -> (GlobalMotionConfig, f64) {
     let mvs = inter_mv_grid(sequence, params, cur_y, ref_y);
     let mut xs: Vec<i32> = mvs.iter().map(|m| m.0).collect();
@@ -480,11 +579,11 @@ pub enum GlobalMotionModel {
 /// motion it approaches 0 and block motion alone is cheaper. A
 /// degenerate ME grid (too few usable blocks for the normal equations)
 /// falls back to the pan fit.
-pub fn estimate_global_motion_config(
+pub fn estimate_global_motion_config<S: InterSample>(
     sequence: &SequenceHeader,
     params: &InterEncoderParams,
-    cur_y: &[u8],
-    ref_y: &[u8],
+    cur_y: &[S],
+    ref_y: &[S],
     model: GlobalMotionModel,
 ) -> (GlobalMotionConfig, f64) {
     if model == GlobalMotionModel::Pan {
@@ -526,22 +625,22 @@ pub fn estimate_global_motion_config(
 }
 
 /// [`estimate_global_motion_config`] with [`GlobalMotionModel::Affine`].
-pub fn estimate_global_affine_config(
+pub fn estimate_global_affine_config<S: InterSample>(
     sequence: &SequenceHeader,
     params: &InterEncoderParams,
-    cur_y: &[u8],
-    ref_y: &[u8],
+    cur_y: &[S],
+    ref_y: &[S],
 ) -> (GlobalMotionConfig, f64) {
     estimate_global_motion_config(sequence, params, cur_y, ref_y, GlobalMotionModel::Affine)
 }
 
 /// [`estimate_global_motion_config`] with
 /// [`GlobalMotionModel::Perspective`].
-pub fn estimate_global_perspective_config(
+pub fn estimate_global_perspective_config<S: InterSample>(
     sequence: &SequenceHeader,
     params: &InterEncoderParams,
-    cur_y: &[u8],
-    ref_y: &[u8],
+    cur_y: &[S],
+    ref_y: &[S],
 ) -> (GlobalMotionConfig, f64) {
     estimate_global_motion_config(
         sequence,
@@ -567,17 +666,17 @@ pub fn estimate_global_perspective_config(
 /// global fraction. Fit degeneracy on either reference falls back to
 /// that reference's median-pan model, mirroring the 1-ref estimator's
 /// fallback.
-pub fn estimate_global_bipred_config(
+pub fn estimate_global_bipred_config<S: InterSample>(
     sequence: &SequenceHeader,
     params: &InterEncoderParams,
-    cur_y: &[u8],
-    ref1_y: &[u8],
-    ref2_y: &[u8],
+    cur_y: &[S],
+    ref1_y: &[S],
+    ref2_y: &[S],
     model: GlobalMotionModel,
 ) -> (GlobalMotionConfig, f64) {
     let (_sbx, _sby, blocks_x, blocks_y) = motion_grid(sequence.luma_width, sequence.luma_height);
     let bmp = params.bipred_mv_precision;
-    let per_ref = |ref_y: &[u8]| -> (GlobalParams, Vec<bool>) {
+    let per_ref = |ref_y: &[S]| -> (GlobalParams, Vec<bool>) {
         let mvs = subpel_search_me(
             cur_y,
             ref_y,
@@ -1037,9 +1136,9 @@ fn quantise_global_fit(
 /// through the same §15.8.10 path). Returns the grid plus the global
 /// fraction.
 #[allow(clippy::too_many_arguments)]
-fn global_gmode_by_sad(
-    cur_y: &[u8],
-    ref_y: &[u8],
+fn global_gmode_by_sad<S: InterSample>(
+    cur_y: &[S],
+    ref_y: &[S],
     width: u32,
     height: u32,
     blocks_x: u32,
@@ -1061,7 +1160,7 @@ fn global_gmode_by_sad(
     let sample_int = |px: i32, py: i32| -> i32 {
         let cx = px.clamp(0, w - 1) as usize;
         let cy = py.clamp(0, h - 1) as usize;
-        ref_y[cy * w as usize + cx] as i32
+        ref_y[cy * w as usize + cx].to_i32()
     };
     let sample = |px: i64, py: i64| -> i32 {
         match &upref {
@@ -1088,7 +1187,7 @@ fn global_gmode_by_sad(
                     let py = y0 + dy;
                     let s = cur_y
                         [(py.clamp(0, h - 1) as usize) * w as usize + px.clamp(0, w - 1) as usize]
-                        as i32;
+                        .to_i32();
                     let scaled_x = (px as i64) << mv_precision;
                     let scaled_y = (py as i64) << mv_precision;
                     let rb = sample(scaled_x + mv.0 as i64, scaled_y + mv.1 as i64);
@@ -1255,11 +1354,11 @@ impl Default for InterEncoderParams {
 
 /// One input picture (Y/U/V planes + picture number).
 #[derive(Debug, Clone)]
-pub struct InterInputPicture<'a> {
+pub struct InterInputPicture<'a, S: InterSample = u8> {
     pub picture_number: u32,
-    pub y: &'a [u8],
-    pub u: &'a [u8],
-    pub v: &'a [u8],
+    pub y: &'a [S],
+    pub u: &'a [S],
+    pub v: &'a [S],
 }
 
 /// Block dims for preset 1 (Table 11.1) — the only preset r1 emits.
@@ -1294,9 +1393,9 @@ pub struct IntegerMv(pub i32, pub i32);
 /// stride, 8x8 block). The block at position `(bx, by)` covers source
 /// pixels `[by*4 .. by*4+8) x [bx*4 .. bx*4+8)` (truncated against the
 /// picture edge).
-pub fn full_search_me(
-    cur_y: &[u8],
-    ref_y: &[u8],
+pub fn full_search_me<S: InterSample>(
+    cur_y: &[S],
+    ref_y: &[S],
     width: u32,
     height: u32,
     blocks_x: u32,
@@ -1349,9 +1448,9 @@ pub fn full_search_me(
 /// position `(x0, y0)` against reference position `(x0 + dx, y0 + dy)`,
 /// with edge clamping on both pictures.
 #[allow(clippy::too_many_arguments)]
-fn sad_block(
-    cur: &[u8],
-    refp: &[u8],
+fn sad_block<S: InterSample>(
+    cur: &[S],
+    refp: &[S],
     w: i32,
     h: i32,
     x0: i32,
@@ -1368,8 +1467,8 @@ fn sad_block(
         for x in 0..xblen {
             let cx = (x0 + x).clamp(0, w - 1) as usize;
             let rx = (x0 + dx + x).clamp(0, w - 1) as usize;
-            let a = cur[cy * w as usize + cx] as i32;
-            let b = refp[ry * w as usize + rx] as i32;
+            let a = cur[cy * w as usize + cx].to_i32();
+            let b = refp[ry * w as usize + rx].to_i32();
             sad += (a - b).unsigned_abs() as i64;
         }
     }
@@ -1384,8 +1483,8 @@ fn sad_block(
 /// reverse side, so SAD evaluated here matches the eventual
 /// reconstruction error pixel-for-pixel.
 #[allow(clippy::too_many_arguments)]
-fn sad_subpel(
-    cur: &[u8],
+fn sad_subpel<S: InterSample>(
+    cur: &[S],
     upref: &[i32],
     up_w: usize,
     up_h: usize,
@@ -1408,7 +1507,7 @@ fn sad_subpel(
             let cx = (x0 + x).clamp(0, w - 1) as usize;
             let px = qx + (x as i64) * scale;
             let r = subpel_predict(upref, up_w, up_h, px, py, mv_precision);
-            let a = cur[cy * w as usize + cx] as i32;
+            let a = cur[cy * w as usize + cx].to_i32();
             sad += (a - r).unsigned_abs() as i64;
         }
     }
@@ -1416,38 +1515,51 @@ fn sad_subpel(
 }
 
 /// Build the half-pel upsampled reference plane (§15.8.11) for a
-/// `width × height` u8 luma plane. The returned plane has size
-/// `(2w - 1) × (2h - 1)` in i32. We use `depth = 9` so that the spec's
-/// `[-2^(d-1), 2^(d-1)-1]` clip range (`[-256, 255]`) is wide enough
-/// to hold any 0..255 input plus the 8-tap filter's small overshoot.
+/// `width × height` luma plane of any [`InterSample`] width. The
+/// returned plane has size `2w × 2h` in i32. We use
+/// `depth = S::ME_UPREF_DEPTH` (one bit above the sample width) so
+/// that the spec's `[-2^(d-1), 2^(d-1)-1]` clip range is wide enough
+/// to hold the full unsigned input range plus the 8-tap filter's small
+/// overshoot.
 ///
-/// The samples are kept in unsigned `0..255` space rather than signed
-/// `-128..127`; this matches the original sub-pel ME path (which scores
-/// against the u8 source directly). The OBMC-aware refinement
+/// The samples are kept in unsigned space rather than the signed
+/// mid-range-offset convention; this matches the original sub-pel ME
+/// path (which scores against the unsigned source directly). The
+/// OBMC-aware refinement
 /// ([`obmc_refine_me`]) builds its own *signed* upref via
 /// [`build_upref_signed`] because the decoder OBMC blend operates on the
 /// pre-offset signed reference buffer (§15.4 / §15.8.5).
-pub(crate) fn build_upref(plane: &[u8], width: u32, height: u32) -> (Vec<i32>, usize, usize) {
-    let w = width as usize;
-    let h = height as usize;
-    let signed: Vec<i32> = plane.iter().map(|&v| v as i32).collect();
-    let (up, up_w, up_h) = interp2by2(&signed, w, h, 9);
-    (up, up_w, up_h)
-}
-
-/// Like [`build_upref`] but with the spec's signed pre-offset
-/// convention: each input sample is shifted by `-2^(depth-1)` (i.e.
-/// `-128` for 8-bit) to match what the decoder's reference buffer
-/// holds (§15.4 stores the pre-output-offset signed plane).
-pub(crate) fn build_upref_signed(
-    plane: &[u8],
+pub(crate) fn build_upref<S: InterSample>(
+    plane: &[S],
     width: u32,
     height: u32,
 ) -> (Vec<i32>, usize, usize) {
     let w = width as usize;
     let h = height as usize;
-    let signed: Vec<i32> = plane.iter().map(|&v| v as i32 - 128).collect();
-    let (up, up_w, up_h) = interp2by2(&signed, w, h, 9);
+    let widened: Vec<i32> = plane.iter().map(|&v| v.to_i32()).collect();
+    let (up, up_w, up_h) = interp2by2(&widened, w, h, S::ME_UPREF_DEPTH);
+    (up, up_w, up_h)
+}
+
+/// Like [`build_upref`] but with the spec's signed pre-offset
+/// convention: each input sample is shifted by `-S::NOMINAL_HALF`
+/// (`-128` for `u8`, `-32768` for `u16`) to mirror what the decoder's
+/// reference buffer holds (§15.4 stores the pre-output-offset signed
+/// plane). For deep sources whose sequence depth is below the sample
+/// width the shift differs from the decoder's by a constant, which
+/// cancels in the SAD/SSE differences the ME scoring computes.
+pub(crate) fn build_upref_signed<S: InterSample>(
+    plane: &[S],
+    width: u32,
+    height: u32,
+) -> (Vec<i32>, usize, usize) {
+    let w = width as usize;
+    let h = height as usize;
+    let signed: Vec<i32> = plane
+        .iter()
+        .map(|&v| v.to_i32() - S::NOMINAL_HALF)
+        .collect();
+    let (up, up_w, up_h) = interp2by2(&signed, w, h, S::ME_UPREF_DEPTH);
     (up, up_w, up_h)
 }
 
@@ -1459,11 +1571,11 @@ pub(crate) fn build_upref_signed(
 /// rate-control picker ([`pick_inter_residue_qindex`]) reconstructs the
 /// **same** MV grid the encoder will use, guaranteeing the residue it
 /// measures matches the residue it eventually emits.
-fn inter_mv_grid(
+fn inter_mv_grid<S: InterSample>(
     sequence: &SequenceHeader,
     params: &InterEncoderParams,
-    cur_y: &[u8],
-    ref_y: &[u8],
+    cur_y: &[S],
+    ref_y: &[S],
 ) -> Vec<IntegerMv> {
     let (_sbx, _sby, blocks_x, blocks_y) = motion_grid(sequence.luma_width, sequence.luma_height);
     let mut mvs = subpel_search_me(
@@ -1539,9 +1651,9 @@ fn inter_mv_grid(
 ///
 /// At `mv_precision = 0` this degenerates to [`full_search_me`].
 #[allow(clippy::too_many_arguments)]
-pub fn subpel_search_me(
-    cur_y: &[u8],
-    ref_y: &[u8],
+pub fn subpel_search_me<S: InterSample>(
+    cur_y: &[S],
+    ref_y: &[S],
     width: u32,
     height: u32,
     blocks_x: u32,
@@ -1765,8 +1877,8 @@ fn block_weighted_pred(
 /// and clipping reproduces exactly what the decoder will write into
 /// the picture.
 #[allow(clippy::too_many_arguments)]
-fn obmc_block_sse(
-    cur: &[u8],
+fn obmc_block_sse<S: InterSample>(
+    cur: &[S],
     cur_w: i32,
     cur_h: i32,
     weighted_pred: &[i32],
@@ -1776,8 +1888,8 @@ fn obmc_block_sse(
     xstart: i32,
     ystart: i32,
 ) -> i64 {
-    let lo = -128i32;
-    let hi = 127i32;
+    let lo = -S::NOMINAL_HALF;
+    let hi = S::NOMINAL_HALF - 1;
     let mut sse: i64 = 0;
     for q in 0..yblen {
         let y = ystart + q as i32;
@@ -1791,11 +1903,12 @@ fn obmc_block_sse(
             }
             let total = weighted_pred[q * xblen + p] + neighbour_sum[q * xblen + p];
             // §15.8.2 picture-domain conversion: (sum + 32) >> 6 then
-            // clip to the signed 8-bit range. Pre-offset cancels with
-            // the 128-bias picture-storage convention, so we compare
-            // against the raw u8 source minus 128.
+            // clip to the sample type's signed range. Pre-offset
+            // cancels with the mid-range picture-storage convention,
+            // so we compare against the raw source minus NOMINAL_HALF.
             let recon_signed = ((total + 32) >> 6).clamp(lo, hi);
-            let src_signed = cur[y as usize * cur_w as usize + x as usize] as i32 - 128;
+            let src_signed =
+                cur[y as usize * cur_w as usize + x as usize].to_i32() - S::NOMINAL_HALF;
             let d = recon_signed - src_signed;
             sse += (d * d) as i64;
         }
@@ -1897,16 +2010,15 @@ fn build_neighbour_sum(
 ///
 /// The refinement converges very fast on smooth motion (typically 1-2
 /// passes); after that the MV grid is at a local minimum of the OBMC
-/// reconstruction cost function. This is the standard "block-coordinate
-/// descent" method described in OBMC literature and used by Dirac
-/// reference encoders.
+/// reconstruction cost function — a plain block-coordinate descent on
+/// the per-block blended-reconstruction SSE.
 ///
 /// The function uses [`crate::obmc::spatial_wt`] for the §15.8.6 ramp
 /// window so the encoder's blend matches the decoder symbol-for-symbol.
 #[allow(clippy::too_many_arguments)]
-pub fn obmc_refine_me(
-    cur_y: &[u8],
-    ref_y: &[u8],
+pub fn obmc_refine_me<S: InterSample>(
+    cur_y: &[S],
+    ref_y: &[S],
     width: u32,
     height: u32,
     blocks_x: u32,
@@ -1939,13 +2051,16 @@ pub fn obmc_refine_me(
     // which holds the *signed pre-output-offset* picture (i.e. `pic` -
     // `2^(depth-1)`). To match the decoder's reconstruction symbol-for-
     // symbol we feed signed reference samples and compare against
-    // `source_u8 - 128`.
+    // `source - NOMINAL_HALF`.
     let (upref, up_w, up_h) = if mv_precision > 0 {
         build_upref_signed(ref_y, width, height)
     } else {
         (Vec::new(), 0, 0)
     };
-    let refp_signed: Vec<i32> = ref_y.iter().map(|&v| v as i32 - 128).collect();
+    let refp_signed: Vec<i32> = ref_y
+        .iter()
+        .map(|&v| v.to_i32() - S::NOMINAL_HALF)
+        .collect();
     let ref_w = width as usize;
     let ref_h = height as usize;
     // Sub-pel step granularity: refine at the finest unit available.
@@ -2076,9 +2191,9 @@ pub fn obmc_refine_me(
 /// converges against the better starting point rather than against a
 /// noisy sub-pel field.
 #[allow(clippy::too_many_arguments)]
-pub fn inter_select_int_pel_per_block(
-    cur_y: &[u8],
-    ref_y: &[u8],
+pub fn inter_select_int_pel_per_block<S: InterSample>(
+    cur_y: &[S],
+    ref_y: &[S],
     width: u32,
     height: u32,
     blocks_x: u32,
@@ -2110,7 +2225,10 @@ pub fn inter_select_int_pel_per_block(
     // Build the signed pre-offset upsampled reference once — matches
     // the convention `obmc_refine_me` uses (§15.4 reference buffer).
     let (upref, up_w, up_h) = build_upref_signed(ref_y, width, height);
-    let refp_signed: Vec<i32> = ref_y.iter().map(|&v| v as i32 - 128).collect();
+    let refp_signed: Vec<i32> = ref_y
+        .iter()
+        .map(|&v| v.to_i32() - S::NOMINAL_HALF)
+        .collect();
     let ref_w = width as usize;
     let ref_h = height as usize;
 
@@ -2759,14 +2877,14 @@ fn encode_dc_values(
 /// same reference plane for later residue subtraction without doubling
 /// the work or rebuilding `mc_tmp` per pixel.
 #[allow(clippy::too_many_arguments)]
-fn build_obmc_prediction(
+fn build_obmc_prediction<S: InterSample>(
     sequence: &SequenceHeader,
     pred: &PicturePredictionParams,
     motion: &PictureMotionData,
     is_chroma: bool,
-    ref_y: &[u8],
-    ref_u: &[u8],
-    ref_v: &[u8],
+    ref_y: &[S],
+    ref_u: &[S],
+    ref_v: &[S],
 ) -> (Vec<i32>, Vec<i32>, Vec<i32>) {
     let chroma_h_ratio = sequence.video_params.chroma_format.h_ratio();
     let chroma_v_ratio = sequence.video_params.chroma_format.v_ratio();
@@ -2813,14 +2931,14 @@ fn build_obmc_prediction(
 /// signed pre-output-offset reconstruction — exactly the shape the
 /// decoder will emit before §15.10's output offset pass.
 #[allow(clippy::too_many_arguments)]
-fn build_obmc_prediction_one(
+fn build_obmc_prediction_one<S: InterSample>(
     sequence: &SequenceHeader,
     pred: &PicturePredictionParams,
     motion: &PictureMotionData,
     component: usize,
     chroma_h_ratio: u32,
     chroma_v_ratio: u32,
-    ref_plane: &[u8],
+    ref_plane: &[S],
     comp_w: usize,
     comp_h: usize,
 ) -> Vec<i32> {
@@ -2832,7 +2950,7 @@ fn build_obmc_prediction_one(
     };
     let half = 1i32 << (depth - 1);
     // Reference plane in the spec's signed pre-offset convention.
-    let ref_signed: Vec<i32> = ref_plane.iter().map(|&v| v as i32 - half).collect();
+    let ref_signed: Vec<i32> = ref_plane.iter().map(|&v| v.to_i32() - half).collect();
     let (xblen, yblen, xbsep, ybsep) = if is_chroma {
         (
             (pred.luma_xblen / chroma_h_ratio) as usize,
@@ -2962,16 +3080,22 @@ fn build_motion_from_mv_grid(
 
 /// Subtract the OBMC prediction from the source picture in the spec's
 /// **signed pre-output-offset** domain — i.e.
-/// `residue[x] = (source_u8[x] - half) - prediction_signed[x]`.
+/// `residue[x] = (source[x] - half) - prediction_signed[x]` with `half
+/// = 2^(depth-1)` from the **sequence** depth (8-bit and deep-colour
+/// sources alike).
 /// The result is a signed plane the wavelet residue encoder forward-
 /// transforms as if it were a tiny intra picture.
-fn build_residue_plane(source_u8: &[u8], prediction_signed: &[i32], depth: u32) -> Vec<i32> {
-    debug_assert_eq!(source_u8.len(), prediction_signed.len());
+fn build_residue_plane<S: InterSample>(
+    source: &[S],
+    prediction_signed: &[i32],
+    depth: u32,
+) -> Vec<i32> {
+    debug_assert_eq!(source.len(), prediction_signed.len());
     let half = 1i32 << (depth - 1);
-    source_u8
+    source
         .iter()
         .zip(prediction_signed.iter())
-        .map(|(&s, &p)| (s as i32 - half) - p)
+        .map(|(&s, &p)| (s.to_i32() - half) - p)
         .collect()
 }
 
@@ -3549,17 +3673,17 @@ struct InterResiduePyramids {
 /// [`encode_inter_picture`] commits to the bitstream, so the pyramids
 /// match the eventual decode symbol-for-symbol at any qindex.
 #[allow(clippy::too_many_arguments)]
-fn build_inter_residue_pyramids(
+fn build_inter_residue_pyramids<S: InterSample>(
     sequence: &SequenceHeader,
     iep: &InterEncoderParams,
     rp: &ResidueParams,
     mvs: &[IntegerMv],
-    cur_y: &[u8],
-    cur_u: &[u8],
-    cur_v: &[u8],
-    ref_y: &[u8],
-    ref_u: &[u8],
-    ref_v: &[u8],
+    cur_y: &[S],
+    cur_u: &[S],
+    cur_v: &[S],
+    ref_y: &[S],
+    ref_u: &[S],
+    ref_v: &[S],
 ) -> InterResiduePyramids {
     let (sbx, sby, blocks_x, blocks_y) = motion_grid(sequence.luma_width, sequence.luma_height);
     let pred = picture_prediction_params_from(sequence, iep, iep.mv_precision, 1);
@@ -3657,15 +3781,15 @@ fn inter_residue_bytes_at_qindex(
 /// Source of truth: BBC Dirac Specification v2.2.3 §11.3 (residue
 /// wavelet_transform), §13.4.4 (codeblock entropy coding).
 #[allow(clippy::too_many_arguments)]
-pub fn pick_inter_residue_qindex(
+pub fn pick_inter_residue_qindex<S: InterSample>(
     sequence: &SequenceHeader,
     params: &InterEncoderParams,
-    cur_y: &[u8],
-    cur_u: &[u8],
-    cur_v: &[u8],
-    ref_y: &[u8],
-    ref_u: &[u8],
-    ref_v: &[u8],
+    cur_y: &[S],
+    cur_u: &[S],
+    cur_v: &[S],
+    ref_y: &[S],
+    ref_u: &[S],
+    ref_v: &[S],
     target_residue_bytes: u32,
 ) -> u32 {
     let rp = match params.residue {
@@ -3694,15 +3818,15 @@ pub fn pick_inter_residue_qindex(
 /// `(qindex, actual_residue_bytes)` so callers can inspect the chosen
 /// quantiser's actual residue-byte cost relative to the supplied budget.
 #[allow(clippy::too_many_arguments)]
-pub fn inter_residue_qindex_diagnostic(
+pub fn inter_residue_qindex_diagnostic<S: InterSample>(
     sequence: &SequenceHeader,
     params: &InterEncoderParams,
-    cur_y: &[u8],
-    cur_u: &[u8],
-    cur_v: &[u8],
-    ref_y: &[u8],
-    ref_u: &[u8],
-    ref_v: &[u8],
+    cur_y: &[S],
+    cur_u: &[S],
+    cur_v: &[S],
+    ref_y: &[S],
+    ref_u: &[S],
+    ref_v: &[S],
     target_residue_bytes: u32,
 ) -> (u32, usize) {
     let rp = match params.residue {
@@ -3738,17 +3862,17 @@ pub fn inter_residue_qindex_diagnostic(
 /// is the reference's. The decoded delta is `ref1 - picture_number` cast
 /// to `i32` (§9.6.1).
 #[allow(clippy::too_many_arguments)]
-pub fn encode_inter_picture(
+pub fn encode_inter_picture<S: InterSample>(
     sequence: &SequenceHeader,
     params: &InterEncoderParams,
     picture_number: u32,
     ref1_picture_number: u32,
-    cur_y: &[u8],
-    cur_u: &[u8],
-    cur_v: &[u8],
-    ref_y: &[u8],
-    ref_u: &[u8],
-    ref_v: &[u8],
+    cur_y: &[S],
+    cur_u: &[S],
+    cur_v: &[S],
+    ref_y: &[S],
+    ref_u: &[S],
+    ref_v: &[S],
 ) -> Vec<u8> {
     assert_eq!(params.block_params_index, 1, "r1 only supports preset 1");
 
@@ -3989,10 +4113,10 @@ fn effective_global_params(g: &GlobalParams) -> GlobalParams {
 /// `mv_precision` is in `1/(2^p)` luma pel units (matches
 /// [`InterEncoderParams::mv_precision`]).
 #[allow(clippy::too_many_arguments)]
-pub fn bipred_select_modes(
-    cur_y: &[u8],
-    ref1_y: &[u8],
-    ref2_y: &[u8],
+pub fn bipred_select_modes<S: InterSample>(
+    cur_y: &[S],
+    ref1_y: &[S],
+    ref2_y: &[S],
     width: u32,
     height: u32,
     blocks_x: u32,
@@ -4063,7 +4187,7 @@ pub fn bipred_select_modes(
             let mv2_half = round_mv_to_half_pel(mv2, mv_precision);
 
             let sad_one =
-                |mv: IntegerMv, refp: &[u8], up: &[i32], up_w: usize, up_h: usize| -> i64 {
+                |mv: IntegerMv, refp: &[S], up: &[i32], up_w: usize, up_h: usize| -> i64 {
                     if mv_precision == 0 {
                         sad_block(cur_y, refp, w_i, h_i, x0, y0, mv.0, mv.1, xblen, yblen)
                     } else {
@@ -4098,7 +4222,7 @@ pub fn bipred_select_modes(
             let pick_best_mv = |mv_sp: IntegerMv,
                                 mv_half: IntegerMv,
                                 mv_int: IntegerMv,
-                                refp: &[u8],
+                                refp: &[S],
                                 up: &[i32],
                                 up_w: usize,
                                 up_h: usize|
@@ -4322,16 +4446,16 @@ fn round_mv_to_int_pel(mv: IntegerMv, p: u32) -> IntegerMv {
 /// §15.8.5 reconstruction at `ref1_wt = ref2_wt = 1`,
 /// `refs_wt_precision = 1` (post-OBMC blend, pre-spatial-weight scale).
 #[allow(clippy::too_many_arguments)]
-fn sad_bipred(
-    cur: &[u8],
+fn sad_bipred<S: InterSample>(
+    cur: &[S],
     up1: &[i32],
     up1_w: usize,
     up1_h: usize,
-    ref1: &[u8],
+    ref1: &[S],
     up2: &[i32],
     up2_w: usize,
     up2_h: usize,
-    ref2: &[u8],
+    ref2: &[S],
     w: i32,
     h: i32,
     x0: i32,
@@ -4352,10 +4476,10 @@ fn sad_bipred(
                 let r1y = (y0 + y + mv1.1).clamp(0, h - 1) as usize;
                 let r2x = (x0 + x + mv2.0).clamp(0, w - 1) as usize;
                 let r2y = (y0 + y + mv2.1).clamp(0, h - 1) as usize;
-                let p1 = ref1[r1y * w as usize + r1x] as i32;
-                let p2 = ref2[r2y * w as usize + r2x] as i32;
+                let p1 = ref1[r1y * w as usize + r1x].to_i32();
+                let p2 = ref2[r2y * w as usize + r2x].to_i32();
                 let pavg = (p1 + p2 + 1) >> 1;
-                let s = cur[cy * w as usize + cx] as i32;
+                let s = cur[cy * w as usize + cx].to_i32();
                 sad += (s - pavg).unsigned_abs() as i64;
             }
         }
@@ -4372,7 +4496,7 @@ fn sad_bipred(
                 let p1 = subpel_predict(up1, up1_w, up1_h, px, py, mv_precision);
                 let p2 = subpel_predict(up2, up2_w, up2_h, px2, py2, mv_precision);
                 let pavg = (p1 + p2 + 1) >> 1;
-                let s = cur[cy * w as usize + cx] as i32;
+                let s = cur[cy * w as usize + cx].to_i32();
                 sad += (s - pavg).unsigned_abs() as i64;
             }
         }
@@ -4386,7 +4510,7 @@ fn sad_bipred(
 /// ref2_wt = 1`, `refs_wt_precision = 1` — i.e. `(v1 + v2 + 1) >> 1`
 /// for the `Ref1And2` mode and the appropriate single-ref pixel
 /// otherwise. References are the *signed pre-offset* convention
-/// (`u8 - 128`) so the result composes with the §15.8.6 spatial weight
+/// (`sample - NOMINAL_HALF`) so the result composes with the §15.8.6 spatial weight
 /// matrix and the §15.8.2 `(sum + 32) >> 6` clip in `obmc_block_sse`.
 #[inline]
 #[allow(clippy::too_many_arguments)]
@@ -4606,10 +4730,10 @@ fn build_neighbour_sum_bipred(
 ///
 /// No-op when `decisions` is empty.
 #[allow(clippy::too_many_arguments)]
-pub fn bipred_post_obmc_refine_modes(
-    cur_y: &[u8],
-    ref1_y: &[u8],
-    ref2_y: &[u8],
+pub fn bipred_post_obmc_refine_modes<S: InterSample>(
+    cur_y: &[S],
+    ref1_y: &[S],
+    ref2_y: &[S],
     width: u32,
     height: u32,
     blocks_x: u32,
@@ -4643,8 +4767,14 @@ pub fn bipred_post_obmc_refine_modes(
     // a constant number of times per block).
     let (up1_signed, up1_w, up1_h) = build_upref_signed(ref1_y, width, height);
     let (up2_signed, up2_w, up2_h) = build_upref_signed(ref2_y, width, height);
-    let ref1_signed: Vec<i32> = ref1_y.iter().map(|&v| v as i32 - 128).collect();
-    let ref2_signed: Vec<i32> = ref2_y.iter().map(|&v| v as i32 - 128).collect();
+    let ref1_signed: Vec<i32> = ref1_y
+        .iter()
+        .map(|&v| v.to_i32() - S::NOMINAL_HALF)
+        .collect();
+    let ref2_signed: Vec<i32> = ref2_y
+        .iter()
+        .map(|&v| v.to_i32() - S::NOMINAL_HALF)
+        .collect();
 
     for j in 0..blocks_y {
         for i in 0..blocks_x {
@@ -4810,16 +4940,16 @@ fn build_motion_from_bipred_grid(
 /// picture. Same shape as [`build_obmc_prediction`] but feeds both
 /// reference planes through `crate::obmc::motion_compensate`.
 #[allow(clippy::too_many_arguments)]
-fn build_obmc_prediction_bipred(
+fn build_obmc_prediction_bipred<S: InterSample>(
     sequence: &SequenceHeader,
     pred: &PicturePredictionParams,
     motion: &PictureMotionData,
-    ref1_y: &[u8],
-    ref1_u: &[u8],
-    ref1_v: &[u8],
-    ref2_y: &[u8],
-    ref2_u: &[u8],
-    ref2_v: &[u8],
+    ref1_y: &[S],
+    ref1_u: &[S],
+    ref1_v: &[S],
+    ref2_y: &[S],
+    ref2_u: &[S],
+    ref2_v: &[S],
 ) -> (Vec<i32>, Vec<i32>, Vec<i32>) {
     let chroma_h_ratio = sequence.video_params.chroma_format.h_ratio();
     let chroma_v_ratio = sequence.video_params.chroma_format.v_ratio();
@@ -4863,15 +4993,15 @@ fn build_obmc_prediction_bipred(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_obmc_prediction_one_bipred(
+fn build_obmc_prediction_one_bipred<S: InterSample>(
     sequence: &SequenceHeader,
     pred: &PicturePredictionParams,
     motion: &PictureMotionData,
     component: usize,
     chroma_h_ratio: u32,
     chroma_v_ratio: u32,
-    ref1_plane: &[u8],
-    ref2_plane: &[u8],
+    ref1_plane: &[S],
+    ref2_plane: &[S],
     comp_w: usize,
     comp_h: usize,
 ) -> Vec<i32> {
@@ -4882,8 +5012,8 @@ fn build_obmc_prediction_one_bipred(
         sequence.luma_depth
     };
     let half = 1i32 << (depth - 1);
-    let ref1_signed: Vec<i32> = ref1_plane.iter().map(|&v| v as i32 - half).collect();
-    let ref2_signed: Vec<i32> = ref2_plane.iter().map(|&v| v as i32 - half).collect();
+    let ref1_signed: Vec<i32> = ref1_plane.iter().map(|&v| v.to_i32() - half).collect();
+    let ref2_signed: Vec<i32> = ref2_plane.iter().map(|&v| v.to_i32() - half).collect();
     let (xblen, yblen, xbsep, ybsep) = if is_chroma {
         (
             (pred.luma_xblen / chroma_h_ratio) as usize,
@@ -4936,21 +5066,21 @@ fn build_obmc_prediction_one_bipred(
 /// `block_motion_data` (incl. v2x / v2y), and feeds both reference
 /// planes into the residue's OBMC prediction.
 #[allow(clippy::too_many_arguments)]
-pub fn encode_bipred_inter_picture(
+pub fn encode_bipred_inter_picture<S: InterSample>(
     sequence: &SequenceHeader,
     params: &InterEncoderParams,
     picture_number: u32,
     ref1_picture_number: u32,
     ref2_picture_number: u32,
-    cur_y: &[u8],
-    cur_u: &[u8],
-    cur_v: &[u8],
-    ref1_y: &[u8],
-    ref1_u: &[u8],
-    ref1_v: &[u8],
-    ref2_y: &[u8],
-    ref2_u: &[u8],
-    ref2_v: &[u8],
+    cur_y: &[S],
+    cur_u: &[S],
+    cur_v: &[S],
+    ref1_y: &[S],
+    ref1_u: &[S],
+    ref1_v: &[S],
+    ref2_y: &[S],
+    ref2_u: &[S],
+    ref2_v: &[S],
 ) -> Vec<u8> {
     assert_eq!(params.block_params_index, 1, "only preset 1 is supported");
 
@@ -5103,18 +5233,19 @@ pub fn encode_bipred_inter_picture(
 /// by a single inter (`0x09`) referencing it. This is the minimal
 /// inter-decode validator — the simplest legal Dirac sequence with a
 /// motion-compensated picture.
-pub fn encode_intra_then_inter_stream(
+pub fn encode_intra_then_inter_stream<S: InterSample>(
     sequence: &SequenceHeader,
     intra_params: &crate::encoder::EncoderParams,
     inter_params: &InterEncoderParams,
-    intra: &InterInputPicture<'_>,
-    inter: &InterInputPicture<'_>,
+    intra: &InterInputPicture<'_, S>,
+    inter: &InterInputPicture<'_, S>,
 ) -> Vec<u8> {
     let sh_payload = crate::encoder::encode_sequence_header(sequence);
 
     // Reference: HQ intra **reference** picture so its decoded form
-    // ends up in the decoder's reference buffer.
-    let intra_payload = crate::encoder::encode_hq_intra_picture(
+    // ends up in the decoder's reference buffer. Dispatch through the
+    // sample trait so u16 sources take the deep-colour HQ intra entry.
+    let intra_payload = S::encode_hq_intra_anchor(
         sequence,
         intra_params,
         intra.picture_number,
@@ -5345,11 +5476,11 @@ pub struct InterPictureRate {
 /// Closes the lib.rs "multi-picture rate-controlled inter sequence
 /// driver" gap (the per-picture picker existed; this wires the
 /// sequence-level carry the HQ/LD intra drivers have).
-pub fn encode_inter_sequence_with_residue_target(
+pub fn encode_inter_sequence_with_residue_target<S: InterSample>(
     sequence: &SequenceHeader,
     intra_params: &crate::encoder::EncoderParams,
     inter_params: &InterEncoderParams,
-    frames: &[InterInputPicture<'_>],
+    frames: &[InterInputPicture<'_, S>],
     target_residue_bytes: u32,
     mode: InterRateControl,
 ) -> Vec<u8> {
@@ -5369,11 +5500,11 @@ pub fn encode_inter_sequence_with_residue_target(
 /// running accumulator for each inter picture). Returns `(stream,
 /// report)`; `report` has one entry per inter picture (i.e.
 /// `frames.len().saturating_sub(1)`).
-pub fn encode_inter_sequence_with_residue_target_report(
+pub fn encode_inter_sequence_with_residue_target_report<S: InterSample>(
     sequence: &SequenceHeader,
     intra_params: &crate::encoder::EncoderParams,
     inter_params: &InterEncoderParams,
-    frames: &[InterInputPicture<'_>],
+    frames: &[InterInputPicture<'_, S>],
     target_residue_bytes: u32,
     mode: InterRateControl,
 ) -> (Vec<u8>, Vec<InterPictureRate>) {
@@ -5396,7 +5527,7 @@ pub fn encode_inter_sequence_with_residue_target_report(
 
     // HQ intra **reference** anchor (0xEC) — its decoded form lands in
     // the decoder's reference buffer per §15.4.
-    let anchor_payload = crate::encoder::encode_hq_intra_picture(
+    let anchor_payload = S::encode_hq_intra_anchor(
         sequence,
         intra_params,
         anchor.picture_number,
@@ -5415,7 +5546,7 @@ pub fn encode_inter_sequence_with_residue_target_report(
     // Every inter picture references the intra anchor — the only
     // reference picture in the stream (0x09 inter pictures are
     // non-reference and never enter the decoder's reference buffer).
-    let reference: &InterInputPicture<'_> = anchor;
+    let reference: &InterInputPicture<'_, S> = anchor;
 
     for pic in inters {
         // Per-picture residue budget from the strategy.
@@ -5654,6 +5785,53 @@ mod tests {
     use super::*;
     use crate::picture_inter::{decode_block_motion_data, parse_picture_prediction_parameters};
     use crate::sequence::parse_sequence_header;
+
+    /// The generic ME pipeline reads `u16` samples above the 8-bit
+    /// range: a bright 10-bit square translated by (+4, +2) must be
+    /// tracked exactly by the integer-pel search, and the sub-pel
+    /// refinement must keep the integer answer (the translation is
+    /// integer-pel). Values straddle 255 so a truncating 8-bit read
+    /// would flatten the square into the background and return (0, 0).
+    #[test]
+    fn full_search_me_tracks_10bit_translation_in_u16() {
+        let (w, h) = (64usize, 64usize);
+        // Textured 16x16 square (values 512..896, all above the 8-bit
+        // range) on a flat dim background. The texture translates with
+        // the square, so an interior block matches only at the true
+        // offset — a truncating 8-bit read would alias the texture.
+        let tex = |lx: usize, ly: usize| -> u16 { 512 + ((lx * 13 + ly * 7) % 384) as u16 };
+        let mut f0 = vec![64u16; w * h];
+        let mut f1 = vec![64u16; w * h];
+        for ly in 0..16 {
+            for lx in 0..16 {
+                f0[(24 + ly) * w + (24 + lx)] = tex(lx, ly);
+                f1[(26 + ly) * w + (28 + lx)] = tex(lx, ly);
+            }
+        }
+        let (_sbx, _sby, bx, by) = motion_grid(w as u32, h as u32);
+        let mvs = full_search_me(&f1, &f0, w as u32, h as u32, bx, by, 8);
+        // Block (8, 8) covers current pixels [32, 40) x [32, 40) — fully
+        // inside the moved square. The MV convention reads the reference
+        // at (x + mv), so the exact-texture match is at (-4, -2).
+        let idx = (8 * bx + 8) as usize;
+        assert_eq!((mvs[idx].0, mvs[idx].1), (-4, -2));
+        // Sub-pel refinement at quarter-pel keeps the integer answer
+        // (scaled into quarter-pel units).
+        let mvs_q = subpel_search_me(&f1, &f0, w as u32, h as u32, bx, by, 8, 2);
+        assert_eq!((mvs_q[idx].0, mvs_q[idx].1), (-16, -8));
+    }
+
+    /// `build_upref` at `u16` must not clip genuine deep-colour values:
+    /// a flat 16-bit plane at 65000 upsamples to 65000 everywhere (the
+    /// §15.8.11 filter preserves constants, and `ME_UPREF_DEPTH = 17`
+    /// gives the clip range headroom past the full u16 excursion).
+    #[test]
+    fn build_upref_u16_preserves_full_range_constants() {
+        let plane = vec![65000u16; 16 * 16];
+        let (up, up_w, up_h) = build_upref(&plane, 16, 16);
+        assert_eq!((up_w, up_h), (32, 32));
+        assert!(up.iter().all(|&v| v == 65000));
+    }
 
     #[test]
     fn cb_residue_bytes_match_intra_core_byte_for_byte() {

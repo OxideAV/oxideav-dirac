@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `encoder_inter::InterSample` — sealed source-sample abstraction
+  (`u8` / `u16`) over the whole inter pipeline: motion estimation
+  (`full_search_me` / `subpel_search_me` / `obmc_refine_me` /
+  `inter_select_int_pel_per_block`), bipred mode selection, global
+  model estimation, the residue qindex pickers, the picture emitters
+  (`encode_inter_picture` / `encode_bipred_inter_picture`) and the
+  sequence drivers are now generic over the input sample width.
+  `InterInputPicture` gains a defaulted sample parameter
+  (`InterInputPicture<'a, S = u8>`), so existing 8-bit callers compile
+  unchanged; `&[u16]` planes carry 9-16-bit deep colour with the coded
+  depth still coming from `SequenceHeader::{luma,chroma}_depth`. The
+  sequence drivers dispatch the HQ intra anchor to the matching-width
+  entry point (`encode_hq_intra_picture` / `_u16`) through the trait.
+
 - Deep-colour decoder output: streams whose §10.5.2 `video_depth`
   exceeds 12 bits (e.g. 13-16-bit §10.3.8 custom signal ranges) now
   decode to the oxideav-core 16-bit surfaces `Yuv420P16Le` /
