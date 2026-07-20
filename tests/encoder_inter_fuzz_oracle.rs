@@ -870,9 +870,12 @@ fn full_range_sr(depth: u32) -> oxideav_dirac::video_format::SignalRange {
     }
 }
 
+/// Owned deep Y/U/V planes for one 64x64 4:2:0 frame.
+type DeepPlanes = (Vec<u16>, Vec<u16>, Vec<u16>);
+
 /// Deep 64x64 4:2:0 frame from a seeded xorshift, spanning the full
 /// `[0, 2^depth)` range.
-fn deep_noise_64(depth: u32, seed: u32) -> (Vec<u16>, Vec<u16>, Vec<u16>) {
+fn deep_noise_64(depth: u32, seed: u32) -> DeepPlanes {
     let mut s = seed.max(1);
     let max = (1u64 << depth) - 1;
     let mut gen = |n: usize| -> Vec<u16> {
@@ -884,14 +887,14 @@ fn deep_noise_64(depth: u32, seed: u32) -> (Vec<u16>, Vec<u16>, Vec<u16>) {
 }
 
 /// Deep solid frame (zero-energy fixture at deep amplitudes).
-fn deep_solid_64(fill: u16, depth: u32) -> (Vec<u16>, Vec<u16>, Vec<u16>) {
+fn deep_solid_64(fill: u16, depth: u32) -> DeepPlanes {
     let mid = 1u16 << (depth - 1);
     (vec![fill; 64 * 64], vec![mid; 32 * 32], vec![mid; 32 * 32])
 }
 
 fn deep_pair_inputs<'a>(
-    a: &'a (Vec<u16>, Vec<u16>, Vec<u16>),
-    b: &'a (Vec<u16>, Vec<u16>, Vec<u16>),
+    a: &'a DeepPlanes,
+    b: &'a DeepPlanes,
 ) -> (InterInputPicture<'a, u16>, InterInputPicture<'a, u16>) {
     (
         InterInputPicture {
@@ -976,11 +979,7 @@ fn deep_u16_pathological_inputs_never_panic() {
         make_minimal_sequence_with_signal_range(64, 64, ChromaFormat::Yuv420, full_range_sr(16));
     let ip = intra_params();
     let noise = deep_noise_64(16, 0xDEAD_BEEF);
-    let cases: [(
-        &str,
-        (Vec<u16>, Vec<u16>, Vec<u16>),
-        (Vec<u16>, Vec<u16>, Vec<u16>),
-    ); 5] = [
+    let cases: [(&str, DeepPlanes, DeepPlanes); 5] = [
         ("zero-vs-zero", deep_solid_64(0, 16), deep_solid_64(0, 16)),
         (
             "max-vs-max",
