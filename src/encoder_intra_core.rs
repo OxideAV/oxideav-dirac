@@ -1022,15 +1022,15 @@ pub fn encode_single_core_intra_stream_vlc_u16(
 /// the stream end-to-end (cf. the soft-skip in
 /// `tests/ffmpeg_interop.rs::ffmpeg_decodes_our_inter_stream_translating_square`
 /// which uses an HQ intra reference and trips ffmpeg's profile guard).
-pub fn encode_core_intra_then_inter_stream(
+pub fn encode_core_intra_then_inter_stream<S: crate::encoder_inter::InterSample>(
     sequence: &SequenceHeader,
     intra_params: &CoreIntraEncoderParams,
     inter_params: &crate::encoder_inter::InterEncoderParams,
-    intra: &crate::encoder_inter::InterInputPicture<'_>,
-    inter: &crate::encoder_inter::InterInputPicture<'_>,
+    intra: &crate::encoder_inter::InterInputPicture<'_, S>,
+    inter: &crate::encoder_inter::InterInputPicture<'_, S>,
 ) -> Vec<u8> {
     let sh_payload = crate::encoder::encode_sequence_header(sequence);
-    let intra_payload = encode_core_intra_picture(
+    let intra_payload = S::encode_core_intra_anchor(
         sequence,
         intra_params,
         intra.picture_number,
@@ -1079,16 +1079,16 @@ pub fn encode_core_intra_then_inter_stream(
 /// **decode order** — both intras first so the decoder's reference
 /// buffer is populated by the time the B picture arrives.
 #[allow(clippy::too_many_arguments)]
-pub fn encode_core_intra_then_bipred_stream(
+pub fn encode_core_intra_then_bipred_stream<S: crate::encoder_inter::InterSample>(
     sequence: &SequenceHeader,
     intra_params: &CoreIntraEncoderParams,
     inter_params: &crate::encoder_inter::InterEncoderParams,
-    intra_a: &crate::encoder_inter::InterInputPicture<'_>,
-    intra_b: &crate::encoder_inter::InterInputPicture<'_>,
-    bipred: &crate::encoder_inter::InterInputPicture<'_>,
+    intra_a: &crate::encoder_inter::InterInputPicture<'_, S>,
+    intra_b: &crate::encoder_inter::InterInputPicture<'_, S>,
+    bipred: &crate::encoder_inter::InterInputPicture<'_, S>,
 ) -> Vec<u8> {
     let sh_payload = crate::encoder::encode_sequence_header(sequence);
-    let intra_a_payload = encode_core_intra_picture(
+    let intra_a_payload = S::encode_core_intra_anchor(
         sequence,
         intra_params,
         intra_a.picture_number,
@@ -1096,7 +1096,7 @@ pub fn encode_core_intra_then_bipred_stream(
         intra_a.u,
         intra_a.v,
     );
-    let intra_b_payload = encode_core_intra_picture(
+    let intra_b_payload = S::encode_core_intra_anchor(
         sequence,
         intra_params,
         intra_b.picture_number,

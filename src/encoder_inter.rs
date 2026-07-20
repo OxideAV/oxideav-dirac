@@ -107,6 +107,21 @@ pub trait InterSample: Copy + sealed::Sealed + 'static {
         u: &[Self],
         v: &[Self],
     ) -> Vec<u8>;
+
+    /// Encode a core-syntax AC intra **anchor** picture (`0x0C`
+    /// payload) for the homogeneous core-syntax stream drivers
+    /// (`encoder_intra_core::encode_core_intra_then_inter_stream` /
+    /// `encode_core_intra_then_bipred_stream`), dispatching to the
+    /// matching-width core intra entry point.
+    #[doc(hidden)]
+    fn encode_core_intra_anchor(
+        sequence: &SequenceHeader,
+        params: &crate::encoder_intra_core::CoreIntraEncoderParams,
+        picture_number: u32,
+        y: &[Self],
+        u: &[Self],
+        v: &[Self],
+    ) -> Vec<u8>;
 }
 
 impl InterSample for u8 {
@@ -126,6 +141,23 @@ impl InterSample for u8 {
     ) -> Vec<u8> {
         crate::encoder::encode_hq_intra_picture(sequence, params, picture_number, y, u, v)
     }
+    fn encode_core_intra_anchor(
+        sequence: &SequenceHeader,
+        params: &crate::encoder_intra_core::CoreIntraEncoderParams,
+        picture_number: u32,
+        y: &[Self],
+        u: &[Self],
+        v: &[Self],
+    ) -> Vec<u8> {
+        crate::encoder_intra_core::encode_core_intra_picture(
+            sequence,
+            params,
+            picture_number,
+            y,
+            u,
+            v,
+        )
+    }
 }
 
 impl InterSample for u16 {
@@ -144,6 +176,23 @@ impl InterSample for u16 {
         v: &[Self],
     ) -> Vec<u8> {
         crate::encoder::encode_hq_intra_picture_u16(sequence, params, picture_number, y, u, v)
+    }
+    fn encode_core_intra_anchor(
+        sequence: &SequenceHeader,
+        params: &crate::encoder_intra_core::CoreIntraEncoderParams,
+        picture_number: u32,
+        y: &[Self],
+        u: &[Self],
+        v: &[Self],
+    ) -> Vec<u8> {
+        crate::encoder_intra_core::encode_core_intra_picture_u16(
+            sequence,
+            params,
+            picture_number,
+            y,
+            u,
+            v,
+        )
     }
 }
 

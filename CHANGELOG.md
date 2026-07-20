@@ -22,6 +22,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   depth still coming from `SequenceHeader::{luma,chroma}_depth`. The
   sequence drivers dispatch the HQ intra anchor to the matching-width
   entry point (`encode_hq_intra_picture` / `_u16`) through the trait.
+- Deep-colour **inter** encode, end-to-end: 1-ref P (`0x09`) and 2-ref
+  bipred B (`0x0A`) pictures from 10/12/16-bit `&[u16]` sources
+  round-trip **bit-exactly** through the crate's own decoder at
+  residue qindex 0 (HQ-anchored and homogeneous core-syntax chains,
+  4:2:0/4:2:2/4:4:4; the core-syntax stream drivers
+  `encode_core_intra_then_inter_stream` /
+  `encode_core_intra_then_bipred_stream` are now sample-generic too).
 
 - Deep-colour decoder output: streams whose §10.5.2 `video_depth`
   exceeds 12 bits (e.g. 13-16-bit §10.3.8 custom signal ranges) now
