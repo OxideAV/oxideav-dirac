@@ -57,6 +57,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   estimator (`auto_global_motion`) is pinned on a 12-bit whole-frame
   pan sequence — applied on every inter picture (fraction ≥ 0.5
   telemetry) with the rate-controlled stream still q0 bit-exact.
+- Interop characterisation: the black-box reference decoder accepts
+  our 10/12-bit preset-range core-syntax inter chains but corrupts
+  its own output at deep depths (a zeroed mid-picture stripe on the
+  intra frame it decodes bit-exactly stand-alone, near-garbage inter
+  frame) — while the identical bytes decode bit-exactly through this
+  crate's decoder; the 8-bit variant of the same chain has been
+  oracle-bit-exact since round-408, so depth is the only trigger.
+  Deep inter therefore stays self-validated (the oracle also rejects
+  the §10.3.8 custom ranges 13-16-bit streams require).
 
 ### Fixed
 
