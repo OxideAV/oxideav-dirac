@@ -34,6 +34,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whole-picture global pan at 10-bit, per-reference global models on a
   16-bit bipred B, and the pan **estimator** driven from a 12-bit ME
   grid all round-trip bit-exactly at residue qindex 0.
+- Deep-colour rate-controlled inter sequences: the
+  PerPicture / Cbr / Vbv / VbvHysteresis residue-budget drivers are
+  pinned on 10- and 16-bit `&[u16]` sources — bare-target requests,
+  carry tracking (`Σ(actual − target)`), the `-buffer_bytes` savings
+  clamp, the per-picture drain cap (and its collapse to plain Vbv),
+  monotone qindex escalation under a tight budget, and full q0
+  bit-exactness at a floor budget (16-bit Cbr lands within ~2.4% of
+  the per-picture target over the fixture sequence).
 
 ### Fixed
 
