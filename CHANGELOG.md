@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.10](https://github.com/OxideAV/oxideav-dirac/compare/v0.0.9...v0.0.10) - 2026-07-20
+
+### Other
+
+- round-419 deep-colour inter + rate-control rollup
+- characterise the oracle's deep-inter corruption; self-decode is the load-bearing check
+- per-picture auto global motion pinned on a deep (12-bit) rate-controlled sequence
+- alias the deep plane triple (type-complexity lint on the u16 oracle arms)
+- deep-colour (u16) arms in the inter-encoder oracle
+- deep fixture trio anchors self-encoded inter P pins (10/12/16-bit bit-exact)
+- deep-colour rate-controlled sequences — all four residue-budget drivers pinned on u16
+- deep codeblock-grid residue + global motion bit-exact; fix 16-bit OBMC SSE overflow
+- deep-colour P + bipred B encode, q0 bit-exact end-to-end at 10/12/16-bit
+- InterSample genericization — the whole ME/OBMC/residue pipeline reads u8 or u16 planes
+- reword a corpus-driver policy comment to name no external implementations
+- round-417 deep-colour rollup — corpus 12/12, fragment 16-bit note
+- >16-bit depth rejected cleanly; fix write_uint(u32::MAX) underflow
+- 16-bit deep colour through the §14 fragmented-picture path
+- three deep-colour fixtures BitExact (12/12); full-range deep test pattern
+- &[u16] deep entry points; core-syntax bit-exact at 16-bit
+- deep 10/12-bit preset streams cross-decode bit-exactly; emit_deep_stream example
+- 13-16-bit deep-colour intra, q0 bit-exact end-to-end
+- output_pixel_format query + exact-header receive_arena_frame
+- deep-colour output — Yuv*P16Le for >12-bit, native Yuv422/444P12Le
+- mark internal decode-pipeline modules #[doc(hidden)] so semver-checks tracks only the stable API
+- pin the two zero-residue wire forms as decode-identical
+- *(bipred)* pin bit-exact cross-decode on the 2-ref chains
+- bit-exact cross-decode — literal block params + explicit zero-residue
+- DIRAC_TRACE decode instrumentation per the docs MV trace contract
+- *(docs_corpus)* pin the edge-mc-probes-320x240 fixture bit-exact
+- reference-exact out-of-frame sub-pel edge extension (§15.8.10)
+- hand-computed spec test for eighth-pel (mv_precision=3) sub-pel
+- README + CHANGELOG: round-404 per-component intra-DC fix + quarter-pel status
+- hand-computed spec tests for the quarter-pel sub-pel MC path
+- *(docs_corpus)* bounded regression gate for the quarter-pel inter fixture
+- intra-block DC is per-component (C2/V no longer predicts from C1/U)
+- add CI / crates.io / docs.rs / MIT-license badges
+
 ### Added
 
 - `encoder_inter::InterSample` — sealed source-sample abstraction
