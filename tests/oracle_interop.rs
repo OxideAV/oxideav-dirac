@@ -8,9 +8,9 @@
 //!   picture (HQ-profile VC-2 intra pictures produce a `VideoFrame`).
 //!
 //! Clean-room posture: the oracle is invoked strictly as an opaque
-//! black-box validator binary (encode fixtures in, decoded YUV out);
-//! its source is never consulted. `ORACLE_BIN` below is the
-//! executable's on-disk name — invocation data, not a reference.
+//! black-box validator binary (encode fixtures in, decoded YUV out).
+//! `ORACLE_BIN` below is the executable's on-disk name — invocation
+//! data, not a reference.
 
 /// The black-box validator executable name (data, not a reference).
 const ORACLE_BIN: &str = "ffmpeg";
