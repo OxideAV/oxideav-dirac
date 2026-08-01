@@ -1,5 +1,5 @@
 //! Emit a single-frame VC-2 HQ intra-only Dirac elementary stream to
-//! stdout or a file. Useful for feeding `ffmpeg -c:v dirac` and
+//! stdout or a file. Useful for feeding an external oracle decoder and
 //! checking third-party interop.
 
 use std::io::Write;
