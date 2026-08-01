@@ -3882,6 +3882,190 @@ pub fn pick_inter_residue_qindex<S: InterSample>(
     127
 }
 
+/// The committed per-block decision grid for a 2-ref bipred picture:
+/// [`bipred_select_modes`] plus the optional round-95 post-OBMC
+/// re-evaluation pass. Factored out so the emitter
+/// ([`encode_bipred_inter_picture`]) and the rate-control pyramids
+/// builder run the *same* pipeline and can never diverge.
+fn bipred_decisions<S: InterSample>(
+    sequence: &SequenceHeader,
+    params: &InterEncoderParams,
+    cur_y: &[S],
+    ref1_y: &[S],
+    ref2_y: &[S],
+) -> Vec<BipredBlock> {
+    let (_sbx, _sby, blocks_x, blocks_y) = motion_grid(sequence.luma_width, sequence.luma_height);
+    let bmp = params.bipred_mv_precision;
+    let mut decisions = bipred_select_modes(
+        cur_y,
+        ref1_y,
+        ref2_y,
+        sequence.luma_width,
+        sequence.luma_height,
+        blocks_x,
+        blocks_y,
+        params.mv_search_range,
+        bmp,
+    );
+    if params.bipred_post_obmc_refine {
+        bipred_post_obmc_refine_modes(
+            cur_y,
+            ref1_y,
+            ref2_y,
+            sequence.luma_width,
+            sequence.luma_height,
+            blocks_x,
+            blocks_y,
+            &mut decisions,
+            bmp,
+        );
+    }
+    decisions
+}
+
+/// Build the three unquantised residue pyramids for a 2-ref bipred
+/// picture — the bipred analogue of [`build_inter_residue_pyramids`].
+/// Runs the same decision pipeline [`encode_bipred_inter_picture`]
+/// commits ([`bipred_decisions`]), reconstructs the §15.8.5 two-ref
+/// OBMC blend, subtracts it from the source and forward-transforms
+/// each plane, so the pyramids match the eventual emission
+/// symbol-for-symbol at any qindex.
+#[allow(clippy::too_many_arguments)]
+fn build_bipred_residue_pyramids<S: InterSample>(
+    sequence: &SequenceHeader,
+    iep: &InterEncoderParams,
+    rp: &ResidueParams,
+    decisions: &[BipredBlock],
+    cur_y: &[S],
+    cur_u: &[S],
+    cur_v: &[S],
+    ref1_y: &[S],
+    ref1_u: &[S],
+    ref1_v: &[S],
+    ref2_y: &[S],
+    ref2_u: &[S],
+    ref2_v: &[S],
+) -> InterResiduePyramids {
+    let (sbx, sby, blocks_x, blocks_y) = motion_grid(sequence.luma_width, sequence.luma_height);
+    let bmp = iep.bipred_mv_precision;
+    let pred = picture_prediction_params_from(sequence, iep, bmp, 2);
+    let gmode_grid = iep
+        .global_motion
+        .as_ref()
+        .map(|cfg| resolve_gmode_grid(cfg, blocks_x, blocks_y));
+    let (global1, global2) = match &iep.global_motion {
+        None => (None, None),
+        Some(cfg) => (
+            Some(effective_global_params(&cfg.global1)),
+            Some(effective_global_params(
+                &cfg.global2.clone().unwrap_or_default(),
+            )),
+        ),
+    };
+    let motion = build_motion_from_bipred_grid(
+        sbx,
+        sby,
+        blocks_x,
+        blocks_y,
+        decisions,
+        gmode_grid.as_deref(),
+        global1,
+        global2,
+    );
+    let (pred_y, pred_u, pred_v) = build_obmc_prediction_bipred(
+        sequence, &pred, &motion, ref1_y, ref1_u, ref1_v, ref2_y, ref2_u, ref2_v,
+    );
+    let res_y = build_residue_plane(cur_y, &pred_y, sequence.luma_depth);
+    let res_u = build_residue_plane(cur_u, &pred_u, sequence.chroma_depth);
+    let res_v = build_residue_plane(cur_v, &pred_v, sequence.chroma_depth);
+    InterResiduePyramids {
+        y: forward_residue_pyramid(&res_y, sequence.luma_width, sequence.luma_height, rp),
+        u: forward_residue_pyramid(&res_u, sequence.chroma_width, sequence.chroma_height, rp),
+        v: forward_residue_pyramid(&res_v, sequence.chroma_width, sequence.chroma_height, rp),
+    }
+}
+
+/// 2-ref bipred residue rate-control qindex picker — the bipred
+/// analogue of [`pick_inter_residue_qindex`]. Runs the same decision
+/// pipeline [`encode_bipred_inter_picture`] commits, reconstructs the
+/// two-ref OBMC blend and forward-transforms the residue once, then
+/// walks `rp.qindex.min(127)..=127` for the **smallest** qindex whose
+/// serialised §11.3 residue payload fits `target_residue_bytes`
+/// (returning 127 when even the most aggressive quantiser overflows —
+/// still spec-conformant under §13.4.4). Same monotonicity and
+/// budget-scope contract as the 1-ref picker: the budget covers the
+/// residue stream only, never the motion data.
+#[allow(clippy::too_many_arguments)]
+pub fn pick_bipred_residue_qindex<S: InterSample>(
+    sequence: &SequenceHeader,
+    params: &InterEncoderParams,
+    cur_y: &[S],
+    cur_u: &[S],
+    cur_v: &[S],
+    ref1_y: &[S],
+    ref1_u: &[S],
+    ref1_v: &[S],
+    ref2_y: &[S],
+    ref2_u: &[S],
+    ref2_v: &[S],
+    target_residue_bytes: u32,
+) -> u32 {
+    bipred_residue_qindex_diagnostic(
+        sequence,
+        params,
+        cur_y,
+        cur_u,
+        cur_v,
+        ref1_y,
+        ref1_u,
+        ref1_v,
+        ref2_y,
+        ref2_u,
+        ref2_v,
+        target_residue_bytes,
+    )
+    .0
+}
+
+/// Diagnostic counterpart to [`pick_bipred_residue_qindex`]: returns
+/// `(qindex, actual_residue_bytes)` — the bipred analogue of
+/// [`inter_residue_qindex_diagnostic`]. `(0, 0)` when residue is
+/// disabled (no residue stream exists to size).
+#[allow(clippy::too_many_arguments)]
+pub fn bipred_residue_qindex_diagnostic<S: InterSample>(
+    sequence: &SequenceHeader,
+    params: &InterEncoderParams,
+    cur_y: &[S],
+    cur_u: &[S],
+    cur_v: &[S],
+    ref1_y: &[S],
+    ref1_u: &[S],
+    ref1_v: &[S],
+    ref2_y: &[S],
+    ref2_u: &[S],
+    ref2_v: &[S],
+    target_residue_bytes: u32,
+) -> (u32, usize) {
+    let rp = match params.residue {
+        Some(ref rp) => rp.clone(),
+        None => return (0, 0),
+    };
+    let decisions = bipred_decisions(sequence, params, cur_y, ref1_y, ref2_y);
+    let pyr = build_bipred_residue_pyramids(
+        sequence, params, &rp, &decisions, cur_y, cur_u, cur_v, ref1_y, ref1_u, ref1_v, ref2_y,
+        ref2_u, ref2_v,
+    );
+    let floor = rp.qindex.min(127);
+    let mut bytes = 0usize;
+    for qindex in floor..=127 {
+        bytes = inter_residue_bytes_at_qindex(&rp, &pyr, qindex);
+        if bytes <= target_residue_bytes as usize {
+            return (qindex, bytes);
+        }
+    }
+    (127, bytes)
+}
+
 /// Diagnostic counterpart to [`pick_inter_residue_qindex`]: returns
 /// `(qindex, actual_residue_bytes)` so callers can inspect the chosen
 /// quantiser's actual residue-byte cost relative to the supplied budget.
@@ -5251,19 +5435,7 @@ pub fn encode_bipred_inter_picture<S: InterSample>(
     w.byte_align();
 
     // §12.3 block_motion_data — 2-ref bipred path.
-    let (sbx, sby, blocks_x, blocks_y) = motion_grid(sequence.luma_width, sequence.luma_height);
-    let mut decisions = bipred_select_modes(
-        cur_y,
-        ref1_y,
-        ref2_y,
-        sequence.luma_width,
-        sequence.luma_height,
-        blocks_x,
-        blocks_y,
-        params.mv_search_range,
-        bmp,
-    );
-
+    //
     // Note: per-reference 1-ref-style `obmc_refine_me` is NOT applied to
     // the bipred path. `obmc_refine_me` optimises each reference's MV
     // independently against the source, but in a bipred B-picture the
@@ -5272,25 +5444,14 @@ pub fn encode_bipred_inter_picture<S: InterSample>(
     // versa) would shift MVs toward minimising the single-ref residue
     // rather than the blended reconstruction error — breaking the
     // self-roundtrip invariant. Round-95: instead of per-ref refinement,
-    // we run a single post-OBMC RE-EVALUATION pass that scores each
-    // block's `bipred_select_modes` decision against the full §15.8.5
-    // OBMC blend (with the neighbour grid frozen). The candidate set is
-    // a strict superset of the current decision, so per-block OBMC SSE
-    // cannot regress — same monotonicity invariant the 1-ref round-80
+    // `bipred_decisions` runs a single post-OBMC RE-EVALUATION pass that
+    // scores each block's `bipred_select_modes` decision against the full
+    // §15.8.5 OBMC blend (with the neighbour grid frozen). The candidate
+    // set is a strict superset of the current decision, so per-block OBMC
+    // SSE cannot regress — same monotonicity invariant the 1-ref round-80
     // `inter_select_int_pel_per_block` second pass carries.
-    if params.bipred_post_obmc_refine {
-        bipred_post_obmc_refine_modes(
-            cur_y,
-            ref1_y,
-            ref2_y,
-            sequence.luma_width,
-            sequence.luma_height,
-            blocks_x,
-            blocks_y,
-            &mut decisions,
-            bmp,
-        );
-    }
+    let (sbx, sby, blocks_x, blocks_y) = motion_grid(sequence.luma_width, sequence.luma_height);
+    let decisions = bipred_decisions(sequence, params, cur_y, ref1_y, ref2_y);
 
     // §12.3.3.2 per-block global-mode grid + §11.2.6 params for both
     // references (None when the picture uses block motion only).

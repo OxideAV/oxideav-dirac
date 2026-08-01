@@ -50,6 +50,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   accumulator laws on the new driver). The rate-request/fold math and
   the per-picture auto-global resolution are factored into helpers
   shared with the anchored driver (behaviour unchanged there).
+- Bipred residue rate control: `pick_bipred_residue_qindex` +
+  `bipred_residue_qindex_diagnostic`, the 2-ref analogues of the 1-ref
+  inter-residue picker. The decision pipeline (`bipred_select_modes` +
+  the round-95 post-OBMC re-evaluation) is factored into a helper the
+  emitter and the picker share, so the rate-control pyramids match the
+  eventual `encode_bipred_inter_picture` emission symbol-for-symbol;
+  the picker walks the same floor..=127 smallest-fitting-qindex
+  contract (`tests/encoder_bipred_residue_rate.rs`: floor keeping,
+  budget monotonicity, fit, floor respect, disabled-residue
+  degeneracy).
 
 - `encoder_inter::InterSample` — sealed source-sample abstraction
   (`u8` / `u16`) over the whole inter pipeline: motion estimation
