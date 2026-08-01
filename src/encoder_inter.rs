@@ -73,6 +73,13 @@ pub trait InterSample: Copy + sealed::Sealed + 'static {
     /// Widen one source sample to the `i32` arithmetic domain.
     fn to_i32(self) -> i32;
 
+    /// Narrow a decoded output-domain value (`[0, 2^depth - 1]` after
+    /// the §15.5 output offset) back to a source sample, clamping to
+    /// the depth range. Used by the closed-loop sequence drivers to
+    /// turn a [`crate::picture::DecodedPicture`] plane back into the
+    /// sample domain the ME / residue entry points consume.
+    fn from_i32_clamped(v: i32, depth: u32) -> Self;
+
     /// Clip depth handed to the §15.8.11 half-pel upsampler when the
     /// ME search scores against **unsigned** source samples
     /// ([`build_upref`]): one bit above the sample width, so the spec's
@@ -129,6 +136,11 @@ impl InterSample for u8 {
     fn to_i32(self) -> i32 {
         self as i32
     }
+    #[inline]
+    fn from_i32_clamped(v: i32, depth: u32) -> Self {
+        let max = ((1u32 << depth.min(8)) - 1) as i32;
+        v.clamp(0, max) as u8
+    }
     const ME_UPREF_DEPTH: u32 = 9;
     const NOMINAL_HALF: i32 = 128;
     fn encode_hq_intra_anchor(
@@ -164,6 +176,11 @@ impl InterSample for u16 {
     #[inline]
     fn to_i32(self) -> i32 {
         self as i32
+    }
+    #[inline]
+    fn from_i32_clamped(v: i32, depth: u32) -> Self {
+        let max = ((1u32 << depth.min(16)) - 1) as i32;
+        v.clamp(0, max) as u16
     }
     const ME_UPREF_DEPTH: u32 = 17;
     const NOMINAL_HALF: i32 = 32768;
@@ -3925,6 +3942,71 @@ pub fn encode_inter_picture<S: InterSample>(
     ref_u: &[S],
     ref_v: &[S],
 ) -> Vec<u8> {
+    encode_inter_picture_impl(
+        sequence,
+        params,
+        picture_number,
+        ref1_picture_number,
+        cur_y,
+        cur_u,
+        cur_v,
+        ref_y,
+        ref_u,
+        ref_v,
+        false,
+    )
+}
+
+/// Encode one core-syntax 1-ref **reference** inter picture, parse code
+/// `0x0D` (reference, AC-coded, 1 ref). Identical payload layout to
+/// [`encode_inter_picture`] plus the §12.2 reference-picture RETD field
+/// (emitted as `0`: no retired picture — the decoder's reference buffer
+/// evicts by its own capacity). A decoded `0x0D` picture enters the
+/// reference buffer per §15.4, so subsequent inter pictures may
+/// reference it — the building block for P-chains, and the forward
+/// anchor a bipred B needs beyond the intra picture.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_inter_reference_picture<S: InterSample>(
+    sequence: &SequenceHeader,
+    params: &InterEncoderParams,
+    picture_number: u32,
+    ref1_picture_number: u32,
+    cur_y: &[S],
+    cur_u: &[S],
+    cur_v: &[S],
+    ref_y: &[S],
+    ref_u: &[S],
+    ref_v: &[S],
+) -> Vec<u8> {
+    encode_inter_picture_impl(
+        sequence,
+        params,
+        picture_number,
+        ref1_picture_number,
+        cur_y,
+        cur_u,
+        cur_v,
+        ref_y,
+        ref_u,
+        ref_v,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_inter_picture_impl<S: InterSample>(
+    sequence: &SequenceHeader,
+    params: &InterEncoderParams,
+    picture_number: u32,
+    ref1_picture_number: u32,
+    cur_y: &[S],
+    cur_u: &[S],
+    cur_v: &[S],
+    ref_y: &[S],
+    ref_u: &[S],
+    ref_v: &[S],
+    is_reference: bool,
+) -> Vec<u8> {
     assert_eq!(params.block_params_index, 1, "r1 only supports preset 1");
 
     let mut w = BitWriter::new();
@@ -3936,7 +4018,13 @@ pub fn encode_inter_picture<S: InterSample>(
     // §9.6.1 reference deltas — one signed for ref1.
     let d1: i32 = ref1_picture_number.wrapping_sub(picture_number) as i32;
     w.write_sint(d1);
-    // No retd — parse code 0x09 is non-reference.
+    if is_reference {
+        // §12.2 RETD for reference parse codes: a single signed value;
+        // `0` retires nothing (the decoder's reference buffer evicts
+        // oldest-first at its own capacity).
+        w.write_sint(0);
+    }
+    // (Non-reference parse code 0x09 carries no RETD.)
 
     w.byte_align();
 
@@ -5601,69 +5689,15 @@ pub fn encode_inter_sequence_with_residue_target_report<S: InterSample>(
 
     for pic in inters {
         // Per-picture residue budget from the strategy.
-        let requested: u32 = match mode {
-            InterRateControl::PerPicture => target_residue_bytes,
-            InterRateControl::Cbr => {
-                // Spend `target` minus whatever we've overshot so far
-                // (carry > 0 ⇒ pull back; carry < 0 ⇒ spend extra).
-                let want = target_residue_bytes as i64 - carry;
-                want.clamp(0, u32::MAX as i64) as u32
-            }
-            InterRateControl::Vbv { buffer_bytes } => {
-                // Leaky-bucket: identical to `Cbr` but the spendable
-                // savings (`max(-carry, 0)`) are capped at `buffer_bytes`.
-                // The post-encode clamp keeps `carry >= -buffer_bytes`, so
-                // the request `target - carry` is bounded above by
-                // `target + buffer_bytes`. The explicit `min` here is
-                // belt-and-braces against bucket-cap edge cases; the
-                // post-encode clamp is the load-bearing invariant.
-                let spendable = (-carry).min(buffer_bytes as i64).max(0);
-                let want = target_residue_bytes as i64 - carry.max(0) + spendable;
-                want.clamp(0, u32::MAX as i64) as u32
-            }
-            InterRateControl::VbvHysteresis {
-                buffer_bytes,
-                max_drain_per_picture,
-            } => {
-                // Drain-rate hysteresis: identical bucket fill / forfeit
-                // semantics as `Vbv`, but the spendable savings are
-                // additionally clamped at `max_drain_per_picture`. The
-                // debt-payback branch (`carry > 0`) is unchanged because
-                // debt repayment is mandatory, not rate-limited — only the
-                // spend side of the bucket is hysteretic.
-                let spendable = (-carry)
-                    .min(buffer_bytes as i64)
-                    .min(max_drain_per_picture as i64)
-                    .max(0);
-                let want = target_residue_bytes as i64 - carry.max(0) + spendable;
-                want.clamp(0, u32::MAX as i64) as u32
-            }
-        };
+        let requested = residue_rate_request(mode, target_residue_bytes, carry);
 
         // Round-386: per-picture automatic global-motion estimation.
         // Resolved BEFORE the residue qindex picker so rate control
         // measures exactly the stream it will emit (a global picture's
         // prediction — and therefore its residue — differs from the
         // block-motion one). An explicit caller config always wins.
-        let mut pic_params = inter_params.clone();
-        let mut global_fraction: Option<f64> = None;
-        let mut global_applied = false;
-        if pic_params.global_motion.is_none() {
-            if let Some(auto) = &inter_params.auto_global_motion {
-                let (cfg, fraction) = estimate_global_motion_config(
-                    sequence,
-                    inter_params,
-                    pic.y,
-                    reference.y,
-                    auto.model,
-                );
-                global_fraction = Some(fraction);
-                if fraction >= auto.min_fraction {
-                    pic_params.global_motion = Some(cfg);
-                    global_applied = true;
-                }
-            }
-        }
+        let (mut pic_params, global_fraction, global_applied) =
+            resolve_per_picture_params(sequence, inter_params, pic.y, reference.y);
 
         // Pick the residue qindex for this picture against the budget,
         // and measure what it actually costs. With residue disabled the
@@ -5707,28 +5741,347 @@ pub fn encode_inter_sequence_with_residue_target_report<S: InterSample>(
         // Fold the actual-vs-target residue deviation into the
         // accumulator (computed identically for every mode; only the
         // feedback modes *use* it when sizing the next request).
-        carry += actual_residue as i64 - target_residue_bytes as i64;
-
-        // VBV: clamp the savings end of the bucket at -buffer_bytes so
-        // the next picture's `target - carry` request stays ≤ target +
-        // buffer_bytes. Overshoot debt (carry > 0) is left untouched — a
-        // peak-size cap governs only the upper edge of the request — and
-        // PerPicture / Cbr leave `carry` alone (PerPicture ignores it
-        // anyway; Cbr is the unbounded-bucket limit).
-        match mode {
-            InterRateControl::Vbv { buffer_bytes }
-            | InterRateControl::VbvHysteresis { buffer_bytes, .. } => {
-                let floor = -(buffer_bytes as i64);
-                if carry < floor {
-                    carry = floor;
-                }
-            }
-            InterRateControl::PerPicture | InterRateControl::Cbr => {}
-        }
+        residue_rate_fold(mode, target_residue_bytes, &mut carry, actual_residue);
 
         report.push(InterPictureRate {
             picture_number: pic.picture_number,
             ref1_picture_number: reference.picture_number,
+            requested_residue_bytes: requested,
+            actual_residue_bytes: actual_residue as u32,
+            qindex,
+            running_surplus_bytes: carry,
+            global_fraction,
+            global_applied,
+        });
+    }
+
+    write_parse_info(&mut out, 0x10, 0, prev_unit_len);
+    (out, report)
+}
+
+/// Per-picture residue-budget request for one [`InterRateControl`]
+/// strategy given the running carry (`Σ(actual − target)` so far).
+/// Shared by every rate-controlled inter sequence driver so the four
+/// variants behave identically whichever GOP shape carries them.
+fn residue_rate_request(mode: InterRateControl, target_residue_bytes: u32, carry: i64) -> u32 {
+    match mode {
+        InterRateControl::PerPicture => target_residue_bytes,
+        InterRateControl::Cbr => {
+            // Spend `target` minus whatever we've overshot so far
+            // (carry > 0 ⇒ pull back; carry < 0 ⇒ spend extra).
+            let want = target_residue_bytes as i64 - carry;
+            want.clamp(0, u32::MAX as i64) as u32
+        }
+        InterRateControl::Vbv { buffer_bytes } => {
+            // Leaky-bucket: identical to `Cbr` but the spendable
+            // savings (`max(-carry, 0)`) are capped at `buffer_bytes`.
+            // The post-encode clamp keeps `carry >= -buffer_bytes`, so
+            // the request `target - carry` is bounded above by
+            // `target + buffer_bytes`. The explicit `min` here is
+            // belt-and-braces against bucket-cap edge cases; the
+            // post-encode clamp is the load-bearing invariant.
+            let spendable = (-carry).min(buffer_bytes as i64).max(0);
+            let want = target_residue_bytes as i64 - carry.max(0) + spendable;
+            want.clamp(0, u32::MAX as i64) as u32
+        }
+        InterRateControl::VbvHysteresis {
+            buffer_bytes,
+            max_drain_per_picture,
+        } => {
+            // Drain-rate hysteresis: identical bucket fill / forfeit
+            // semantics as `Vbv`, but the spendable savings are
+            // additionally clamped at `max_drain_per_picture`. The
+            // debt-payback branch (`carry > 0`) is unchanged because
+            // debt repayment is mandatory, not rate-limited — only the
+            // spend side of the bucket is hysteretic.
+            let spendable = (-carry)
+                .min(buffer_bytes as i64)
+                .min(max_drain_per_picture as i64)
+                .max(0);
+            let want = target_residue_bytes as i64 - carry.max(0) + spendable;
+            want.clamp(0, u32::MAX as i64) as u32
+        }
+    }
+}
+
+/// Fold one encoded picture's actual residue bytes into the running
+/// carry, applying the VBV savings clamp where the strategy has one.
+/// The dual of [`residue_rate_request`]; shared by every
+/// rate-controlled inter sequence driver.
+fn residue_rate_fold(
+    mode: InterRateControl,
+    target_residue_bytes: u32,
+    carry: &mut i64,
+    actual_residue_bytes: usize,
+) {
+    *carry += actual_residue_bytes as i64 - target_residue_bytes as i64;
+
+    // VBV: clamp the savings end of the bucket at -buffer_bytes so
+    // the next picture's `target - carry` request stays ≤ target +
+    // buffer_bytes. Overshoot debt (carry > 0) is left untouched — a
+    // peak-size cap governs only the upper edge of the request — and
+    // PerPicture / Cbr leave `carry` alone (PerPicture ignores it
+    // anyway; Cbr is the unbounded-bucket limit).
+    match mode {
+        InterRateControl::Vbv { buffer_bytes }
+        | InterRateControl::VbvHysteresis { buffer_bytes, .. } => {
+            let floor = -(buffer_bytes as i64);
+            if *carry < floor {
+                *carry = floor;
+            }
+        }
+        InterRateControl::PerPicture | InterRateControl::Cbr => {}
+    }
+}
+
+/// Resolve the effective per-picture encoder parameters: run the
+/// [`InterEncoderParams::auto_global_motion`] estimate against this
+/// picture's reference when configured (an explicit `global_motion`
+/// always wins) and report `(params, global_fraction, global_applied)`.
+fn resolve_per_picture_params<S: InterSample>(
+    sequence: &SequenceHeader,
+    inter_params: &InterEncoderParams,
+    cur_y: &[S],
+    ref_y: &[S],
+) -> (InterEncoderParams, Option<f64>, bool) {
+    let mut pic_params = inter_params.clone();
+    let mut global_fraction: Option<f64> = None;
+    let mut global_applied = false;
+    if pic_params.global_motion.is_none() {
+        if let Some(auto) = &inter_params.auto_global_motion {
+            let (cfg, fraction) =
+                estimate_global_motion_config(sequence, inter_params, cur_y, ref_y, auto.model);
+            global_fraction = Some(fraction);
+            if fraction >= auto.min_fraction {
+                pic_params.global_motion = Some(cfg);
+                global_applied = true;
+            }
+        }
+    }
+    (pic_params, global_fraction, global_applied)
+}
+
+/// Closed-loop reconstruction state for the chained sequence drivers:
+/// the decoder-mirroring reference buffer plus the last reference's
+/// planes in the source-sample domain (what the ME / residue entry
+/// points consume).
+struct ChainReference<S: InterSample> {
+    picture_number: u32,
+    y: Vec<S>,
+    u: Vec<S>,
+    v: Vec<S>,
+}
+
+/// Decode a just-emitted picture payload exactly as the decoder will
+/// (against the current reference buffer), push it into the buffer with
+/// the §15.4 pre-output-offset recentring, and return its planes
+/// narrowed back to the source-sample domain. Panics if the crate's own
+/// decoder rejects the crate's own emission — that is an encoder bug,
+/// not a recoverable condition.
+fn reconstruct_chain_reference<S: InterSample>(
+    sequence: &SequenceHeader,
+    refs: &mut Vec<crate::picture::ReferencePicture>,
+    payload: &[u8],
+    parse_code: u8,
+) -> ChainReference<S> {
+    let pi = crate::parse_info::ParseInfo {
+        parse_code,
+        next_parse_offset: 0,
+        previous_parse_offset: 0,
+    };
+    let pic = crate::picture::decode_picture_with_refs(payload, pi, sequence, refs)
+        .expect("closed-loop reconstruction: own emission must decode");
+
+    // §15.4: the reference buffer holds the signed, pre-output-offset
+    // form (mirrors the decoder front-end's push_reference).
+    let luma_half = if sequence.luma_depth == 0 {
+        0
+    } else {
+        1i32 << (sequence.luma_depth - 1)
+    };
+    let chroma_half = if sequence.chroma_depth == 0 {
+        0
+    } else {
+        1i32 << (sequence.chroma_depth - 1)
+    };
+    refs.push(crate::picture::ReferencePicture {
+        picture_number: pic.picture_number,
+        luma_width: pic.luma_width,
+        luma_height: pic.luma_height,
+        chroma_width: pic.chroma_width,
+        chroma_height: pic.chroma_height,
+        y: pic.y.iter().map(|v| v - luma_half).collect(),
+        u: pic.u.iter().map(|v| v - chroma_half).collect(),
+        v: pic.v.iter().map(|v| v - chroma_half).collect(),
+    });
+    // Decoder front-end keeps at most 4 references, oldest evicted
+    // first — mirror it so long chains agree with the decoder.
+    while refs.len() > 4 {
+        refs.remove(0);
+    }
+
+    ChainReference {
+        picture_number: pic.picture_number,
+        y: pic
+            .y
+            .iter()
+            .map(|&v| S::from_i32_clamped(v, sequence.luma_depth))
+            .collect(),
+        u: pic
+            .u
+            .iter()
+            .map(|&v| S::from_i32_clamped(v, sequence.chroma_depth))
+            .collect(),
+        v: pic
+            .v
+            .iter()
+            .map(|&v| S::from_i32_clamped(v, sequence.chroma_depth))
+            .collect(),
+    }
+}
+
+/// Encode a **P-chain** core-syntax inter sequence: one HQ intra anchor
+/// (`0xEC`) followed by N 1-ref **reference** inter pictures (`0x0D`),
+/// each referencing the *previous picture in the chain* — the classic
+/// long-GOP shape [`encode_inter_sequence_with_residue_target`] cannot
+/// express (its `0x09` pictures are non-reference, so every picture
+/// must anchor to the intra).
+///
+/// The encoder runs **closed-loop**: after emitting each reference
+/// picture it decodes its own bytes through
+/// [`crate::picture::decode_picture_with_refs`] (against the same
+/// reference buffer the decoder maintains) and uses the *reconstructed*
+/// picture — not the source — as the next picture's ME / residue
+/// reference. At residue qindex 0 with a reversible wavelet the
+/// reconstruction equals the source and the whole chain round-trips
+/// bit-exactly; at lossy qindexes the loop pins encoder and decoder to
+/// the same reference planes, so quantisation error stays per-picture
+/// instead of accumulating as drift.
+///
+/// Rate control (`target_residue_bytes` + [`InterRateControl`]) is the
+/// same four-variant residue-byte accumulator as
+/// [`encode_inter_sequence_with_residue_target`], per-picture auto
+/// global motion included. Returns the elementary stream; the `_report`
+/// companion adds per-picture telemetry (with `ref1_picture_number`
+/// tracking the chain rather than a fixed anchor).
+pub fn encode_inter_p_chain_with_residue_target<S: InterSample>(
+    sequence: &SequenceHeader,
+    intra_params: &crate::encoder::EncoderParams,
+    inter_params: &InterEncoderParams,
+    frames: &[InterInputPicture<'_, S>],
+    target_residue_bytes: u32,
+    mode: InterRateControl,
+) -> Vec<u8> {
+    let (stream, _report) = encode_inter_p_chain_with_residue_target_report(
+        sequence,
+        intra_params,
+        inter_params,
+        frames,
+        target_residue_bytes,
+        mode,
+    );
+    stream
+}
+
+/// [`encode_inter_p_chain_with_residue_target`] plus per-picture
+/// telemetry; one report entry per inter picture.
+pub fn encode_inter_p_chain_with_residue_target_report<S: InterSample>(
+    sequence: &SequenceHeader,
+    intra_params: &crate::encoder::EncoderParams,
+    inter_params: &InterEncoderParams,
+    frames: &[InterInputPicture<'_, S>],
+    target_residue_bytes: u32,
+    mode: InterRateControl,
+) -> (Vec<u8>, Vec<InterPictureRate>) {
+    let pi_size = 13usize;
+    let sh_payload = crate::encoder::encode_sequence_header(sequence);
+    let sh_unit_len = (pi_size + sh_payload.len()) as u32;
+
+    let mut out = Vec::new();
+    write_parse_info(&mut out, 0x00, sh_unit_len, 0);
+    out.extend_from_slice(&sh_payload);
+    let mut prev_unit_len = sh_unit_len;
+
+    let mut report: Vec<InterPictureRate> = Vec::new();
+
+    let Some((anchor, inters)) = frames.split_first() else {
+        write_parse_info(&mut out, 0x10, 0, prev_unit_len);
+        return (out, report);
+    };
+
+    // HQ intra **reference** anchor (0xEC), then reconstruct it
+    // closed-loop so the first P references the decoded anchor.
+    let anchor_payload = S::encode_hq_intra_anchor(
+        sequence,
+        intra_params,
+        anchor.picture_number,
+        anchor.y,
+        anchor.u,
+        anchor.v,
+    );
+    let anchor_unit_len = (pi_size + anchor_payload.len()) as u32;
+    write_parse_info(&mut out, 0xEC, anchor_unit_len, prev_unit_len);
+    out.extend_from_slice(&anchor_payload);
+    prev_unit_len = anchor_unit_len;
+
+    let mut refs: Vec<crate::picture::ReferencePicture> = Vec::new();
+    let mut chain_ref: ChainReference<S> =
+        reconstruct_chain_reference(sequence, &mut refs, &anchor_payload, 0xEC);
+
+    let mut carry: i64 = 0;
+
+    for pic in inters {
+        let requested = residue_rate_request(mode, target_residue_bytes, carry);
+
+        let (mut pic_params, global_fraction, global_applied) =
+            resolve_per_picture_params(sequence, inter_params, pic.y, &chain_ref.y);
+
+        let (qindex, actual_residue) = inter_residue_qindex_diagnostic(
+            sequence,
+            &pic_params,
+            pic.y,
+            pic.u,
+            pic.v,
+            &chain_ref.y,
+            &chain_ref.u,
+            &chain_ref.v,
+            requested,
+        );
+
+        if let Some(ref rp) = inter_params.residue {
+            let mut rp = rp.clone();
+            rp.qindex = qindex;
+            pic_params.residue = Some(rp);
+        }
+        let inter_payload = encode_inter_reference_picture(
+            sequence,
+            &pic_params,
+            pic.picture_number,
+            chain_ref.picture_number,
+            pic.y,
+            pic.u,
+            pic.v,
+            &chain_ref.y,
+            &chain_ref.u,
+            &chain_ref.v,
+        );
+        let inter_unit_len = (pi_size + inter_payload.len()) as u32;
+        // Reference inter, 1 ref, AC-coded core syntax: 0x0D.
+        write_parse_info(&mut out, 0x0D, inter_unit_len, prev_unit_len);
+        out.extend_from_slice(&inter_payload);
+        prev_unit_len = inter_unit_len;
+
+        let ref1_picture_number = chain_ref.picture_number;
+
+        // Closed loop: the next picture references THIS picture's
+        // decoded form, exactly as the decoder will reconstruct it.
+        chain_ref = reconstruct_chain_reference(sequence, &mut refs, &inter_payload, 0x0D);
+
+        residue_rate_fold(mode, target_residue_bytes, &mut carry, actual_residue);
+
+        report.push(InterPictureRate {
+            picture_number: pic.picture_number,
+            ref1_picture_number,
             requested_residue_bytes: requested,
             actual_residue_bytes: actual_residue as u32,
             qindex,

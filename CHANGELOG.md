@@ -26,6 +26,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   falls back to prefix scanning on truncated or unpatched offsets.
   `tests/container_tags.rs` pins the whole contract, including
   registry-level resolution with packet evidence.
+- Reference inter pictures + closed-loop P-chains:
+  `encoder_inter::encode_inter_reference_picture` emits the 1-ref
+  **reference** parse code `0x0D` (identical payload to
+  `encode_inter_picture` plus the §12.2 RETD field, written as `0`), so
+  an encoded P picture enters the decoder's §15.4 reference buffer and
+  subsequent pictures can reference it.
+  `encode_inter_p_chain_with_residue_target` (+ `_report`) chains N
+  such pictures behind an HQ intra anchor, each referencing its
+  immediate predecessor — the classic long-GOP shape the anchored
+  `0x09` driver cannot express — with the same four residue
+  rate-control variants (PerPicture / Cbr / Vbv / VbvHysteresis) and
+  per-picture auto global motion. The driver is **closed-loop**: after
+  emitting each reference picture it decodes its own bytes against the
+  decoder-mirroring reference buffer
+  (`InterSample::from_i32_clamped` narrows the reconstruction back to
+  the source-sample domain) and references the reconstruction, so at
+  residue qindex 0 the whole chain round-trips bit-exactly and at
+  lossy qindexes quantisation error stays per-picture instead of
+  accumulating as drift (`tests/encoder_inter_p_chain.rs` pins the
+  parse-code chain, predecessor referencing, q0 bit-exactness, a
+  drift bound under a quarter-budget squeeze, and the CBR/VBV
+  accumulator laws on the new driver). The rate-request/fold math and
+  the per-picture auto-global resolution are factored into helpers
+  shared with the anchored driver (behaviour unchanged there).
 
 - `encoder_inter::InterSample` — sealed source-sample abstraction
   (`u8` / `u16`) over the whole inter pipeline: motion estimation
