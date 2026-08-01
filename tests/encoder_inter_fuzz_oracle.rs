@@ -1056,3 +1056,118 @@ fn deep_u16_bipred_sweep_never_panics() {
         assert_eq!(stream, stream2, "{label}: encode must be deterministic");
     }
 }
+
+// -------------------------------------------------------------------
+// Round-436: chained-driver arms (closed-loop P-chain + I/P/B GOP).
+// -------------------------------------------------------------------
+
+/// **P-chain / GOP driver fuzz.** Seeded walk over frame count ×
+/// `b_between_refs` × rate-control variant × pathological targets on
+/// 8-bit noise inputs. Contract: the driver terminates, its stream
+/// decodes to exactly one frame per input picture through the
+/// registry-backed decoder, and (implicitly) the closed-loop
+/// self-decode inside the driver never rejects the driver's own
+/// emission. Runtime-bounded: small frame counts only.
+#[test]
+fn chained_driver_shape_sweep_never_panics() {
+    use oxideav_dirac::encoder_inter::{
+        encode_inter_gop_with_residue_target, GopStructure, InterRateControl,
+    };
+
+    let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+    let ip = intra_params();
+
+    let mut seed = 0xC0FF_EE01u32;
+    let mut frames: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = Vec::new();
+    for _ in 0..5 {
+        let y = smooth_luma_64(xs32(&mut seed));
+        frames.push((y, vec![128u8; 32 * 32], vec![128u8; 32 * 32]));
+    }
+
+    let modes = [
+        InterRateControl::PerPicture,
+        InterRateControl::Cbr,
+        InterRateControl::Vbv { buffer_bytes: 0 },
+        InterRateControl::VbvHysteresis {
+            buffer_bytes: 4096,
+            max_drain_per_picture: 1,
+        },
+    ];
+    let targets = [0u32, 37, u32::MAX];
+
+    for (case, &(n, bs)) in [(1usize, 0u32), (2, 0), (4, 1), (5, 2), (5, 0)]
+        .iter()
+        .enumerate()
+    {
+        let pics: Vec<InterInputPicture<'_>> = frames[..n]
+            .iter()
+            .enumerate()
+            .map(|(i, f)| InterInputPicture {
+                picture_number: i as u32,
+                y: &f.0,
+                u: &f.1,
+                v: &f.2,
+            })
+            .collect();
+        let mode = modes[case % modes.len()];
+        let target = targets[case % targets.len()];
+        let stream = encode_inter_gop_with_residue_target(
+            &seq,
+            &ip,
+            &InterEncoderParams::default(),
+            &pics,
+            GopStructure { b_between_refs: bs },
+            target,
+            mode,
+        );
+        let label = format!("chained shape n={n} bs={bs} mode={mode:?} target={target}");
+        assert_decodes_to(&stream, n, &label);
+    }
+}
+
+/// **Deep chained-driver fuzz.** 16-bit saturated + noise inputs
+/// through the P-chain driver with a pathological 1-byte residue
+/// budget — bounded termination, clean per-frame decode, deterministic.
+#[test]
+fn deep_chained_driver_pathological_budget_never_panics() {
+    use oxideav_dirac::encoder::make_minimal_sequence_with_signal_range;
+    use oxideav_dirac::encoder_inter::{
+        encode_inter_p_chain_with_residue_target, InterRateControl,
+    };
+
+    let seq =
+        make_minimal_sequence_with_signal_range(64, 64, ChromaFormat::Yuv420, full_range_sr(16));
+    let ip = intra_params();
+    let fa = deep_solid_64(0xFFFF, 16);
+    let fb = deep_noise_64(16, 0xDEAD_4436);
+    let fc = deep_solid_64(0, 16);
+    let planes = [&fa, &fb, &fc];
+    let pics: Vec<InterInputPicture<'_, u16>> = planes
+        .iter()
+        .enumerate()
+        .map(|(i, f)| InterInputPicture {
+            picture_number: i as u32,
+            y: &f.0,
+            u: &f.1,
+            v: &f.2,
+        })
+        .collect();
+    let stream = encode_inter_p_chain_with_residue_target(
+        &seq,
+        &ip,
+        &InterEncoderParams::default(),
+        &pics,
+        1,
+        InterRateControl::Cbr,
+    );
+    assert_decodes_to(&stream, 3, "deep chained pathological budget");
+    let stream2 = encode_inter_p_chain_with_residue_target(
+        &seq,
+        &ip,
+        &InterEncoderParams::default(),
+        &pics,
+        1,
+        InterRateControl::Cbr,
+    );
+    assert_eq!(stream, stream2, "deep chained encode must be deterministic");
+}

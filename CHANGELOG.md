@@ -84,6 +84,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the CBR accumulator law holds across a deep mixed P/B report and a
   tight 16-bit chain budget escalates qindex while remaining
   decodable on the `Yuv420P16Le` output surface.
+- Fuzz-oracle arms for the chained drivers
+  (`encoder_inter_fuzz_oracle.rs`): a seeded shape sweep (frame count
+  × `b_between_refs` × the four rate-control variants × pathological
+  targets incl. `0` and `u32::MAX`) on 8-bit noise, and a 16-bit
+  saturated/noise P-chain at a pathological 1-byte Cbr budget —
+  bounded termination, per-frame decode, determinism, and the
+  closed-loop self-decode never rejecting the driver's own emission.
 
 - `encoder_inter::InterSample` — sealed source-sample abstraction
   (`u8` / `u16`) over the whole inter pipeline: motion estimation
