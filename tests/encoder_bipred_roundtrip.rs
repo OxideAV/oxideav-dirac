@@ -16,9 +16,12 @@
 //!   (averaging gives the B-frame access to information the 1-ref path
 //!   structurally can't reach).
 //!
-//! * **ffmpeg cross-decode** — hard-asserted: ffmpeg's `dirac` decoder
+//! * **the oracle cross-decode** — hard-asserted: the oracle's `dirac` decoder
 //!   accepts our 0x0C + 0x0C + 0x0A 3-picture chain and reconstructs the
 //!   B-frame above a defensive cross-decode floor.
+
+/// The black-box validator executable name (data, not a reference).
+const ORACLE_BIN: &str = "ffmpeg";
 
 use oxideav_core::CodecRegistry;
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
@@ -615,15 +618,15 @@ fn bipred_no_residue_beats_single_ref_no_residue_baseline() {
     );
 }
 
-/// **ffmpeg cross-decode** — hard-asserted. The bipred 0x0C + 0x0C +
-/// 0x0A chain must round-trip through ffmpeg's `dirac` decoder
+/// **the oracle cross-decode** — hard-asserted. The bipred 0x0C + 0x0C +
+/// 0x0A chain must round-trip through the oracle's `dirac` decoder
 /// end-to-end and reconstruct the B picture. Mirrors the equivalent
-/// 1-ref test (`tests/ffmpeg_interop.rs::ffmpeg_decodes_our_inter_stream_translating_square`)
+/// 1-ref test (`tests/oracle_interop.rs::oracle_decodes_our_inter_stream_translating_square`)
 /// but exercises the new 2-ref path.
 #[test]
-fn ffmpeg_cross_decodes_our_bipred_b_frame() {
-    fn ffmpeg_available() -> bool {
-        std::process::Command::new("ffmpeg")
+fn oracle_cross_decodes_our_bipred_b_frame() {
+    fn oracle_available() -> bool {
+        std::process::Command::new(ORACLE_BIN)
             .arg("-version")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -631,8 +634,8 @@ fn ffmpeg_cross_decodes_our_bipred_b_frame() {
             .map(|s| s.success())
             .unwrap_or(false)
     }
-    if !ffmpeg_available() {
-        eprintln!("ffmpeg not available; skipping bipred cross-decode test");
+    if !oracle_available() {
+        eprintln!("the oracle not available; skipping bipred cross-decode test");
         return;
     }
 
@@ -672,7 +675,7 @@ fn ffmpeg_cross_decodes_our_bipred_b_frame() {
     let yuv = tmpdir.join("oxideav_dirac_interop_bipred.yuv");
     std::fs::write(&drc, &stream).expect("write drc");
 
-    let status = std::process::Command::new("ffmpeg")
+    let status = std::process::Command::new(ORACLE_BIN)
         .args([
             "-y",
             "-hide_banner",
@@ -686,34 +689,34 @@ fn ffmpeg_cross_decodes_our_bipred_b_frame() {
         .args(["-f", "rawvideo", "-pix_fmt", "yuv420p"])
         .arg(&yuv)
         .status()
-        .expect("run ffmpeg");
+        .expect("run the oracle");
     assert!(
         status.success(),
-        "ffmpeg rejected our bipred 0x0C + 0x0C + 0x0A stream — see \
+        "the oracle rejected our bipred 0x0C + 0x0C + 0x0A stream — see \
          {drc:?}; the 2-ref encoder's parse-info / block_motion_data / \
-         residue framing isn't what ffmpeg's dirac decoder expects"
+         residue framing isn't what the oracle's dirac decoder expects"
     );
 
-    let out = std::fs::read(&yuv).expect("read ffmpeg yuv");
+    let out = std::fs::read(&yuv).expect("read the oracle yuv");
     let frame_size = 64 * 64 + 2 * 32 * 32;
-    // ffmpeg outputs the 3 frames in display order: A (0), bipred (1),
+    // the oracle outputs the 3 frames in display order: A (0), bipred (1),
     // B (2). The bipred B frame is at offset frame_size.
     assert!(
         out.len() >= 3 * frame_size,
-        "ffmpeg produced {} bytes; expected at least {} (3 frames)",
+        "the oracle produced {} bytes; expected at least {} (3 frames)",
         out.len(),
         3 * frame_size
     );
     let bipred_y = &out[frame_size..frame_size + 64 * 64];
     let py = psnr(bipred_y, &ym);
-    eprintln!("ffmpeg bipred B-frame cross-decode Y PSNR: {py:.2} dB");
+    eprintln!("the oracle bipred B-frame cross-decode Y PSNR: {py:.2} dB");
     // Round-408: with the encoder emitting literal §11.2.2 block
     // parameters and explicit all-zero-band residues (the two external
     // oracle quirks that capped historical cross-decode), the bipred
     // 0x0A chain cross-decodes **bit-exactly** through the oracle.
     assert!(
         py.is_infinite(),
-        "ffmpeg bipred B-frame cross-decode no longer bit-exact \
+        "the oracle bipred B-frame cross-decode no longer bit-exact \
          ({py:.2} dB) — the round-408 encoder/oracle convention \
          alignment regressed on the 2-ref path"
     );
@@ -724,12 +727,12 @@ fn ffmpeg_cross_decodes_our_bipred_b_frame() {
 /// quarter-pel MVs on smooth-motion blocks and integer-pel MVs on
 /// sharp-edge blocks. The camera-pan fixture is entirely smooth-motion
 /// (cosine-shaped vertical bars panned by 1 luma pel), so the bipred
-/// path picks sub-pel MVs almost everywhere and lifts the ffmpeg
+/// path picks sub-pel MVs almost everywhere and lifts the oracle
 /// cross-decode from the integer-pel-only ceiling (~48 dB) to ≥ 50 dB.
 #[test]
-fn ffmpeg_cross_decodes_camera_pan_bipred_with_subpel_gain() {
-    fn ffmpeg_available() -> bool {
-        std::process::Command::new("ffmpeg")
+fn oracle_cross_decodes_camera_pan_bipred_with_subpel_gain() {
+    fn oracle_available() -> bool {
+        std::process::Command::new(ORACLE_BIN)
             .arg("-version")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -737,8 +740,8 @@ fn ffmpeg_cross_decodes_camera_pan_bipred_with_subpel_gain() {
             .map(|s| s.success())
             .unwrap_or(false)
     }
-    if !ffmpeg_available() {
-        eprintln!("ffmpeg not available; skipping camera-pan bipred subpel gain");
+    if !oracle_available() {
+        eprintln!("the oracle not available; skipping camera-pan bipred subpel gain");
         return;
     }
     use oxideav_dirac::encoder_inter::synthetic_camera_pan_64;
@@ -785,7 +788,7 @@ fn ffmpeg_cross_decodes_camera_pan_bipred_with_subpel_gain() {
         let drc = std::env::temp_dir().join(format!("oxideav_dirac_camera_pan_bipred_{tag}.drc"));
         let yuv = std::env::temp_dir().join(format!("oxideav_dirac_camera_pan_bipred_{tag}.yuv"));
         std::fs::write(&drc, &stream).expect("write drc");
-        let s = std::process::Command::new("ffmpeg")
+        let s = std::process::Command::new(ORACLE_BIN)
             .args([
                 "-y",
                 "-hide_banner",
@@ -799,10 +802,10 @@ fn ffmpeg_cross_decodes_camera_pan_bipred_with_subpel_gain() {
             .args(["-f", "rawvideo", "-pix_fmt", "yuv420p"])
             .arg(&yuv)
             .status()
-            .expect("run ffmpeg");
+            .expect("run the oracle");
         assert!(
             s.success(),
-            "ffmpeg rejected camera-pan bipred ({tag}) — see {drc:?}"
+            "the oracle rejected camera-pan bipred ({tag}) — see {drc:?}"
         );
         let out = std::fs::read(&yuv).unwrap();
         let frame_size = 64 * 64 + 2 * 32 * 32;
@@ -812,7 +815,7 @@ fn ffmpeg_cross_decodes_camera_pan_bipred_with_subpel_gain() {
     let psnr_int = measure(0, "int");
     let psnr_qpel = measure(2, "qpel");
     eprintln!(
-        "camera-pan bipred ffmpeg cross-decode: int = {psnr_int:.2} dB, \
+        "camera-pan bipred the oracle cross-decode: int = {psnr_int:.2} dB, \
          qpel(adaptive) = {psnr_qpel:.2} dB"
     );
     // Premise rewritten in round-382: before the §B.2.7.1 terminator fix
@@ -851,7 +854,7 @@ fn ffmpeg_cross_decodes_camera_pan_bipred_with_subpel_gain() {
 /// the round-91 widening (which includes a half-pel candidate, missing
 /// in the round-39 2-candidate set) should match-or-beat the round-39
 /// 2-candidate behaviour. We exercise this via a self-roundtrip (no
-/// ffmpeg dependency) to keep the test deterministic across CI hosts.
+/// the oracle dependency) to keep the test deterministic across CI hosts.
 #[test]
 fn bipred_widened_set_half_pel_favourable_self_roundtrip_no_residue() {
     use oxideav_dirac::encoder_inter::synthetic_camera_pan_64;
@@ -942,7 +945,7 @@ fn bipred_widened_set_half_pel_favourable_self_roundtrip_no_residue() {
 ///
 /// The test uses `residue = None` so we measure the ME-only path's
 /// contribution (residue at qindex=0 closes any remaining gap and
-/// would mask the refinement's signal). Self-roundtrip (no ffmpeg) so
+/// would mask the refinement's signal). Self-roundtrip (no the oracle) so
 /// CI is deterministic.
 #[test]
 fn bipred_post_obmc_refine_does_not_regress_no_residue() {

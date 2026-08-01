@@ -5,7 +5,7 @@
 //!
 //! Until now the only intra path the crate could emit was VC-2 HQ
 //! (`encoder::encode_hq_intra_picture`, parse codes `0xE8` / `0xEC`).
-//! That works for ffmpeg standalone-intra streams but ffmpeg's `dirac`
+//! That works for the oracle standalone-intra streams but the oracle's `dirac`
 //! decoder rejects mixing HQ intra with core-syntax inter (parse code
 //! `0x09`) in the same sequence: both share the parse-info framing but
 //! disagree on every syntax element below it. This module emits a
@@ -902,7 +902,7 @@ fn select_coeff_ctxs(
 }
 
 /// Encode a single-frame stream consisting of [seq_hdr | core-intra
-/// reference (`0x0C`) | EOS]. Useful for self-roundtrip and ffmpeg
+/// reference (`0x0C`) | EOS]. Useful for self-roundtrip and the oracle
 /// cross-decode tests of just the intra path.
 pub fn encode_single_core_intra_stream(
     sequence: &SequenceHeader,
@@ -1018,10 +1018,10 @@ pub fn encode_single_core_intra_stream_vlc_u16(
 
 /// Encode a 2-picture stream: a core-syntax intra reference (`0x0C`)
 /// followed by a single core-syntax inter (`0x09`) referencing it. The
-/// homogeneous parse-code family lets ffmpeg's `dirac` decoder accept
+/// homogeneous parse-code family lets the oracle's `dirac` decoder accept
 /// the stream end-to-end (cf. the soft-skip in
-/// `tests/ffmpeg_interop.rs::ffmpeg_decodes_our_inter_stream_translating_square`
-/// which uses an HQ intra reference and trips ffmpeg's profile guard).
+/// `tests/oracle_interop.rs::oracle_decodes_our_inter_stream_translating_square`
+/// which uses an HQ intra reference and trips the oracle's profile guard).
 pub fn encode_core_intra_then_inter_stream<S: crate::encoder_inter::InterSample>(
     sequence: &SequenceHeader,
     intra_params: &CoreIntraEncoderParams,

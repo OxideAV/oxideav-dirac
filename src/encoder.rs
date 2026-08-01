@@ -1674,7 +1674,7 @@ impl LdEncoderParams {
 /// Number of raw bits used by the slice-header `slice_y_length` field
 /// (§13.5.2).
 ///
-/// The VC-2 / SMPTE ST 2042-1 reference — and ffmpeg's `vc2` decoder —
+/// The VC-2 / SMPTE ST 2042-1 reference — and the oracle's `vc2` decoder —
 /// size this field as `floor(log2(total_bits)) + 1` where
 /// `total_bits = 8 * slice_bytes`, i.e. the minimum number of bits
 /// required to represent any value in `[0, total_bits - 1]`. This
@@ -1682,7 +1682,7 @@ impl LdEncoderParams {
 /// `total_bits` is not an exact power of two, and is one bit larger
 /// otherwise. Using the Dirac formula at power-of-two slice sizes
 /// (e.g. `slice_bytes ∈ {32, 64, 128, 256}`) causes a single-bit shift
-/// in the luma coefficient stream that ffmpeg interprets as garbage —
+/// in the luma coefficient stream that the oracle interprets as garbage —
 /// the root cause of the Round 8 LD interop regression.
 pub(crate) fn ld_length_bits(slice_bytes: u32) -> u32 {
     let total_bits = slice_bytes.saturating_mul(8).max(1);
@@ -2787,7 +2787,7 @@ fn encode_ld_slice(
     let total_bits = 8u64 * slice_n_bytes as u64;
     // §13.5.2 specifies `length_bits = intlog2(8*slice_bytes - 7)` with the
     // Dirac `intlog2` convention `2^(m-1) < n ≤ 2^m` (§6.4.3). In practice
-    // ffmpeg's VC-2 decoder — and the SMPTE ST 2042-1 reference — sizes
+    // the oracle's VC-2 decoder — and the SMPTE ST 2042-1 reference — sizes
     // this field as `floor(log2(total_bits)) + 1` (the minimum bits
     // needed to represent `0..total_bits-1`), which agrees with the
     // Dirac formula except when `total_bits` is an exact power of 2

@@ -27,13 +27,13 @@
 //! * **VC-2 LD intra pictures** (parse codes 0xC8 / 0xCC) — full
 //!   coefficient unpack, intra DC prediction, IDWT, output offset.
 //! * **VC-2 HQ intra pictures** (parse codes 0xE8 / 0xEC) — same,
-//!   minus the DC prediction. A multi-frame 128x96 ffmpeg testsrc
-//!   clip decodes pixel-for-pixel-identically to ffmpeg.
+//!   minus the DC prediction. A multi-frame 128x96 oracle-generated test-source
+//!   clip decodes pixel-for-pixel-identically to the oracle.
 //! * **Core-syntax intra pictures** (parse code 0x08 / 0x0C) — §13.4
 //!   per-subband codeblock unpacking, with both the VLC and the
 //!   arithmetic-coded paths (zero-parent / zero-neighbourhood /
 //!   sign-prediction contexts per Table 13.1). End-to-end testing
-//!   relies on a third-party Dirac encoder; ffmpeg only emits VC-2.
+//!   relies on a third-party Dirac encoder; the oracle only emits VC-2.
 //! * **Core-syntax inter pictures** — §11.2 picture prediction
 //!   parameters, §12.3 block motion data decode (superblock splits,
 //!   block modes, reference-1 / reference-2 motion vectors, DC values
@@ -43,7 +43,7 @@
 //!   weighting window, affine/perspective global motion, and bi-
 //!   directional reference weighting). The reference-picture buffer
 //!   is maintained across pictures by the decoder front-end. As of
-//!   writing, ffmpeg does not emit Dirac inter (only VC-2 intra) so
+//!   writing, the oracle does not emit Dirac inter (only VC-2 intra) so
 //!   end-to-end testing of this path relies on primitives-level unit
 //!   tests until a third-party Dirac encoder is available.
 //!
@@ -64,10 +64,10 @@
 //! Encoder coverage:
 //!
 //! * **VC-2 HQ intra** ([`encoder::encode_single_hq_intra_stream`]) —
-//!   the bit-exact ffmpeg interop baseline (≥48 dB Y PSNR at q=0
+//!   the bit-exact oracle-interop baseline (≥48 dB Y PSNR at q=0
 //!   across LeGall / DD9-7 / DD13-7 / Haar / Fidelity / Daubechies).
 //! * **VC-2 LD intra** ([`encoder::encode_single_ld_intra_stream`]) —
-//!   ffmpeg-validated with the Round 9 `slice_y_length` width fix.
+//!   oracle-validated with the Round 9 `slice_y_length` width fix.
 //! * **Dirac core-syntax inter** ([`encoder_inter::encode_intra_then_inter_stream`]
 //!   for 1-ref P, [`encoder_inter::encode_bipred_inter_picture`] +
 //!   [`encoder_intra_core::encode_core_intra_then_bipred_stream`] for
@@ -85,7 +85,7 @@
 //!   residue closes the prediction-error loop: at the default
 //!   `qindex = 0` the inter self-roundtrip is bit-exact (∞ dB) on every
 //!   synthetic translation fixture in the test suite (1-ref and 2-ref
-//!   alike), and the homogeneous-profile ffmpeg cross-decode lands at
+//!   alike), and the homogeneous-profile oracle cross-decode lands at
 //!   ~34 dB (1-ref `+4`-pel translating-square, +15 dB over no-residue)
 //!   and **~42 dB** (bipred B on the complementary-bar fixture). Setting
 //!   `residue: None` reverts to the round-1 ZERO_RESIDUAL=true behaviour
@@ -98,7 +98,7 @@
 //!   custom quant matrix. Self-roundtrip is bit-exact on flat
 //!   pictures and ≥48 dB Y/U on a testsrc gradient. Pairs with the
 //!   round-1 inter encoder for a homogeneous-syntax 2-frame stream
-//!   that ffmpeg's `dirac` decoder accepts end-to-end (cross-decoded
+//!   that the oracle's `dirac` decoder accepts end-to-end (cross-decoded
 //!   intra Y PSNR ≈ 52 dB). A **VLC (non-arithmetic) variant**
 //!   ([`encoder_intra_core::encode_core_intra_picture_vlc`] /
 //!   [`encoder_intra_core::encode_single_core_intra_stream_vlc`],

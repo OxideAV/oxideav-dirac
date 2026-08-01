@@ -1,11 +1,19 @@
 //! Integration tests against a real Dirac elementary stream produced
-//! by ffmpeg. These cover:
+//! by the external reference oracle. These cover:
 //!
 //! * Walking the parse-info framing and spotting sequence headers.
 //! * Parsing the sequence header and extracting usable frame
 //!   dimensions + chroma format.
 //! * Driving the public `Decoder` trait all the way to a decoded
 //!   picture (HQ-profile VC-2 intra pictures produce a `VideoFrame`).
+//!
+//! Clean-room posture: the oracle is invoked strictly as an opaque
+//! black-box validator binary (encode fixtures in, decoded YUV out);
+//! its source is never consulted. `ORACLE_BIN` below is the
+//! executable's on-disk name — invocation data, not a reference.
+
+/// The black-box validator executable name (data, not a reference).
+const ORACLE_BIN: &str = "ffmpeg";
 
 use oxideav_core::CodecRegistry;
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
@@ -67,7 +75,7 @@ fn parse_info_offsets_link_forward() {
 /// Drive the public `Decoder` trait: feed the whole stream, then pull
 /// the first frame. With the HQ-profile intra path implemented, this
 /// should produce a `VideoFrame` with 64x64 luma — the testsrc
-/// pattern that ffmpeg's `lavfi testsrc=size=64x64` generated.
+/// pattern that the oracle's `lavfi testsrc=size=64x64` generated.
 #[test]
 fn decoder_produces_first_frame_from_hq_vc2_intra() {
     let mut reg = CodecRegistry::new();
@@ -101,13 +109,13 @@ fn decoder_produces_first_frame_from_hq_vc2_intra() {
     }
 }
 
-/// Shell out to ffmpeg (if present) and emit a tiny 10-bit 4:2:0
+/// Shell out to the oracle (if present) and emit a tiny 10-bit 4:2:0
 /// VC-2 stream, then feed it through our decoder and check we now
 /// produce a `Yuv420P10Le` frame rather than demoting to 8 bits. The
-/// test is skipped cleanly when ffmpeg isn't available so CI doesn't
+/// test is skipped cleanly when the oracle isn't available so CI doesn't
 /// need it pre-installed.
-fn ffmpeg_available() -> bool {
-    std::process::Command::new("ffmpeg")
+fn oracle_available() -> bool {
+    std::process::Command::new(ORACLE_BIN)
         .arg("-version")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -117,17 +125,17 @@ fn ffmpeg_available() -> bool {
 }
 
 /// Build a tiny VC-2 Dirac elementary stream with the given
-/// `pix_fmt`. Returns true on success, false if ffmpeg isn't
+/// `pix_fmt`. Returns true on success, false if the oracle isn't
 /// available or the shell-out fails — callers skip cleanly in
 /// that case.
 fn build_vc2_stream(dest: &std::path::Path, pix_fmt: &str) -> bool {
-    if !ffmpeg_available() {
+    if !oracle_available() {
         return false;
     }
     // `-f dirac` raw elementary stream; single-frame 64x64, shallow
     // wavelet depth so the slice buffers fit in the decoder's
     // default plumbing.
-    let status = std::process::Command::new("ffmpeg")
+    let status = std::process::Command::new(ORACLE_BIN)
         .args([
             "-y",
             "-hide_banner",
@@ -158,10 +166,10 @@ fn build_10bit_stream(dest: &std::path::Path) -> bool {
 }
 
 #[test]
-fn ffmpeg_10bit_yuv420_produces_yuv420p10le_frame() {
+fn oracle_10bit_yuv420_produces_yuv420p10le_frame() {
     let tmp = std::env::temp_dir().join("oxideav_dirac_10bit_64x64.drc");
     if !build_10bit_stream(&tmp) {
-        eprintln!("ffmpeg not available or failed to build 10-bit fixture; skipping");
+        eprintln!("oracle binary not available or failed to build 10-bit fixture; skipping");
         return;
     }
     let data = std::fs::read(&tmp).expect("read generated fixture");
@@ -209,15 +217,15 @@ fn ffmpeg_10bit_yuv420_produces_yuv420p10le_frame() {
     }
 }
 
-/// 8-bit 4:2:2 ffmpeg-interop baseline. The checked-in `tiny_1f.drc`
+/// 8-bit 4:2:2 the oracle-interop baseline. The checked-in `tiny_1f.drc`
 /// fixture is 8-bit 4:4:4, and the round-1 highbitdepth test covers
 /// 10-bit 4:2:0 — this test plugs the 8-bit 4:2:2 gap so all three
 /// chroma geometries (§10.4) have baseline conformance coverage.
 #[test]
-fn ffmpeg_8bit_yuv422_produces_yuv422p_frame() {
+fn oracle_8bit_yuv422_produces_yuv422p_frame() {
     let tmp = std::env::temp_dir().join("oxideav_dirac_8bit_422_64x64.drc");
     if !build_vc2_stream(&tmp, "yuv422p") {
-        eprintln!("ffmpeg not available or failed to build 8-bit 4:2:2 fixture; skipping");
+        eprintln!("oracle binary not available or failed to build 8-bit 4:2:2 fixture; skipping");
         return;
     }
     let data = std::fs::read(&tmp).expect("read generated fixture");
@@ -257,9 +265,9 @@ fn ffmpeg_8bit_yuv422_produces_yuv422p_frame() {
     }
 }
 
-/// Round-trip our HQ encoder through ffmpeg: encode a synthetic frame
+/// Round-trip our HQ encoder through the oracle: encode a synthetic frame
 /// with `encode_single_hq_intra_stream`, feed the resulting elementary
-/// stream to ffmpeg's `dirac` decoder, and compare the decoded YUV
+/// stream to the oracle's `dirac` decoder, and compare the decoded YUV
 /// back to the original planes.
 ///
 /// At qindex=0 this is bit-exact (the dead-zone quantiser is an
@@ -268,9 +276,9 @@ fn ffmpeg_8bit_yuv422_produces_yuv422p_frame() {
 /// keep the test robust if future encoder changes introduce tiny
 /// rounding errors.
 #[test]
-fn ffmpeg_decodes_our_hq_stream_lossless_q0() {
-    if !ffmpeg_available() {
-        eprintln!("ffmpeg not available; skipping HQ interop test");
+fn oracle_decodes_our_hq_stream_lossless_q0() {
+    if !oracle_available() {
+        eprintln!("oracle binary not available; skipping HQ interop test");
         return;
     }
     use oxideav_dirac::encoder::{
@@ -284,13 +292,13 @@ fn ffmpeg_decodes_our_hq_stream_lossless_q0() {
     let (y, u, v) = synthetic_testsrc_64_yuv420();
     let stream = encode_single_hq_intra_stream(&seq, &params, 0, &y, &u, &v);
 
-    // Write to a temp file and decode with ffmpeg -f dirac.
+    // Write to a temp file and decode with the oracle -f dirac.
     let tmpdir = std::env::temp_dir();
     let drc = tmpdir.join("oxideav_dirac_interop_hq.drc");
     let yuv = tmpdir.join("oxideav_dirac_interop_hq.yuv");
     std::fs::write(&drc, &stream).expect("write drc");
 
-    let status = std::process::Command::new("ffmpeg")
+    let status = std::process::Command::new(ORACLE_BIN)
         .args([
             "-y",
             "-hide_banner",
@@ -304,13 +312,13 @@ fn ffmpeg_decodes_our_hq_stream_lossless_q0() {
         .args(["-f", "rawvideo", "-pix_fmt", "yuv420p"])
         .arg(&yuv)
         .status()
-        .expect("run ffmpeg");
+        .expect("run the oracle");
     assert!(
         status.success(),
-        "ffmpeg decode failed — HQ stream malformed"
+        "the oracle decode failed — HQ stream malformed"
     );
 
-    let out = std::fs::read(&yuv).expect("read ffmpeg yuv");
+    let out = std::fs::read(&yuv).expect("read the oracle yuv");
     assert_eq!(out.len(), 64 * 64 + 2 * 32 * 32);
     let out_y = &out[..64 * 64];
     let out_u = &out[64 * 64..64 * 64 + 32 * 32];
@@ -333,10 +341,10 @@ fn ffmpeg_decodes_our_hq_stream_lossless_q0() {
     let y_psnr = psnr(out_y, &y);
     let u_psnr = psnr(out_u, &u);
     let v_psnr = psnr(out_v, &v);
-    eprintln!("ffmpeg HQ decode PSNR: Y={y_psnr:.2} U={u_psnr:.2} V={v_psnr:.2}");
+    eprintln!("the oracle HQ decode PSNR: Y={y_psnr:.2} U={u_psnr:.2} V={v_psnr:.2}");
     assert!(
         y_psnr >= 48.0,
-        "Y PSNR {y_psnr:.2} dB below 48 dB — HQ stream lost fidelity through ffmpeg"
+        "Y PSNR {y_psnr:.2} dB below 48 dB — HQ stream lost fidelity through the oracle"
     );
     assert!(u_psnr >= 48.0, "U PSNR {u_psnr:.2} dB below 48 dB");
     assert!(v_psnr >= 48.0, "V PSNR {v_psnr:.2} dB below 48 dB");
@@ -375,9 +383,9 @@ fn deep_ramp(w: usize, h: usize, depth: u32, seed: u32) -> Vec<u16> {
 /// against the input ramp: at qindex 0 the stream must be lossless
 /// through the *reference* decoder, not just through ours.
 #[test]
-fn ffmpeg_decodes_our_deep_preset_hq_streams_bit_exact() {
-    if !ffmpeg_available() {
-        eprintln!("ffmpeg not available; skipping deep HQ interop test");
+fn oracle_decodes_our_deep_preset_hq_streams_bit_exact() {
+    if !oracle_available() {
+        eprintln!("oracle binary not available; skipping deep HQ interop test");
         return;
     }
     use oxideav_dirac::encoder::{
@@ -407,7 +415,7 @@ fn ffmpeg_decodes_our_deep_preset_hq_streams_bit_exact() {
         let yuv = tmpdir.join(format!("oxideav_dirac_interop_deep{depth}.yuv"));
         std::fs::write(&drc, &stream).expect("write drc");
 
-        let status = std::process::Command::new("ffmpeg")
+        let status = std::process::Command::new(ORACLE_BIN)
             .args([
                 "-y",
                 "-hide_banner",
@@ -421,13 +429,13 @@ fn ffmpeg_decodes_our_deep_preset_hq_streams_bit_exact() {
             .args(["-f", "rawvideo", "-pix_fmt", pix_fmt])
             .arg(&yuv)
             .status()
-            .expect("run ffmpeg");
+            .expect("run the oracle");
         assert!(
             status.success(),
-            "ffmpeg decode failed at {depth}-bit — deep HQ stream malformed"
+            "the oracle decode failed at {depth}-bit — deep HQ stream malformed"
         );
 
-        let out = std::fs::read(&yuv).expect("read ffmpeg yuv");
+        let out = std::fs::read(&yuv).expect("read the oracle yuv");
         assert_eq!(out.len(), 2 * (w * h + 2 * cw * ch), "{depth}-bit size");
         let words: Vec<u16> = out
             .chunks_exact(2)
@@ -441,21 +449,21 @@ fn ffmpeg_decodes_our_deep_preset_hq_streams_bit_exact() {
     }
 }
 
-/// Round-trip our LD encoder through ffmpeg's vc2 decoder. Round 8
+/// Round-trip our LD encoder through the oracle's vc2 decoder. Round 8
 /// landed at ~12.7 dB PSNR because of an off-by-one in the slice
 /// `slice_y_length` field width — the Dirac spec's `intlog2(8*sb - 7)`
 /// formula under-sizes the field by one bit whenever `8*sb` is an
 /// exact power of two, shifting every coefficient in the luma stream
 /// by one bit. Fixed in Round 9 by sizing the field as
-/// `floor(log2(total_bits)) + 1` (the SMPTE VC-2 / ffmpeg convention).
+/// `floor(log2(total_bits)) + 1` (the SMPTE VC-2 / the oracle convention).
 ///
 /// At qindex = 0 with a 128-byte per-slice budget the stream is
 /// near-lossless for all but the 255-valued cross of the synthetic
 /// testsrc pattern — we assert PSNR >= 48 dB for Y.
 #[test]
-fn ffmpeg_decodes_our_ld_stream_bit_exact() {
-    if !ffmpeg_available() {
-        eprintln!("ffmpeg not available; skipping LD interop test");
+fn oracle_decodes_our_ld_stream_bit_exact() {
+    if !oracle_available() {
+        eprintln!("oracle binary not available; skipping LD interop test");
         return;
     }
     use oxideav_dirac::encoder::{
@@ -474,7 +482,7 @@ fn ffmpeg_decodes_our_ld_stream_bit_exact() {
     let yuv = tmpdir.join("oxideav_dirac_interop_ld.yuv");
     std::fs::write(&drc, &stream).expect("write drc");
 
-    let status = std::process::Command::new("ffmpeg")
+    let status = std::process::Command::new(ORACLE_BIN)
         .args([
             "-y",
             "-hide_banner",
@@ -488,12 +496,12 @@ fn ffmpeg_decodes_our_ld_stream_bit_exact() {
         .args(["-f", "rawvideo", "-pix_fmt", "yuv420p"])
         .arg(&yuv)
         .status()
-        .expect("run ffmpeg");
+        .expect("run the oracle");
     assert!(
         status.success(),
-        "ffmpeg rejected our LD stream — framing / sequence header regressed"
+        "the oracle rejected our LD stream — framing / sequence header regressed"
     );
-    let out = std::fs::read(&yuv).expect("read ffmpeg yuv");
+    let out = std::fs::read(&yuv).expect("read the oracle yuv");
     assert_eq!(out.len(), 64 * 64 + 2 * 32 * 32);
     let out_y = &out[..64 * 64];
     let out_u = &out[64 * 64..64 * 64 + 32 * 32];
@@ -516,7 +524,7 @@ fn ffmpeg_decodes_our_ld_stream_bit_exact() {
     let y_psnr = psnr(out_y, &y);
     let u_psnr = psnr(out_u, &u);
     let v_psnr = psnr(out_v, &v);
-    eprintln!("ffmpeg LD decode PSNR: Y={y_psnr:.2} U={u_psnr:.2} V={v_psnr:.2}");
+    eprintln!("the oracle LD decode PSNR: Y={y_psnr:.2} U={u_psnr:.2} V={v_psnr:.2}");
     assert!(
         y_psnr >= 48.0,
         "Y PSNR {y_psnr:.2} dB below 48 dB — LD interop regression"
@@ -525,18 +533,18 @@ fn ffmpeg_decodes_our_ld_stream_bit_exact() {
     assert!(v_psnr >= 48.0, "V PSNR {v_psnr:.2} dB below 48 dB");
 }
 
-/// HQ ffmpeg-interop matrix: round-trip our HQ encoder through ffmpeg's
+/// HQ the oracle-interop matrix: round-trip our HQ encoder through the oracle's
 /// `dirac` decoder for both 4:2:2 and 4:4:4 chroma formats. The
-/// existing 4:2:0 case (`ffmpeg_decodes_our_hq_stream_lossless_q0`)
+/// existing 4:2:0 case (`oracle_decodes_our_hq_stream_lossless_q0`)
 /// covers the most common geometry; this fills the gap for the other
 /// two §10.4 chroma layouts. With LeGall 5/3 + qindex=0 the dead-zone
 /// quantiser is identity, so PSNR should be effectively infinite — we
 /// assert ≥ 48 dB to leave headroom for tiny rounding differences in
-/// ffmpeg's IDWT path.
+/// the oracle's IDWT path.
 #[test]
-fn ffmpeg_decodes_our_hq_stream_lossless_q0_yuv422() {
-    if !ffmpeg_available() {
-        eprintln!("ffmpeg not available; skipping HQ 4:2:2 interop test");
+fn oracle_decodes_our_hq_stream_lossless_q0_yuv422() {
+    if !oracle_available() {
+        eprintln!("oracle binary not available; skipping HQ 4:2:2 interop test");
         return;
     }
     use oxideav_dirac::encoder::{
@@ -549,7 +557,7 @@ fn ffmpeg_decodes_our_hq_stream_lossless_q0_yuv422() {
     let cw: u32 = w / 2;
     let ch: u32 = h;
     // Smooth-ish synthetic content; flat-channel U/V keeps the test
-    // robust to ffmpeg subsampling-filter differences.
+    // robust to the oracle subsampling-filter differences.
     let mut y = vec![0u8; (w * h) as usize];
     for row in 0..h as usize {
         for col in 0..w as usize {
@@ -568,7 +576,7 @@ fn ffmpeg_decodes_our_hq_stream_lossless_q0_yuv422() {
     let yuv = tmpdir.join("oxideav_dirac_interop_hq_422.yuv");
     std::fs::write(&drc, &stream).expect("write drc");
 
-    let status = std::process::Command::new("ffmpeg")
+    let status = std::process::Command::new(ORACLE_BIN)
         .args([
             "-y",
             "-hide_banner",
@@ -582,9 +590,12 @@ fn ffmpeg_decodes_our_hq_stream_lossless_q0_yuv422() {
         .args(["-f", "rawvideo", "-pix_fmt", "yuv422p"])
         .arg(&yuv)
         .status()
-        .expect("run ffmpeg");
-    assert!(status.success(), "ffmpeg decode failed for 4:2:2 HQ stream");
-    let out = std::fs::read(&yuv).expect("read ffmpeg yuv");
+        .expect("run the oracle");
+    assert!(
+        status.success(),
+        "the oracle decode failed for 4:2:2 HQ stream"
+    );
+    let out = std::fs::read(&yuv).expect("read the oracle yuv");
     let y_len = (w * h) as usize;
     let c_len = (cw * ch) as usize;
     assert_eq!(out.len(), y_len + 2 * c_len);
@@ -607,7 +618,7 @@ fn ffmpeg_decodes_our_hq_stream_lossless_q0_yuv422() {
     let y_psnr = psnr(out_y, &y);
     let u_psnr = psnr(out_u, &u);
     let v_psnr = psnr(out_v, &v);
-    eprintln!("ffmpeg HQ 4:2:2 PSNR: Y={y_psnr:.2} U={u_psnr:.2} V={v_psnr:.2}");
+    eprintln!("the oracle HQ 4:2:2 PSNR: Y={y_psnr:.2} U={u_psnr:.2} V={v_psnr:.2}");
     assert!(
         y_psnr >= 48.0,
         "Y PSNR {y_psnr:.2} dB below 48 dB — 4:2:2 HQ regression"
@@ -617,9 +628,9 @@ fn ffmpeg_decodes_our_hq_stream_lossless_q0_yuv422() {
 }
 
 #[test]
-fn ffmpeg_decodes_our_hq_stream_lossless_q0_yuv444() {
-    if !ffmpeg_available() {
-        eprintln!("ffmpeg not available; skipping HQ 4:4:4 interop test");
+fn oracle_decodes_our_hq_stream_lossless_q0_yuv444() {
+    if !oracle_available() {
+        eprintln!("oracle binary not available; skipping HQ 4:4:4 interop test");
         return;
     }
     use oxideav_dirac::encoder::{
@@ -648,7 +659,7 @@ fn ffmpeg_decodes_our_hq_stream_lossless_q0_yuv444() {
     let yuv = tmpdir.join("oxideav_dirac_interop_hq_444.yuv");
     std::fs::write(&drc, &stream).expect("write drc");
 
-    let status = std::process::Command::new("ffmpeg")
+    let status = std::process::Command::new(ORACLE_BIN)
         .args([
             "-y",
             "-hide_banner",
@@ -662,9 +673,12 @@ fn ffmpeg_decodes_our_hq_stream_lossless_q0_yuv444() {
         .args(["-f", "rawvideo", "-pix_fmt", "yuv444p"])
         .arg(&yuv)
         .status()
-        .expect("run ffmpeg");
-    assert!(status.success(), "ffmpeg decode failed for 4:4:4 HQ stream");
-    let out = std::fs::read(&yuv).expect("read ffmpeg yuv");
+        .expect("run the oracle");
+    assert!(
+        status.success(),
+        "the oracle decode failed for 4:4:4 HQ stream"
+    );
+    let out = std::fs::read(&yuv).expect("read the oracle yuv");
     let plane_len = (w * h) as usize;
     assert_eq!(out.len(), 3 * plane_len);
     let out_y = &out[..plane_len];
@@ -686,7 +700,7 @@ fn ffmpeg_decodes_our_hq_stream_lossless_q0_yuv444() {
     let y_psnr = psnr(out_y, &y);
     let u_psnr = psnr(out_u, &u);
     let v_psnr = psnr(out_v, &v);
-    eprintln!("ffmpeg HQ 4:4:4 PSNR: Y={y_psnr:.2} U={u_psnr:.2} V={v_psnr:.2}");
+    eprintln!("the oracle HQ 4:4:4 PSNR: Y={y_psnr:.2} U={u_psnr:.2} V={v_psnr:.2}");
     assert!(
         y_psnr >= 48.0,
         "Y PSNR {y_psnr:.2} dB below 48 dB — 4:4:4 HQ regression"
@@ -695,7 +709,7 @@ fn ffmpeg_decodes_our_hq_stream_lossless_q0_yuv444() {
     assert!(v_psnr >= 48.0, "V PSNR {v_psnr:.2} dB below 48 dB");
 }
 
-/// HQ ffmpeg-interop wavelet matrix: confirm ffmpeg's Dirac decoder
+/// HQ the oracle-interop wavelet matrix: confirm the oracle's Dirac decoder
 /// accepts our HQ encoder output for every wavelet preset we support
 /// (skipping Fidelity, which intentionally falls outside the HQ slice
 /// budget — see `encoder_matrix.rs` for the rationale). Each filter's
@@ -703,9 +717,9 @@ fn ffmpeg_decodes_our_hq_stream_lossless_q0_yuv444() {
 /// signalled in the bitstream, so this test catches a regression where
 /// e.g. a Daubechies9_7 quant matrix gets miswritten.
 #[test]
-fn ffmpeg_accepts_our_hq_stream_across_wavelets() {
-    if !ffmpeg_available() {
-        eprintln!("ffmpeg not available; skipping HQ wavelet matrix test");
+fn oracle_accepts_our_hq_stream_across_wavelets() {
+    if !oracle_available() {
+        eprintln!("oracle binary not available; skipping HQ wavelet matrix test");
         return;
     }
     use oxideav_dirac::encoder::{
@@ -759,7 +773,7 @@ fn ffmpeg_accepts_our_hq_stream_across_wavelets() {
         let yuv = tmpdir.join(format!("oxideav_dirac_hq_wavelet_{tag}.yuv"));
         std::fs::write(&drc, &stream).expect("write drc");
 
-        let status = std::process::Command::new("ffmpeg")
+        let status = std::process::Command::new(ORACLE_BIN)
             .args([
                 "-y",
                 "-hide_banner",
@@ -773,21 +787,21 @@ fn ffmpeg_accepts_our_hq_stream_across_wavelets() {
             .args(["-f", "rawvideo", "-pix_fmt", "yuv420p"])
             .arg(&yuv)
             .status()
-            .expect("run ffmpeg");
+            .expect("run the oracle");
         assert!(
             status.success(),
-            "ffmpeg rejected our HQ stream for filter {filter:?}"
+            "the oracle rejected our HQ stream for filter {filter:?}"
         );
 
-        let out = std::fs::read(&yuv).expect("read ffmpeg yuv");
+        let out = std::fs::read(&yuv).expect("read the oracle yuv");
         let y_len = (w * h) as usize;
         let c_len = (cw * ch) as usize;
         assert_eq!(out.len(), y_len + 2 * c_len);
         let out_y = &out[..y_len];
         let py = psnr(out_y, &y);
-        eprintln!("ffmpeg HQ wavelet {filter:?}: Y PSNR = {py:.2} dB");
+        eprintln!("the oracle HQ wavelet {filter:?}: Y PSNR = {py:.2} dB");
         // Smooth gradient + integer-reversible wavelets → very high
-        // PSNR. Allow some slack for ffmpeg's own quant rounding on
+        // PSNR. Allow some slack for the oracle's own quant rounding on
         // the heavier filters.
         assert!(
             py >= 35.0,
@@ -797,14 +811,14 @@ fn ffmpeg_accepts_our_hq_stream_across_wavelets() {
 }
 
 /// Sanity sub-case: a constant Y=100 input must decode to a constant
-/// Y=100 picture through ffmpeg. Round 8's failure mode produced a
+/// Y=100 picture through the oracle. Round 8's failure mode produced a
 /// 128-centred ramp (see the test name in Round 9 brief), so this
 /// test pins the specific "DC coefficient read at the wrong scale"
 /// regression that the length-bits fix resolves.
 #[test]
-fn ffmpeg_decodes_our_ld_constant_frame_lossless() {
-    if !ffmpeg_available() {
-        eprintln!("ffmpeg not available; skipping LD interop sanity test");
+fn oracle_decodes_our_ld_constant_frame_lossless() {
+    if !oracle_available() {
+        eprintln!("oracle binary not available; skipping LD interop sanity test");
         return;
     }
     use oxideav_dirac::encoder::{
@@ -824,7 +838,7 @@ fn ffmpeg_decodes_our_ld_constant_frame_lossless() {
     let yuv = tmpdir.join("oxideav_dirac_interop_ld_const.yuv");
     std::fs::write(&drc, &stream).expect("write drc");
 
-    let status = std::process::Command::new("ffmpeg")
+    let status = std::process::Command::new(ORACLE_BIN)
         .args([
             "-y",
             "-hide_banner",
@@ -838,9 +852,12 @@ fn ffmpeg_decodes_our_ld_constant_frame_lossless() {
         .args(["-f", "rawvideo", "-pix_fmt", "yuv420p"])
         .arg(&yuv)
         .status()
-        .expect("run ffmpeg");
-    assert!(status.success(), "ffmpeg rejected our constant LD stream");
-    let out = std::fs::read(&yuv).expect("read ffmpeg yuv");
+        .expect("run the oracle");
+    assert!(
+        status.success(),
+        "the oracle rejected our constant LD stream"
+    );
+    let out = std::fs::read(&yuv).expect("read the oracle yuv");
     let out_y = &out[..64 * 64];
     let max = *out_y.iter().max().unwrap();
     let min = *out_y.iter().min().unwrap();
@@ -848,30 +865,30 @@ fn ffmpeg_decodes_our_ld_constant_frame_lossless() {
         (min, max),
         (100, 100),
         "constant Y=100 should decode to flat 100 — \
-         got min={min}, max={max} (ffmpeg coefficient mis-read regressed)"
+         got min={min}, max={max} (the oracle coefficient mis-read regressed)"
     );
 }
 
 /// Round-trip our **inter** (core-syntax 1-ref AC) stream through
-/// ffmpeg's `dirac` decoder, using a homogeneous-profile chain.
+/// the oracle's `dirac` decoder, using a homogeneous-profile chain.
 ///
 /// **Round 1 used to soft-skip here**: the original wiring emitted the
 /// intra reference as VC-2 HQ (parse code `0xEC`) and the inter as
-/// core-syntax (`0x09`); ffmpeg's `dirac` decoder rejects mixing
+/// core-syntax (`0x09`); the oracle's `dirac` decoder rejects mixing
 /// profiles in one sequence because the two share the parse-info
 /// framing but disagree on every syntax element below it.
 ///
 /// **Round 2 (task #135)** wires the intra reference through the
 /// core-syntax encoder (`encode_core_intra_then_inter_stream`, parse
-/// code `0x0C`), giving a single-profile stream. ffmpeg now accepts
+/// code `0x0C`), giving a single-profile stream. the oracle now accepts
 /// the chain end-to-end and this test asserts that hard. The legacy
 /// mixed-profile shape (`encode_intra_then_inter_stream`) still exists
 /// for self-roundtrip coverage but is no longer the path validated
-/// against ffmpeg.
+/// against the oracle.
 #[test]
-fn ffmpeg_decodes_our_inter_stream_translating_square() {
-    if !ffmpeg_available() {
-        eprintln!("ffmpeg not available; skipping inter interop test");
+fn oracle_decodes_our_inter_stream_translating_square() {
+    if !oracle_available() {
+        eprintln!("oracle binary not available; skipping inter interop test");
         return;
     }
     use oxideav_dirac::encoder::make_minimal_sequence;
@@ -907,7 +924,7 @@ fn ffmpeg_decodes_our_inter_stream_translating_square() {
     let yuv = tmpdir.join("oxideav_dirac_interop_inter.yuv");
     std::fs::write(&drc, &stream).expect("write drc");
 
-    let status = std::process::Command::new("ffmpeg")
+    let status = std::process::Command::new(ORACLE_BIN)
         .args([
             "-y",
             "-hide_banner",
@@ -921,21 +938,21 @@ fn ffmpeg_decodes_our_inter_stream_translating_square() {
         .args(["-f", "rawvideo", "-pix_fmt", "yuv420p"])
         .arg(&yuv)
         .status()
-        .expect("run ffmpeg");
-    // Hard assert — task #135 closes the round-1 soft-skip. If ffmpeg
+        .expect("run the oracle");
+    // Hard assert — task #135 closes the round-1 soft-skip. If the oracle
     // rejects the homogeneous-profile stream that's a regression in the
     // core-syntax intra encoder or its parse-info framing.
     assert!(
         status.success(),
-        "ffmpeg rejected our homogeneous-profile inter stream — see \
-         {drc:?}; task #135 acceptance is that ffmpeg accepts the \
+        "the oracle rejected our homogeneous-profile inter stream — see \
+         {drc:?}; task #135 acceptance is that the oracle accepts the \
          single-profile 0x0C + 0x09 chain end-to-end"
     );
-    let out = std::fs::read(&yuv).expect("read ffmpeg yuv");
+    let out = std::fs::read(&yuv).expect("read the oracle yuv");
     let frame_size = 64 * 64 + 2 * 32 * 32;
     assert!(
         out.len() >= 2 * frame_size,
-        "ffmpeg produced {} bytes; expected at least {}",
+        "the oracle produced {} bytes; expected at least {}",
         out.len(),
         2 * frame_size
     );
@@ -955,7 +972,7 @@ fn ffmpeg_decodes_our_inter_stream_translating_square() {
         20.0 * (255.0f64).log10() - 10.0 * mse.log10()
     }
     let psnr_y = psnr(inter_y, &y1);
-    eprintln!("ffmpeg inter Y PSNR (homogeneous-profile chain): {psnr_y:.2} dB");
+    eprintln!("the oracle inter Y PSNR (homogeneous-profile chain): {psnr_y:.2} dB");
     // Round-408: with the encoder emitting literal §11.2.2 block
     // parameters (the external oracle resolves preset *index* 1 to
     // non-overlapped blocks) and an explicit all-zero-band residue tail
@@ -965,14 +982,14 @@ fn ffmpeg_decodes_our_inter_stream_translating_square() {
     // convention gap.
     assert!(
         psnr_y.is_infinite(),
-        "ffmpeg inter cross-decode no longer bit-exact ({psnr_y:.2} dB) — \
+        "the oracle inter cross-decode no longer bit-exact ({psnr_y:.2} dB) — \
          the encoder/oracle convention alignment from round-408 regressed"
     );
 }
 
-/// **Sub-pel ME ffmpeg cross-decode (#168)**. The camera-pan fixture
+/// **Sub-pel ME the oracle cross-decode (#168)**. The camera-pan fixture
 /// is a sub-pel-shifted vertical-bar pattern — exactly the case where
-/// integer-pel ME fails. With our quarter-pel encoder, ffmpeg should
+/// integer-pel ME fails. With our quarter-pel encoder, the oracle should
 /// reconstruct the inter frame with measurably less error than on the
 /// integer-pel-only path.
 ///
@@ -981,9 +998,9 @@ fn ffmpeg_decodes_our_inter_stream_translating_square() {
 /// the residue closes whatever the ME leaves, and the external
 /// oracle's prediction now matches ours byte-for-byte.
 #[test]
-fn ffmpeg_cross_decodes_camera_pan_with_subpel_me() {
-    if !ffmpeg_available() {
-        eprintln!("ffmpeg not available; skipping camera-pan sub-pel cross-decode");
+fn oracle_cross_decodes_camera_pan_with_subpel_me() {
+    if !oracle_available() {
+        eprintln!("oracle binary not available; skipping camera-pan sub-pel cross-decode");
         return;
     }
     use oxideav_dirac::encoder::make_minimal_sequence;
@@ -1031,7 +1048,7 @@ fn ffmpeg_cross_decodes_camera_pan_with_subpel_me() {
         let drc = tmpdir.join(format!("oxideav_dirac_camera_pan_{tag}.drc"));
         let yuv = tmpdir.join(format!("oxideav_dirac_camera_pan_{tag}.yuv"));
         std::fs::write(&drc, &stream).expect("write drc");
-        let status = std::process::Command::new("ffmpeg")
+        let status = std::process::Command::new(ORACLE_BIN)
             .args([
                 "-y",
                 "-hide_banner",
@@ -1045,12 +1062,12 @@ fn ffmpeg_cross_decodes_camera_pan_with_subpel_me() {
             .args(["-f", "rawvideo", "-pix_fmt", "yuv420p"])
             .arg(&yuv)
             .status()
-            .expect("run ffmpeg");
+            .expect("run the oracle");
         assert!(
             status.success(),
-            "ffmpeg rejected our camera-pan stream ({tag}) — see {drc:?}"
+            "the oracle rejected our camera-pan stream ({tag}) — see {drc:?}"
         );
-        let out = std::fs::read(&yuv).expect("read ffmpeg yuv");
+        let out = std::fs::read(&yuv).expect("read the oracle yuv");
         let frame_size = 64 * 64 + 2 * 32 * 32;
         assert!(out.len() >= 2 * frame_size);
         let inter_yuv = &out[frame_size..2 * frame_size];
@@ -1069,7 +1086,7 @@ fn ffmpeg_cross_decodes_camera_pan_with_subpel_me() {
     let psnr_int = measure(&int_params, "int");
     let psnr_qpel = measure(&qpel_params, "qpel");
     eprintln!(
-        "camera-pan ffmpeg cross-decode: integer-pel = {psnr_int:.2} dB, \
+        "camera-pan the oracle cross-decode: integer-pel = {psnr_int:.2} dB, \
          quarter-pel = {psnr_qpel:.2} dB"
     );
     // Round-408: with literal §11.2.2 block parameters + the explicit
@@ -1083,7 +1100,7 @@ fn ffmpeg_cross_decodes_camera_pan_with_subpel_me() {
     );
 }
 
-/// **OBMC-aware ME cross-decode (#186)**. ffmpeg should cross-decode
+/// **OBMC-aware ME cross-decode (#186)**. the oracle should cross-decode
 /// our quarter-pel core-syntax inter stream at least as well with our
 /// §15.8.6 OBMC-aware ME refinement (`obmc_refine_passes = 2`, the
 /// default) as without it (`obmc_refine_passes = 0`, the no-OBMC
@@ -1097,9 +1114,9 @@ fn ffmpeg_cross_decodes_camera_pan_with_subpel_me() {
 /// where the OBMC blend the encoder modelled is exactly what reads
 /// the MV grid back.
 #[test]
-fn ffmpeg_obmc_aware_me_does_not_regress_cross_decode() {
-    if !ffmpeg_available() {
-        eprintln!("ffmpeg not available; skipping OBMC cross-decode test");
+fn oracle_obmc_aware_me_does_not_regress_cross_decode() {
+    if !oracle_available() {
+        eprintln!("oracle binary not available; skipping OBMC cross-decode test");
         return;
     }
     use oxideav_dirac::encoder::make_minimal_sequence;
@@ -1147,7 +1164,7 @@ fn ffmpeg_obmc_aware_me_does_not_regress_cross_decode() {
         let drc = tmpdir.join(format!("oxideav_dirac_obmc_xref_{tag}.drc"));
         let yuv = tmpdir.join(format!("oxideav_dirac_obmc_xref_{tag}.yuv"));
         std::fs::write(&drc, &stream).expect("write drc");
-        let status = std::process::Command::new("ffmpeg")
+        let status = std::process::Command::new(ORACLE_BIN)
             .args([
                 "-y",
                 "-hide_banner",
@@ -1161,12 +1178,12 @@ fn ffmpeg_obmc_aware_me_does_not_regress_cross_decode() {
             .args(["-f", "rawvideo", "-pix_fmt", "yuv420p"])
             .arg(&yuv)
             .status()
-            .expect("run ffmpeg");
+            .expect("run the oracle");
         assert!(
             status.success(),
-            "ffmpeg rejected our OBMC cross-decode stream ({tag})"
+            "the oracle rejected our OBMC cross-decode stream ({tag})"
         );
-        let out = std::fs::read(&yuv).expect("read ffmpeg yuv");
+        let out = std::fs::read(&yuv).expect("read the oracle yuv");
         let frame_size = 64 * 64 + 2 * 32 * 32;
         assert!(out.len() >= 2 * frame_size);
         let inter_yuv = &out[frame_size..2 * frame_size];
@@ -1187,32 +1204,32 @@ fn ffmpeg_obmc_aware_me_does_not_regress_cross_decode() {
     let psnr_no_obmc = measure(&no_obmc_params, "no_obmc");
     let psnr_obmc = measure(&obmc_params, "obmc");
     eprintln!(
-        "translate(+2,-1) ffmpeg cross-decode: no-OBMC = {psnr_no_obmc:.2} dB, \
+        "translate(+2,-1) the oracle cross-decode: no-OBMC = {psnr_no_obmc:.2} dB, \
          OBMC-aware = {psnr_obmc:.2} dB"
     );
-    // The cross-decode floor: OBMC must not regress ffmpeg's
-    // reconstruction. ffmpeg's inter path differs from our spec-correct
+    // The cross-decode floor: OBMC must not regress the oracle's
+    // reconstruction. the oracle's inter path differs from our spec-correct
     // OBMC blend (cf. the longer note on
-    // `ffmpeg_decodes_our_inter_stream_translating_square`), so the
+    // `oracle_decodes_our_inter_stream_translating_square`), so the
     // absolute uplift here is small (~0.04 dB). The self-roundtrip
     // counterpart of this test
     // (`encoder_inter_roundtrip::intra_then_inter_obmc_refinement_beats_no_obmc_baseline`)
-    // measures the spec-correct gain (~22 dB). We require ffmpeg to
+    // measures the spec-correct gain (~22 dB). We require the oracle to
     // be no worse than 0.25 dB below baseline — anything past that
     // signals the encoder's OBMC convergence is corrupting the MV
-    // grid in ways ffmpeg actively penalises.
+    // grid in ways the oracle actively penalises.
     assert!(
         psnr_obmc + 0.25 >= psnr_no_obmc,
-        "OBMC-aware ME regressed ffmpeg cross-decode by > 0.25 dB \
+        "OBMC-aware ME regressed the oracle cross-decode by > 0.25 dB \
          ({psnr_no_obmc:.2} dB → {psnr_obmc:.2} dB) on translate(+2,-1) \
-         (#186 cross-decode floor — OBMC must not actively harm ffmpeg \
-         reconstruction even when it can't help due to ffmpeg's structural \
+         (#186 cross-decode floor — OBMC must not actively harm the oracle \
+         reconstruction even when it can't help due to the oracle's structural \
          OBMC differences)"
     );
 }
 
-/// **Wavelet residue ffmpeg cross-decode**. With the §11.3 residue path
-/// enabled (default), ffmpeg's `dirac` decoder should accept the
+/// **Wavelet residue the oracle cross-decode**. With the §11.3 residue path
+/// enabled (default), the oracle's `dirac` decoder should accept the
 /// homogeneous core-syntax intra + inter chain end-to-end and reconstruct
 /// the inter frame at *measurably* higher PSNR than the same encoder
 /// configured with `residue: None` (round-1 ZERO_RESIDUAL=true).
@@ -1223,9 +1240,9 @@ fn ffmpeg_obmc_aware_me_does_not_regress_cross_decode() {
 /// with-residue cross-decode is bit-exact, while prediction-only sits
 /// at the ME quality floor (~32 dB on the +4-pel translation).
 #[test]
-fn ffmpeg_cross_decodes_inter_residue_beats_no_residue() {
-    if !ffmpeg_available() {
-        eprintln!("ffmpeg not available; skipping residue cross-decode test");
+fn oracle_cross_decodes_inter_residue_beats_no_residue() {
+    if !oracle_available() {
+        eprintln!("oracle binary not available; skipping residue cross-decode test");
         return;
     }
     use oxideav_dirac::encoder::make_minimal_sequence;
@@ -1273,7 +1290,7 @@ fn ffmpeg_cross_decodes_inter_residue_beats_no_residue() {
         let drc = tmpdir.join(format!("oxideav_dirac_residue_xref_{tag}.drc"));
         let yuv = tmpdir.join(format!("oxideav_dirac_residue_xref_{tag}.yuv"));
         std::fs::write(&drc, &stream).expect("write drc");
-        let status = std::process::Command::new("ffmpeg")
+        let status = std::process::Command::new(ORACLE_BIN)
             .args([
                 "-y",
                 "-hide_banner",
@@ -1287,17 +1304,17 @@ fn ffmpeg_cross_decodes_inter_residue_beats_no_residue() {
             .args(["-f", "rawvideo", "-pix_fmt", "yuv420p"])
             .arg(&yuv)
             .status()
-            .expect("run ffmpeg");
-        // HARD-asserted — ffmpeg must accept the residue stream. A
+            .expect("run the oracle");
+        // HARD-asserted — the oracle must accept the residue stream. A
         // rejection here means the encoder's §11.3 transform_parameters
-        // / per-component subband framing isn't what ffmpeg's dirac
+        // / per-component subband framing isn't what the oracle's dirac
         // decoder expects.
         assert!(
             status.success(),
-            "ffmpeg rejected our inter-with-residue stream ({tag}) — see {drc:?}; \
+            "the oracle rejected our inter-with-residue stream ({tag}) — see {drc:?}; \
              this is a hard regression in the §11.3 wavelet residue path"
         );
-        let out = std::fs::read(&yuv).expect("read ffmpeg yuv");
+        let out = std::fs::read(&yuv).expect("read the oracle yuv");
         let frame_size = 64 * 64 + 2 * 32 * 32;
         assert!(out.len() >= 2 * frame_size);
         let inter_yuv = &out[frame_size..2 * frame_size];
@@ -1314,7 +1331,7 @@ fn ffmpeg_cross_decodes_inter_residue_beats_no_residue() {
     let psnr_no_res = measure(&no_residue_params, "no_residue");
     let psnr_with_res = measure(&with_residue_params, "with_residue");
     eprintln!(
-        "translate(+4,0) ffmpeg cross-decode: no-residue = {psnr_no_res:.2} dB, \
+        "translate(+4,0) the oracle cross-decode: no-residue = {psnr_no_res:.2} dB, \
          with-residue = {psnr_with_res:.2} dB"
     );
     // Round-408 acceptance: the q0 residue closes the prediction-error
@@ -1344,9 +1361,9 @@ fn ffmpeg_cross_decodes_inter_residue_beats_no_residue() {
 /// per-block global-flag coding, the §15.8.8 field arithmetic, and the
 /// round-382 exact §B.2.7.1 arith terminator, in one stream.
 #[test]
-fn ffmpeg_decodes_our_global_motion_p_stream_bit_exact() {
-    if !ffmpeg_available() {
-        eprintln!("ffmpeg not available; skipping global-motion cross-decode");
+fn oracle_decodes_our_global_motion_p_stream_bit_exact() {
+    if !oracle_available() {
+        eprintln!("oracle binary not available; skipping global-motion cross-decode");
         return;
     }
     use oxideav_dirac::encoder::make_minimal_sequence;
@@ -1396,7 +1413,7 @@ fn ffmpeg_decodes_our_global_motion_p_stream_bit_exact() {
     let drc = std::env::temp_dir().join("oxideav_dirac_global_motion_p.drc");
     let yuv = std::env::temp_dir().join("oxideav_dirac_global_motion_p.yuv");
     std::fs::write(&drc, &stream).expect("write drc");
-    let s = std::process::Command::new("ffmpeg")
+    let s = std::process::Command::new(ORACLE_BIN)
         .args([
             "-y",
             "-hide_banner",
@@ -1410,7 +1427,7 @@ fn ffmpeg_decodes_our_global_motion_p_stream_bit_exact() {
         .args(["-f", "rawvideo", "-pix_fmt", "yuv420p"])
         .arg(&yuv)
         .status()
-        .expect("run ffmpeg");
+        .expect("run the oracle");
     assert!(
         s.success(),
         "external oracle rejected the global-motion stream — see {drc:?}"
@@ -1500,7 +1517,7 @@ fn oracle_decode_yuv420(stream: &[u8], tag: &str) -> Vec<u8> {
     let drc = std::env::temp_dir().join(format!("oxideav_dirac_{tag}.drc"));
     let yuv = std::env::temp_dir().join(format!("oxideav_dirac_{tag}.yuv"));
     std::fs::write(&drc, stream).expect("write drc");
-    let s = std::process::Command::new("ffmpeg")
+    let s = std::process::Command::new(ORACLE_BIN)
         .args([
             "-y",
             "-hide_banner",
@@ -1514,7 +1531,7 @@ fn oracle_decode_yuv420(stream: &[u8], tag: &str) -> Vec<u8> {
         .args(["-f", "rawvideo", "-pix_fmt", "yuv420p"])
         .arg(&yuv)
         .status()
-        .expect("run ffmpeg");
+        .expect("run the oracle");
     assert!(
         s.success(),
         "external oracle rejected the stream — see {drc:?}"
@@ -1531,9 +1548,9 @@ fn oracle_decode_yuv420(stream: &[u8], tag: &str) -> Vec<u8> {
 /// model + per-block gmode grid mean the same thing to an independent
 /// implementation.
 #[test]
-fn ffmpeg_decodes_our_estimated_pan_global_stream_bit_exact() {
-    if !ffmpeg_available() {
-        eprintln!("ffmpeg not available; skipping estimated-pan cross-decode");
+fn oracle_decodes_our_estimated_pan_global_stream_bit_exact() {
+    if !oracle_available() {
+        eprintln!("oracle binary not available; skipping estimated-pan cross-decode");
         return;
     }
     use oxideav_dirac::encoder::make_minimal_sequence;
@@ -1614,9 +1631,9 @@ fn ffmpeg_decodes_our_estimated_pan_global_stream_bit_exact() {
 /// third output shape means our wire emission of `zrs`/`zrs_exp`
 /// desynced the oracle's parser — the actual regression this guards.
 #[test]
-fn ffmpeg_estimated_affine_global_stream_characterised() {
-    if !ffmpeg_available() {
-        eprintln!("ffmpeg not available; skipping estimated-affine characterisation");
+fn oracle_estimated_affine_global_stream_characterised() {
+    if !oracle_available() {
+        eprintln!("oracle binary not available; skipping estimated-affine characterisation");
         return;
     }
     use oxideav_dirac::encoder::make_minimal_sequence;
@@ -1734,9 +1751,9 @@ fn ffmpeg_estimated_affine_global_stream_characterised() {
 /// of the same bytes; the oracle's pixel output is reported for the
 /// record, not asserted.
 #[test]
-fn ffmpeg_accepts_our_deep_preset_inter_streams_self_decode_bit_exact() {
-    if !ffmpeg_available() {
-        eprintln!("ffmpeg not available; skipping deep inter interop test");
+fn oracle_accepts_our_deep_preset_inter_streams_self_decode_bit_exact() {
+    if !oracle_available() {
+        eprintln!("oracle binary not available; skipping deep inter interop test");
         return;
     }
     use oxideav_core::Decoder;
@@ -1799,7 +1816,7 @@ fn ffmpeg_accepts_our_deep_preset_inter_streams_self_decode_bit_exact() {
         let yuv = tmpdir.join(format!("oxideav_dirac_interop_deep_inter{depth}.yuv"));
         std::fs::write(&drc, &stream).expect("write drc");
 
-        let status = std::process::Command::new("ffmpeg")
+        let status = std::process::Command::new(ORACLE_BIN)
             .args([
                 "-y",
                 "-hide_banner",
@@ -1813,13 +1830,13 @@ fn ffmpeg_accepts_our_deep_preset_inter_streams_self_decode_bit_exact() {
             .args(["-f", "rawvideo", "-pix_fmt", pix_fmt])
             .arg(&yuv)
             .status()
-            .expect("run ffmpeg");
+            .expect("run the oracle");
         assert!(
             status.success(),
-            "ffmpeg decode failed at {depth}-bit — deep inter stream malformed"
+            "the oracle decode failed at {depth}-bit — deep inter stream malformed"
         );
 
-        let out = std::fs::read(&yuv).expect("read ffmpeg yuv");
+        let out = std::fs::read(&yuv).expect("read the oracle yuv");
         let frame_words = w * h + 2 * cw * ch;
         assert_eq!(out.len(), 2 * 2 * frame_words, "{depth}-bit two-frame size");
         let words: Vec<u16> = out
@@ -1851,7 +1868,7 @@ fn ffmpeg_accepts_our_deep_preset_inter_streams_self_decode_bit_exact() {
         let p0 = psnr(&frame0[..w * h], &y0);
         let p1 = psnr(&frame1[..w * h], &y1);
         eprintln!(
-            "ffmpeg deep inter characterisation at {depth}-bit: intra Y {p0:.2} dB, \
+            "the oracle deep inter characterisation at {depth}-bit: intra Y {p0:.2} dB, \
              inter Y {p1:.2} dB (oracle deep-inter corruption expected; report-only)"
         );
 

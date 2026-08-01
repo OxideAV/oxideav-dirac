@@ -9,9 +9,12 @@
 //! * **Intra + inter** (`encode_core_intra_then_inter_stream`) — the
 //!   homogeneous-syntax replacement for `encode_intra_then_inter_stream`
 //!   in `encoder_inter.rs`. With both pictures in the same parse-code
-//!   family ffmpeg's `dirac` decoder no longer trips its
+//!   family the oracle's `dirac` decoder no longer trips its
 //!   profile-mismatch guard. Locally we still validate the inter PSNR
 //!   stays above the brief's 30 dB target.
+
+/// The black-box validator executable name (data, not a reference).
+const ORACLE_BIN: &str = "ffmpeg";
 
 use oxideav_core::CodecRegistry;
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
@@ -587,29 +590,29 @@ fn core_intra_then_two_inter_chain_decodes_each_frame() {
     );
 }
 
-/// ffmpeg cross-decode: feed a homogeneous core-syntax stream
-/// (intra `0x0C` + inter `0x09`) to ffmpeg's `dirac` decoder. With
+/// the oracle cross-decode: feed a homogeneous core-syntax stream
+/// (intra `0x0C` + inter `0x09`) to the oracle's `dirac` decoder. With
 /// both pictures in the same parse-code family the decoder no longer
 /// rejects on a profile-mismatch — this is the close-out for the
 /// round-1 soft-skip rationale in
-/// `tests/ffmpeg_interop.rs::ffmpeg_decodes_our_inter_stream_translating_square`.
+/// `tests/oracle_interop.rs::oracle_decodes_our_inter_stream_translating_square`.
 ///
 /// **Round 2 (this task / #135) is a hard assertion**, not a soft skip.
-/// ffmpeg 8.1 (verified locally) accepts the homogeneous `0x0C` + `0x09`
+/// the oracle 8.1 (verified locally) accepts the homogeneous `0x0C` + `0x09`
 /// chain end-to-end and decodes both pictures. The intra Y PSNR sits at
 /// ~52 dB (qindex = 0 + LeGall 5/3 dead-zone identity), the inter Y
 /// PSNR around ~19 dB on the translating-square fixture (cross-decode
-/// is below the brief's ≥ 30 dB self-roundtrip floor because ffmpeg's
+/// is below the brief's ≥ 30 dB self-roundtrip floor because the oracle's
 /// inter path differs from ours in OBMC overlap weighting + half-pel
 /// reference filtering — both follow-up items). The assert floor
-/// here is set deliberately low to absorb ffmpeg-version drift while
+/// here is set deliberately low to absorb the oracle-version drift while
 /// still catching framing / linkage regressions: anything above 15 dB
 /// means the MV grid, parse-code framing and intra reference all
-/// reached ffmpeg coherently.
+/// reached the oracle coherently.
 #[test]
-fn ffmpeg_decodes_our_core_intra_then_inter_stream() {
-    fn ffmpeg_available() -> bool {
-        std::process::Command::new("ffmpeg")
+fn oracle_decodes_our_core_intra_then_inter_stream() {
+    fn oracle_available() -> bool {
+        std::process::Command::new(ORACLE_BIN)
             .arg("-version")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -617,8 +620,8 @@ fn ffmpeg_decodes_our_core_intra_then_inter_stream() {
             .map(|s| s.success())
             .unwrap_or(false)
     }
-    if !ffmpeg_available() {
-        eprintln!("ffmpeg not available; skipping core-intra interop test");
+    if !oracle_available() {
+        eprintln!("the oracle not available; skipping core-intra interop test");
         return;
     }
 
@@ -646,7 +649,7 @@ fn ffmpeg_decodes_our_core_intra_then_inter_stream() {
     let yuv = tmpdir.join("oxideav_dirac_interop_core_intra_inter.yuv");
     std::fs::write(&drc, &stream).expect("write drc");
 
-    let status = std::process::Command::new("ffmpeg")
+    let status = std::process::Command::new(ORACLE_BIN)
         .args([
             "-y",
             "-hide_banner",
@@ -660,22 +663,22 @@ fn ffmpeg_decodes_our_core_intra_then_inter_stream() {
         .args(["-f", "rawvideo", "-pix_fmt", "yuv420p"])
         .arg(&yuv)
         .status()
-        .expect("run ffmpeg");
-    // No soft skip — task #135 acceptance criterion is that ffmpeg
+        .expect("run the oracle");
+    // No soft skip — task #135 acceptance criterion is that the oracle
     // accepts our homogeneous-profile stream cleanly. If this fails
     // we want a loud failure so the regression is caught immediately.
     assert!(
         status.success(),
-        "ffmpeg rejected our core-intra+inter stream — see {drc:?}; \
-         this is a regression: task #135 acceptance is that ffmpeg \
+        "the oracle rejected our core-intra+inter stream — see {drc:?}; \
+         this is a regression: task #135 acceptance is that the oracle \
          decodes the homogeneous 0x0C + 0x09 chain end-to-end"
     );
 
-    let out = std::fs::read(&yuv).expect("read ffmpeg yuv");
+    let out = std::fs::read(&yuv).expect("read the oracle yuv");
     let frame_size = 64 * 64 + 2 * 32 * 32;
     assert!(
         out.len() >= 2 * frame_size,
-        "ffmpeg produced {} bytes; expected at least {} (2 frames)",
+        "the oracle produced {} bytes; expected at least {} (2 frames)",
         out.len(),
         2 * frame_size
     );
@@ -686,28 +689,28 @@ fn ffmpeg_decodes_our_core_intra_then_inter_stream() {
     // Intra reference round-trip — qindex = 0 so this should be
     // effectively lossless on Y and U for the translating-square
     // fixture (V is constant). The brief's ≥ 30 dB floor applies
-    // here; in practice we land ~52 dB on a 2026-04 ffmpeg build.
+    // here; in practice we land ~52 dB on a 2026-04 the oracle build.
     let intra_y_psnr = psnr(&intra_yuv[..64 * 64], &y0);
-    eprintln!("ffmpeg core-intra Y PSNR: {intra_y_psnr:.2} dB");
+    eprintln!("the oracle core-intra Y PSNR: {intra_y_psnr:.2} dB");
     assert!(
         intra_y_psnr >= 30.0,
-        "ffmpeg failed to recover intra Y above 30 dB"
+        "the oracle failed to recover intra Y above 30 dB"
     );
 
     // Inter — translating square, integer-pel ME. The brief's ≥ 30 dB
-    // target applies to **self-roundtrip**; ffmpeg's inter decoder
+    // target applies to **self-roundtrip**; the oracle's inter decoder
     // differs from ours in a couple of places (OBMC overlap weighting,
     // half-pel reference interpolation) so the cross-decode floor
     // sits ~10 dB lower in r2. That's a follow-up item alongside
     // OBMC overlap reduction at the encoder. The asserts here just
     // confirm the chain doesn't collapse to noise — anything above
     // 15 dB means the MV grid, parse-code framing and intra reference
-    // all reached ffmpeg coherently.
+    // all reached the oracle coherently.
     let inter_y_psnr = psnr(&inter_yuv[..64 * 64], &y1);
-    eprintln!("ffmpeg core-inter Y PSNR: {inter_y_psnr:.2} dB");
+    eprintln!("the oracle core-inter Y PSNR: {inter_y_psnr:.2} dB");
     assert!(
         inter_y_psnr >= 15.0,
-        "ffmpeg core-inter Y PSNR {inter_y_psnr:.2} dB below 15 dB — \
+        "the oracle core-inter Y PSNR {inter_y_psnr:.2} dB below 15 dB — \
          framing or reference linkage broke"
     );
 }

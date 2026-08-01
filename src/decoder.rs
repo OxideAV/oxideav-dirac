@@ -920,7 +920,7 @@ mod tests {
 
     /// A pure 8-bit stream emits an 8-bit planar frame with
     /// stride == width (one byte per sample) — a regression guard so
-    /// the existing ffmpeg_interop decoder_produces_first_frame test
+    /// the existing oracle_interop decoder_produces_first_frame test
     /// keeps agreeing with our choice of PixelFormat::Yuv444P there.
     #[test]
     fn decoded_to_video_frame_8bit_preserves_byte_stride() {

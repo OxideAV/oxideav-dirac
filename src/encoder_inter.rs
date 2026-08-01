@@ -1352,7 +1352,7 @@ impl Default for InterEncoderParams {
         // the spec's §15.8.11 8-tap half-pel filter once for the
         // half-pel grid plus a single bilinear refinement to quarter.
         // Two OBMC refinement passes — empirically converges on the
-        // small fixtures and lifts ffmpeg cross-decode by ≥ 5 dB on
+        // small fixtures and lifts the oracle cross-decode by ≥ 5 dB on
         // the camera-pan fixture (#186 acceptance).
         // Wavelet residue on by default: LeGall 5/3 / depth 3 /
         // qindex=0. Set `residue = None` to revert to the round-1
@@ -1369,7 +1369,7 @@ impl Default for InterEncoderParams {
             // closes the convention drift that previously forced the
             // bipred path to integer-pel-only — sharp-edge blocks now keep
             // their integer MV (avoiding the 8-tap filter ringing that
-            // mismatched ffmpeg's OBMC blend by ~7 dB on complementary-bars
+            // mismatched the oracle's OBMC blend by ~7 dB on complementary-bars
             // fixtures), while smooth-motion blocks pick up the sub-pel
             // gain (+2-4 dB on camera-pan).
             bipred_mv_precision: 2,
@@ -2252,7 +2252,7 @@ pub fn obmc_refine_me<S: InterSample>(
 /// because every MV is already integer-pel.
 ///
 /// Mirrors the [`bipred_select_modes`] adaptive-precision logic landed
-/// in round-39 (which gave +4.4 dB ffmpeg cross-decode on smooth
+/// in round-39 (which gave +4.4 dB oracle cross-decode on smooth
 /// motion and +7 dB on sharp edges in the 2-ref path). Running it as a
 /// **pre-OBMC** step on the 1-ref path means the integer-pel snap is
 /// itself fed into [`obmc_refine_me`]'s neighbour_sum buffer, so OBMC
@@ -5048,7 +5048,7 @@ fn build_neighbour_sum_bipred(
 /// but the OBMC blend can prefer a different per-block mode when the
 /// neighbour grid's contribution skews the per-block recon. Mode-only
 /// candidates keep smooth-motion sub-pel MVs at the qpel grid (the
-/// camera-pan ffmpeg cross-decode floor relies on this) while
+/// camera-pan oracle cross-decode floor relies on this) while
 /// recovering the SAD-vs-OBMC-SSE gap on mid-energy content.
 ///
 /// No-op when `decisions` is empty.
@@ -5424,10 +5424,10 @@ pub fn encode_bipred_inter_picture<S: InterSample>(
 
     // Bipred uses integer-pel ME by default (bipred_mv_precision = 0).
     // Integer-pel eliminates sub-pel interpolation convention differences
-    // between our OBMC and ffmpeg's at the 2-ref blend stage, lifting
-    // ffmpeg cross-decode PSNR from ~42 dB to ~50 dB. The wavelet
+    // between our OBMC and the oracle's at the 2-ref blend stage, lifting
+    // the oracle cross-decode PSNR from ~42 dB to ~50 dB. The wavelet
     // residue closes the prediction-error loop for both our decoder and
-    // ffmpeg's — residue captures whatever integer-pel ME missed.
+    // the oracle's — residue captures whatever integer-pel ME missed.
     let bmp = params.bipred_mv_precision;
 
     // §11.2 picture_prediction_parameters.
@@ -7978,7 +7978,7 @@ mod tests {
     fn bipred_widened_candidate_set_monotonic_per_block_sad() {
         // Camera-pan triplet at qpel: ref1 at pan(0), ref2 at pan(2),
         // current at pan(1) — exact temporal midpoint, the same
-        // smooth-motion fixture the `ffmpeg_cross_decodes_camera_pan_bipred_with_subpel_gain`
+        // smooth-motion fixture the `oracle_cross_decodes_camera_pan_bipred_with_subpel_gain`
         // test exercises. Sub-pel/half-pel/int-pel candidates all
         // produce meaningfully different SADs on this fixture, so the
         // monotonicity check actually exercises the widening (rather

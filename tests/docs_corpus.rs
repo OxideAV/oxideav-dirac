@@ -3,7 +3,7 @@
 //! Each fixture under `../../docs/video/dirac/fixtures/<name>/` ships an
 //! `input.drc` (raw Dirac elementary stream — `BBCD` parse-info chain),
 //! an `expected.yuv` byte-for-byte ground truth produced by an
-//! instrumented FFmpeg `diracdec` decoder, a `notes.md` describing the
+//! instrumented build of the reference oracle decoder, a `notes.md` describing the
 //! bitstream feature focus, and a `trace.txt` (or `trace.txt.gz` when
 //! large) capturing the per-step PARSE_UNIT / SEQUENCE / PICTURE /
 //! CODE_BLOCK / MOTION events the reference decoder emitted. The
@@ -528,7 +528,7 @@ fn corpus_i_then_p_320x240() {
 
 /// Intra + 1-ref inter + bidirectional inter (parse 0x0a, num_refs=2).
 /// The 0x0a picture is in stream-order position 2 but reorders for
-/// display — ffmpeg outputs three frames in display order in the
+/// display — the oracle outputs three frames in display order in the
 /// reference YUV. Our decoder produces frames in decode order; the
 /// `decode_fixture` driver sorts them by `pts` (== `picture_number`
 /// when packets carry no explicit pts) before per-frame comparison
@@ -546,7 +546,7 @@ fn corpus_i_p_b_320x240() {
         // Bit-exact since round-128: the §12.3.6.6 Case 4 unbiased-mean
         // (`div_euclid` floor) fix for intra-block DC prediction inside
         // inter pictures. Both the P frame and the B frame now match
-        // ffmpeg byte-for-byte across all three pictures (I, P, B).
+        // the oracle byte-for-byte across all three pictures (I, P, B).
         tier: Tier::BitExact,
         bytes_per_sample: 1,
     });

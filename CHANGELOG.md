@@ -92,6 +92,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bounded termination, per-frame decode, determinism, and the
   closed-loop self-decode never rejecting the driver's own emission.
 
+### Changed
+
+- Prose hygiene sweep: all external-implementation naming in comments,
+  docs, test identifiers and historical changelog entries now refers
+  to "the (external) oracle" — the opaque black-box validator binary —
+  instead of naming it. `tests/ffmpeg_interop.rs` is renamed to
+  `tests/oracle_interop.rs` (test functions `oracle_*`); the
+  executable's on-disk name survives only as the `ORACLE_BIN`
+  invocation constant, which is launch data, not a reference.
+
 - `encoder_inter::InterSample` — sealed source-sample abstraction
   (`u8` / `u16`) over the whole inter pipeline: motion estimation
   (`full_search_me` / `subpel_search_me` / `obmc_refine_me` /
@@ -536,7 +546,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     emitter uses (`build_inter_residue_pyramids`), so rate control
     measures the true global-motion residue.
   - **External-oracle cross-decode**
-    (`tests/ffmpeg_interop.rs::ffmpeg_decodes_our_global_motion_p_stream_bit_exact`,
+    (`tests/oracle_interop.rs::oracle_decodes_our_global_motion_p_stream_bit_exact`,
     gated on validator availability): a whole-picture global-motion
     1-ref P stream (core `0x0C` anchor + `0x09` inter, constant
     `(-4, 0)` field, no MV residuals on the wire) is accepted by the
@@ -627,9 +637,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `core_intra_vlc_beats_ac_on_v_gradient` (which pinned the VLC/AC
     *contrast*) rewritten as `core_intra_vlc_and_ac_agree_at_q0`: both
     entropy coders now reconstruct bit-exactly at qindex 0;
-  - the bipred camera-pan ffmpeg cross-decode integer-pel baseline went
+  - the bipred camera-pan oracle cross-decode integer-pel baseline went
     from ~50 dB to **bit-exact (∞ dB)** —
-    `ffmpeg_cross_decodes_camera_pan_bipred_with_subpel_gain`'s
+    `oracle_cross_decodes_camera_pan_bipred_with_subpel_gain`'s
     "qpel beats int by ≥ 2 dB" premise was vacuous against a lossless
     baseline and is rewritten as a ≥ 60 dB floor on both variants;
   - sub-4×4-sample (and 1×1-sample) codeblocks in the §11.3.3 spatial
@@ -1539,7 +1549,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     already optimal (`row_mut` slice + single `data.iter_mut()`).
   - Bit-exactness preserved: all 14 wavelet unit tests pass, including
     the 7-filter × depth-{1,2,3} `dwt_idwt_roundtrip_all_filters_all_depths`
-    invariant and the all-filter ffmpeg cross-decode interop tests
+    invariant and the all-filter oracle cross-decode interop tests
     (Dirac-default DD9/7, LeGall 5/3, DD13/7, Haar0/1, Fidelity,
     Daubechies 9/7). Crate-wide test count unchanged at 338, all green.
   - Measured (M2, --measurement-time 3, criterion 100-sample baseline
@@ -2105,7 +2115,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     **73.90 dB Y** + **54.70 dB UV** aggregate, 99.62% pixel-exact.
   The residual ~1% pixel gap on each is the OBMC convention edge case
   (decoder rounds the §15.8.5 weighted-sum reconstruction one LSB
-  differently from ffmpeg on a small fraction of block edges), not the
+  differently from the oracle on a small fraction of block edges), not the
   inverse-quant offset. Eight new unit tests in
   `quant::tests` (offset agreement at low `q`, intra-dominates-inter
   invariant, reconstruction-interval invariant, inverse_quant
@@ -2185,7 +2195,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `(s0 + … + s_{n-1} + (n // 2)) // n`, i.e. `(a + b + c + 1) // 3` with
   floor division. The missing `+1` left every intra picture's level-0 LL
   band ~1 LSB off after the IDWT. With the fix, **all five intra-only
-  docs-corpus fixtures now decode bit-exactly against the ffmpeg
+  docs-corpus fixtures now decode bit-exactly against the oracle
   reference** — `i-only-tiny`, `vc2-low-delay-tiny`,
   `vc2-low-delay-3pics`, `interlaced-720x576-i-only` (depth-4 IDWT) and
   `chroma-422-720x576` (4:2:2) — up from ~48–52 dB PSNR; their
@@ -2366,7 +2376,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gap between the selector's SAD-against-source metric and the
   decoder's OBMC-SSE-against-source reconstruction cost without
   disturbing the MV grid (so smooth-motion sub-pel choices are
-  preserved — the camera-pan ffmpeg cross-decode floor is unchanged
+  preserved — the camera-pan oracle cross-decode floor is unchanged
   at ~53 dB). New public function
   `oxideav_dirac::encoder_inter::bipred_post_obmc_refine_modes`
   (mirrors the shape of `inter_select_int_pel_per_block`). New
@@ -2430,7 +2440,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `bipred_widened_set_half_pel_favourable_self_roundtrip_no_residue`,
   measuring +12.23 dB Y self-roundtrip uplift over the int-pel-only
   ceiling (30.36 → 42.59 dB, residue OFF). The pre-existing
-  `ffmpeg_cross_decodes_camera_pan_bipred_with_subpel_gain` test
+  `oracle_cross_decodes_camera_pan_bipred_with_subpel_gain` test
   shows the round-39 fixture is unchanged (52.53 dB → 52.53 dB) —
   the SAD landscape on cosine-shaped pan-by-1-pel content was
   already converged on the qpel grid, so the new half-pel
@@ -2510,7 +2520,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - drop dead `linkme` dep
 - bipred encoder: per-block adaptive sub-pel-vs-int-pel selection (qpel default, +4.4 dB on smooth motion)
 - registry calls: rename make_decoder/make_encoder → first_decoder/first_encoder
-- bipred encoder: integer-pel ME lifts ffmpeg cross-decode from 42 to ~50 dB
+- bipred encoder: integer-pel ME lifts the oracle cross-decode from 42 to ~50 dB
 - auto-register via oxideav_core::register! macro (linkme distributed slice)
 - unify entry point on register(&mut RuntimeContext) ([#502](https://github.com/OxideAV/oxideav-dirac/pull/502))
 
@@ -2519,10 +2529,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bipred B-picture encoder (`encode_bipred_inter_picture`) now uses
   **integer-pel ME** by default (`bipred_mv_precision = 0`). Quarter-pel
   ME produced an ~8 dB cross-decode penalty because our half-pel
-  interpolation convention differs from ffmpeg's at the 2-ref OBMC blend
+  interpolation convention differs from the oracle's at the 2-ref OBMC blend
   stage, accumulating across blocks. Integer-pel eliminates all
   convention differences; the wavelet residue then closes the
-  prediction-error loop exactly. ffmpeg cross-decode PSNR on the
+  prediction-error loop exactly. Oracle cross-decode PSNR on the
   complementary-bar fixture improves from ~42 dB to ~50 dB. The 1-ref
   (P-picture) path is unaffected and continues to default to
   quarter-pel (`mv_precision = 2`).
@@ -2538,13 +2548,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
-- 2-ref bipred B-picture encoder + decoder fix (42 dB ffmpeg)
+- 2-ref bipred B-picture encoder + decoder fix (42 dB oracle cross-decode)
 
 ## [0.0.4](https://github.com/OxideAV/oxideav-dirac/compare/v0.0.3...v0.0.4) - 2026-05-05
 
 ### Other
 
-- encoder-side §11.3 wavelet residue (~+15 dB ffmpeg cross-decode)
+- encoder-side §11.3 wavelet residue (~+15 dB oracle cross-decode)
 - accept VC-2 LD parse code 0x88 (SD-Profile variant)
 - docs_corpus driver compares frames in display order
 - panic-safe i32/u32 sums in inter motion-data + OBMC paths
@@ -2553,7 +2563,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - migrate to centralized OxideAV/.github reusable workflows
 - inter encoder OBMC-aware ME refinement ([#186](https://github.com/OxideAV/oxideav-dirac/pull/186))
 - inter encoder sub-pel ME ([#168](https://github.com/OxideAV/oxideav-dirac/pull/168))
-- hard-assert ffmpeg I+P interop on homogeneous core-syntax chain
+- hard-assert oracle I+P interop on homogeneous core-syntax chain
 - core-syntax intra encoder (round 2) — 0x0C AC ref
 - inter encoder (round 1) — 1-ref OBMC + arith encoder
 - adopt slim VideoFrame/AudioFrame shape
@@ -2584,11 +2594,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Self-roundtrip residue ON: ∞ dB (bit-exact)** at qindex = 0.
   - **Self-roundtrip residue OFF: 32.60 dB bipred vs 20.18 dB 1-ref**
     (+12 dB, hard-asserted A/B).
-  - **ffmpeg cross-decode: 42.27 dB Y** on the bipred B picture
+  - **oracle cross-decode: 42.27 dB Y** on the bipred B picture
     (hard-asserted, vs 25 dB defensive floor).
   6 new tests in `tests/encoder_bipred_roundtrip.rs` (block-motion-data
   roundtrip, constant-frames smoke, mode-count diagnostic, no-residue
-  A/B, residue-on self-roundtrip, ffmpeg cross-decode); all 188 dirac
+  A/B, residue-on self-roundtrip, the oracle cross-decode); all 188 dirac
   tests pass.
 
 ### Fixed
@@ -2630,11 +2640,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   LeGall 5/3 the inter self-roundtrip is **bit-exact (∞ dB)** on
   `synthetic_translating_pair_64(4, 0)`, `(0, -4)`, `(0, 0)` and
   `synthetic_camera_pan_64(1, 0)` — the residue captures everything
-  ME / OBMC couldn't reach. ffmpeg cross-decode jumps from
+  ME / OBMC couldn't reach. Oracle cross-decode jumps from
   **19.39 dB → 34.38 dB** (~+15 dB) on the `+4`-pel translating-square
-  homogeneous-profile chain (`tests/ffmpeg_interop.rs::ffmpeg_cross_decodes_inter_residue_beats_no_residue`,
+  homogeneous-profile chain (`tests/oracle_interop.rs::oracle_cross_decodes_inter_residue_beats_no_residue`,
   hard-asserted). 7 new tests (4 unit + 3 self-roundtrip / cross-decode
-  including 1 hard ffmpeg assert); all 182 dirac tests pass.
+  including 1 hard oracle assert); all 182 dirac tests pass.
   Existing OBMC / sub-pel tests now explicitly set `residue: None`
   in the no-residue baseline so they keep measuring pure ME quality.
 
@@ -2644,10 +2654,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `0x88`-family: `0x89`, `0x8C`, `0x8D`) now decode through the
   low-delay path. The decoder previously only recognised the `0xC8`
   family and rejected the `0x88` family with "unsupported core-syntax
-  parse code" — but `0x88` is the parse code that real ffmpeg /
-  libschroedinger `vc2enc` emits for VC-2 SD-Profile (the in-tree
+  parse code" — but `0x88` is the parse code real-world VC-2
+  SD-Profile encoders emit (the in-tree
   `corpus_vc2_low_delay_tiny_320x240` and `corpus_vc2_low_delay_3pics_320x240`
-  fixtures, sliced from a vc2enc stream, both use it). Both LD
+  fixtures, sliced from an oracle-produced stream, both use it). Both LD
   variants share the Golomb-coded slice path so accepting both cost
   one extra mask. Per Dirac BBC §9.5.1 + VC-2 ST 2042-1 Table 10.1,
   `bit 6` distinguishes the two LD encodings (legacy vs AC-coded
@@ -2686,7 +2696,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   prediction). The `corpus_i_p_b_320x240` ReportOnly fixture now
   decodes end-to-end (intra ≈ 48.79 dB Y, ref-1 inter ≈ 19.68 dB Y,
   bipred ≈ 7.25 dB Y — the bipred floor is the known
-  ffmpeg-OBMC-convention gap, not the panic).
+  the oracle's OBMC-convention gap, not the panic).
 
 ### Added
 
@@ -2704,14 +2714,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dramatic — `synthetic_translating_pair_64(2,-1)` jumps from
   **32.56 dB** (no-OBMC baseline) to **∞ dB** (bit-exact); the vertical
   `(0,-4)` translation goes 30.24 → 33.37 dB; the integer camera-pan
-  goes 26.92 → 28.02 dB. ffmpeg cross-decode is structurally capped
+  goes 26.92 → 28.02 dB. Oracle cross-decode is structurally capped
   near 19-20 dB on these synthetic fixtures regardless of MV quality
-  (independent ffmpeg-side OBMC convention difference, documented in
-  `tests/ffmpeg_interop.rs`); the new `ffmpeg_obmc_aware_me_does_not_regress_cross_decode`
+  (independent oracle-side OBMC convention difference, documented in
+  `tests/oracle_interop.rs`); the new `oracle_obmc_aware_me_does_not_regress_cross_decode`
   test asserts no cross-decode regression vs the no-OBMC baseline.
   Setting `obmc_refine_passes = 0` reverts to the pre-#186 hard-block
   SAD output for direct A/B comparison. 4 new tests (2 unit + 1
-  self-roundtrip A/B + 1 ffmpeg cross-decode floor); all 165 dirac
+  self-roundtrip A/B + 1 oracle cross-decode floor); all 165 dirac
   tests pass.
 
 - Dirac inter encoder **sub-pel ME** (#168) — `encoder_inter` now runs
@@ -2724,25 +2734,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `synthetic_camera_pan_64` fixture with a vertical-bar pattern panned
   by a configurable quarter-pel offset exposes the gain: self-roundtrip
   Y PSNR jumps from **26.92 dB** (integer-pel) to **52.04 dB**
-  (quarter-pel) on a 1/4-pel pan. ffmpeg cross-decode improves modestly
+  (quarter-pel) on a 1/4-pel pan. Oracle cross-decode improves modestly
   (~1 dB) — that gap will widen once OBMC overlap encoding lands
-  (#169). 5 new tests (3 unit + 1 self-roundtrip + 1 ffmpeg
+  (#169). 5 new tests (3 unit + 1 self-roundtrip + 1 oracle
   cross-decode); all 161 dirac tests pass. `mv_precision` is also
   exposed via `InterEncoderParams` so callers can pick integer-pel
   (`0`), half- (`1`), quarter- (`2`, default), or eighth-pel (`3`).
 
 ### Changed
 
-- ffmpeg interop hard-asserts the homogeneous core-syntax I+P chain
-  (#135). The legacy `tests/ffmpeg_interop.rs::ffmpeg_decodes_our_inter_stream_translating_square`
+- oracle interop hard-asserts the homogeneous core-syntax I+P chain
+  (#135). The legacy `tests/oracle_interop.rs::oracle_decodes_our_inter_stream_translating_square`
   now drives `encode_core_intra_then_inter_stream` instead of the
   mixed HQ-intra + core-inter `encode_intra_then_inter_stream`, so the
-  stream is single-profile (parse codes `0x0C` + `0x09`) and ffmpeg's
+  stream is single-profile (parse codes `0x0C` + `0x09`) and the oracle's
   `dirac` decoder no longer trips its profile-mismatch guard. Both this
   test and the round-2 close-out
-  `tests/encoder_intra_core_roundtrip.rs::ffmpeg_decodes_our_core_intra_then_inter_stream`
-  are now hard asserts (no soft-skip on ffmpeg rejection). Verified
-  against ffmpeg 8.1: intra Y PSNR ≈ 52 dB, inter Y PSNR ≈ 19 dB
+  `tests/encoder_intra_core_roundtrip.rs::oracle_decodes_our_core_intra_then_inter_stream`
+  are now hard asserts (no soft-skip on the oracle rejection). Verified
+  against oracle release 8.1: intra Y PSNR ≈ 52 dB, inter Y PSNR ≈ 19 dB
   cross-decoded on the translating-square 64x64 fixture.
 
 ### Added
@@ -2753,12 +2763,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   matrix, qindex=0 near-lossless). The new
   `encode_core_intra_then_inter_stream` chains a `0x0C` intra reference
   with the round-1 `0x09` inter so the entire stream stays in one
-  parse-code family. ffmpeg's `dirac` decoder no longer rejects the
-  chain (the round-1 ffmpeg-interop soft-skip closes here): cross-
+  parse-code family. The oracle's `dirac` decoder no longer rejects the
+  chain (the round-1 oracle-interop soft-skip closes here): cross-
   decoded intra Y PSNR ≈ 52 dB on a translating-square 64x64 fixture.
   Self-roundtrip is bit-exact on flat pictures and ≥48 dB Y/U on the
   testsrc gradient. 6 new unit tests + 4 new integration tests
-  (`tests/encoder_intra_core_roundtrip.rs`) including a hard ffmpeg
+  (`tests/encoder_intra_core_roundtrip.rs`) including a hard oracle
   cross-decode (no soft-skip).
 
 - Dirac core-syntax **inter encoder** (round 1) — `encoder_inter` module
@@ -2769,7 +2779,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   64x64 fixture clears 30 dB Y PSNR (vertical & horizontal motion);
   zero-motion is bit-exact (∞ dB). 14 new tests including a full
   encoder→decoder integration suite (`tests/encoder_inter_roundtrip.rs`)
-  and a soft-skip ffmpeg cross-decode (waits on r2 core-syntax intra).
+  and a soft-skip oracle cross-decode (waits on r2 core-syntax intra).
 - `arith::ArithEncoder` — Annex B.2 binary arithmetic encoder mirror
   of the existing `ArithDecoder`, with E1/E2/E3 carry handling and a
   conservative termination that keeps the decoder's past-end-1
@@ -2786,14 +2796,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
-- fix LD slice_y_length field width — ffmpeg-bit-exact
-- ffmpeg interop — HQ lossless, LD accepted, profile/preset fit
+- fix LD slice_y_length field width — oracle-bit-exact
+- oracle interop — HQ lossless, LD accepted, profile/preset fit
 - crate-wide fmt + clippy cleanup
 - VC-2 LD (Low-Delay) intra-only encoder
-- ffmpeg-interop test for 8-bit 4:2:2
+- oracle-interop test for 8-bit 4:2:2
 - 10/12-bit output + frame-rate-aware timebase
 - inter-picture decode with OBMC motion compensation
-- dirac encoder: ffmpeg-compatible headers + self-roundtrip (step 6)
+- dirac encoder: oracle-compatible headers + self-roundtrip (step 6)
 - dirac encoder: bitwriter + HQ sequence/picture emit (steps 2-5)
 - dirac encoder: forward wavelet analysis (step 1/5)
 - update lib docs to reflect core-syntax support

@@ -1049,7 +1049,7 @@ pub(crate) fn decode_ld_slice(
     }
     let total_bits = 8u64 * slice_n_bytes as u64;
     let qindex = r.read_nbits(7);
-    // See `crate::encoder::ld_length_bits` — ffmpeg / SMPTE VC-2 reads
+    // See `crate::encoder::ld_length_bits` — the oracle / SMPTE VC-2 reads
     // `slice_y_length` as `floor(log2(total_bits)) + 1` raw bits.
     let length_bits = crate::encoder::ld_length_bits(slice_n_bytes);
     let slice_y_length = r.read_nbits(length_bits) as u64;
@@ -1380,9 +1380,9 @@ mod tests {
     }
 
     /// LD parse codes: 0x88 (VC-2 SD-Profile / legacy), 0xC8 (AC-coded
-    /// variant), and their reference siblings 0x8C / 0xCC. Real ffmpeg
-    /// `vc2enc` output uses 0x88 — the in-tree `corpus_vc2_low_delay_*`
-    /// fixtures sliced from a vc2enc-produced stream were rejected as
+    /// variant), and their reference siblings 0x8C / 0xCC. Real oracle
+    /// VC-2-encoder output uses 0x88 — the in-tree `corpus_vc2_low_delay_*`
+    /// fixtures sliced from an oracle-produced stream were rejected as
     /// "unsupported core-syntax parse code" until the `0x88` family
     /// was admitted. HQ is parse 0xE8 and must NOT be misclassified as
     /// LD; core-syntax parse 0x08 must remain unmatched here.
