@@ -77,6 +77,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   P-chain degeneracy), the reference wiring, q0 bit-exactness through
   the coded→display mapping, the mixed-kind CBR accumulator law, and
   lossy decodability.
+- Deep-colour coverage of the chained drivers
+  (`tests/encoder_inter_gop_deep.rs`): 10- and 16-bit closed-loop
+  P-chains and a 16-bit I/P/B GOP round-trip **bit-exactly** at
+  residue qindex 0 on `&[u16]` sources (full-range §10.3.8 presets);
+  the CBR accumulator law holds across a deep mixed P/B report and a
+  tight 16-bit chain budget escalates qindex while remaining
+  decodable on the `Yuv420P16Le` output surface.
 
 - `encoder_inter::InterSample` — sealed source-sample abstraction
   (`u8` / `u16`) over the whole inter pipeline: motion estimation
