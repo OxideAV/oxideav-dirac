@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Legacy container-tag co-claim: `register_codecs` now declares all
+  three registered container codes for this bitstream syntax —
+  Matroska `V_DIRAC`, the MP4/QuickTime sample entry `drac` (already
+  claimed) and MP4 ObjectTypeIndication `0xA4` — with a confidence
+  probe (`container_tag_probe`) that resolves the shared-tag contest
+  against a dedicated VC-2-profile registration by bitstream evidence:
+  core-syntax (long-GOP era) picture units probe strong (`0.95`,
+  strictly above the VC-2 side's deliberately weak `0.25` long-GOP
+  claim), intra-profile-only (LD/HQ/fragment) units probe weak but
+  nonzero (`0.3`, so a dedicated VC-2 registration outranks us on its
+  home turf while this crate still claims such streams when it is
+  absent), no evidence probes the legacy-owner default (`0.5`), and
+  non-`BBCD` bytes probe `0.0`. The probe walks parse-info units with
+  a bounded hop count, trusts sane `next_parse_offset` values and
+  falls back to prefix scanning on truncated or unpatched offsets.
+  `tests/container_tags.rs` pins the whole contract, including
+  registry-level resolution with packet evidence.
+
 - `encoder_inter::InterSample` — sealed source-sample abstraction
   (`u8` / `u16`) over the whole inter pipeline: motion estimation
   (`full_search_me` / `subpel_search_me` / `obmc_refine_me` /

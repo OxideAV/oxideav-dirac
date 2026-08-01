@@ -231,11 +231,119 @@ pub mod video_format;
 #[doc(hidden)]
 pub mod wavelet;
 
-use oxideav_core::{CodecCapabilities, CodecId, CodecTag};
+use oxideav_core::{CodecCapabilities, CodecId, CodecTag, Confidence, ProbeContext};
 use oxideav_core::{CodecInfo, CodecRegistry, RuntimeContext};
 
 /// Canonical oxideav codec id.
 pub const CODEC_ID_STR: &str = "dirac";
+
+/// Probe confidence when the packet/header bytes carry core-syntax
+/// (long-GOP era) picture evidence — inter pictures or arithmetic/VLC
+/// core-syntax intra. This is the syntax family only this codec id
+/// implements, so the claim is near-certain. Kept below `1.0` so an
+/// exact-match future claim could still outrank it, and well above the
+/// deliberately weak long-GOP claim a VC-2-profile registration makes
+/// on the same shared legacy tags.
+#[doc(hidden)]
+pub const PROBE_CONFIDENCE_LONG_GOP: Confidence = 0.95;
+
+/// Probe confidence when no packet or header bytes are available at
+/// resolution time (the common stream-discovery case — the Matroska
+/// registration for this codec carries no CodecPrivate at all). The
+/// legacy container codes (`V_DIRAC`, `drac`, ObjectType `0xA4`) are
+/// registered to Dirac itself, so absent contrary evidence this crate
+/// is the default owner — but the middling value leaves room for a
+/// claim with real bitstream evidence to win.
+#[doc(hidden)]
+pub const PROBE_CONFIDENCE_NO_EVIDENCE: Confidence = 0.5;
+
+/// Probe confidence when the bytes show only intra-profile (LD / HQ /
+/// fragmented) pictures — the VC-2 flavour of the shared syntax. This
+/// crate decodes those streams end-to-end, so the claim stays nonzero
+/// (it must win when no dedicated VC-2 registration is present), but
+/// it is deliberately weak so a dedicated VC-2-profile registration
+/// outranks it on its home turf.
+#[doc(hidden)]
+pub const PROBE_CONFIDENCE_INTRA_PROFILE: Confidence = 0.3;
+
+/// Upper bound on parse-info hops the probe will follow. A probe runs
+/// per candidate registration at stream-discovery time; evidence, if
+/// present at all, is in the first few data units.
+const PROBE_MAX_UNITS: usize = 64;
+
+/// Confidence probe for the shared legacy container tags.
+///
+/// Matroska `V_DIRAC`, the MP4 sample entry `drac` and MP4
+/// ObjectTypeIndication `0xA4` are registered container codes for
+/// Dirac; VC-2 (the intra-only profile family of the same bitstream
+/// syntax) has no container codes of its own and rides under them.
+/// Both this crate and a dedicated VC-2-profile crate may therefore
+/// claim the same tags; the registry resolves the contest by probe
+/// strength:
+///
+/// * core-syntax picture evidence (parse-code bit 7 clear, bit 3 set —
+///   inter pictures and AC/VLC core-syntax intra, the long-GOP era
+///   syntax) → [`PROBE_CONFIDENCE_LONG_GOP`]: this crate wins;
+/// * only intra-profile pictures (LD / HQ / fragments, parse-code bit
+///   7 set) → [`PROBE_CONFIDENCE_INTRA_PROFILE`]: a dedicated VC-2
+///   registration outranks us, but we still claim the stream when it
+///   is absent;
+/// * no packet/header bytes, or units without pictures →
+///   [`PROBE_CONFIDENCE_NO_EVIDENCE`]: legacy-owner default;
+/// * bytes present but no `BBCD` parse-info structure at all → `0.0`
+///   (not this bitstream syntax).
+// internal — exposed for tests; registered via `CodecInfo::probe`
+#[doc(hidden)]
+pub fn container_tag_probe(ctx: &ProbeContext) -> Confidence {
+    // Prefer real packet bytes; fall back to the container-level
+    // stream-format blob (some carriage formats copy the head of the
+    // elementary stream there). Empty blobs count as "no evidence":
+    // the Matroska registration explicitly has no initialization data.
+    let data = match (ctx.packet, ctx.header) {
+        (Some(p), _) if !p.is_empty() => p,
+        (_, Some(h)) if !h.is_empty() => h,
+        _ => return PROBE_CONFIDENCE_NO_EVIDENCE,
+    };
+
+    let mut pos = match parse_info::ParseInfo::find_next(data, 0) {
+        Some(p) => p,
+        None => return 0.0,
+    };
+    let mut saw_unit = false;
+    let mut saw_intra_profile_picture = false;
+    for _ in 0..PROBE_MAX_UNITS {
+        let Some(pi) = parse_info::ParseInfo::parse(data, pos) else {
+            break;
+        };
+        saw_unit = true;
+        if pi.is_picture() {
+            if pi.is_core_syntax() {
+                // Long-GOP era syntax — decisive.
+                return PROBE_CONFIDENCE_LONG_GOP;
+            }
+            saw_intra_profile_picture = true;
+        }
+        // Advance: trust a sane next_parse_offset, otherwise scan for
+        // the next prefix (offsets may be zero on the last unit or on
+        // streams written without back-patching).
+        let next = pi.next_parse_offset as usize;
+        pos = if next >= parse_info::ParseInfo::SIZE && pos + next <= data.len() {
+            pos + next
+        } else {
+            match parse_info::ParseInfo::find_next(data, pos + 1) {
+                Some(p) => p,
+                None => break,
+            }
+        };
+    }
+    if saw_intra_profile_picture {
+        PROBE_CONFIDENCE_INTRA_PROFILE
+    } else if saw_unit {
+        PROBE_CONFIDENCE_NO_EVIDENCE
+    } else {
+        0.0
+    }
+}
 
 /// Register the Dirac decoder with a codec registry.
 pub fn register_codecs(reg: &mut CodecRegistry) {
@@ -248,10 +356,19 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
         CodecInfo::new(CodecId::new(CODEC_ID_STR))
             .capabilities(caps)
             .decoder(decoder::make_decoder)
-            // Dirac-in-MP4 / MKV / MXF uses the `drac` sample entry
-            // FourCC. Raw elementary streams carry no FourCC on their
-            // own; the container tag is what the registry matches on.
-            .tag(CodecTag::fourcc(b"drac")),
+            // The registered legacy container codes for this bitstream
+            // syntax; VC-2 has none of its own and rides under them
+            // (the Matroska registry entry says so explicitly, and the
+            // MP4RA registry has no VC-2 sample entry). Raw elementary
+            // streams carry no tag; the container code is what the
+            // registry matches on. The probe resolves the co-claim
+            // contest with a VC-2-profile registration by evidence.
+            .tags([
+                CodecTag::fourcc(b"drac"),
+                CodecTag::matroska("V_DIRAC"),
+                CodecTag::mp4_object_type(0xA4),
+            ])
+            .probe(container_tag_probe),
     );
 }
 

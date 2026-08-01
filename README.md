@@ -50,6 +50,20 @@ fixture corpus (12 fixtures, 8-bit through 16-bit deep colour) decodes
 
 `"dirac"`. Register with `oxideav_dirac::register(&mut codecs)`.
 
+### Container tags
+
+The crate claims the three registered legacy container codes for this
+bitstream syntax: Matroska `V_DIRAC`, the MP4/QuickTime sample entry
+`drac`, and MP4 ObjectTypeIndication `0xA4`. VC-2 has no container
+codes of its own and rides under the same tags, so a dedicated
+VC-2-profile crate co-claims them; the registry resolves the contest
+through each side's confidence probe. This crate's probe answers
+strong (`0.95`) on core-syntax (long-GOP era) picture evidence, weak
+but nonzero (`0.3`) on intra-profile-only (LD/HQ/fragment) evidence so
+a dedicated VC-2 registration wins its home streams, `0.5` with no
+evidence (legacy-owner default), and `0.0` on bytes that are not this
+syntax.
+
 ## Scope & clean-room provenance
 
 - **Source of truth**: the BBC Dirac Specification v2.2.3 (2008),
