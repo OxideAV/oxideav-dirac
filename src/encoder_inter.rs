@@ -6256,6 +6256,326 @@ pub fn encode_inter_p_chain_with_residue_target_report<S: InterSample>(
     (out, report)
 }
 
+// ---- GOP-structured (I / P / B) sequence driver ----------------------
+
+/// GOP shape for [`encode_inter_gop_with_residue_target`]: how many
+/// non-reference bipred B pictures sit between consecutive reference
+/// pictures. `0` degenerates to a pure reference-P chain (the same
+/// stream shape as [`encode_inter_p_chain_with_residue_target`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GopStructure {
+    /// Number of B pictures between consecutive reference pictures
+    /// (and between the intra anchor and the first reference P).
+    pub b_between_refs: u32,
+}
+
+/// What role a picture played in a GOP-structured stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GopPictureKind {
+    /// 1-ref **reference** inter picture (`0x0D`) referencing the
+    /// previous reference in coded order.
+    ReferenceP,
+    /// 2-ref non-reference bipred picture (`0x0A`) referencing the
+    /// two enclosing reference pictures (past = ref1, future = ref2).
+    BipredB,
+    /// 1-ref non-reference picture (`0x09`) at the tail of the input
+    /// when the remaining frames cannot complete a `[B…, P]` group;
+    /// references the last reference picture.
+    TrailingP,
+}
+
+/// Per-picture telemetry from
+/// [`encode_inter_gop_with_residue_target_report`] — the GOP analogue
+/// of [`InterPictureRate`], with the picture's role and (for B
+/// pictures) the second reference.
+#[derive(Debug, Clone, Copy)]
+pub struct GopPictureRate {
+    /// Role of this picture in the GOP.
+    pub kind: GopPictureKind,
+    /// Picture number written into the picture header.
+    pub picture_number: u32,
+    /// First (past) reference picture number.
+    pub ref1_picture_number: u32,
+    /// Second (future) reference picture number — B pictures only.
+    pub ref2_picture_number: Option<u32>,
+    /// Residue budget requested for this picture after the
+    /// [`InterRateControl`] adjustment.
+    pub requested_residue_bytes: u32,
+    /// Actual serialised §11.3 residue bytes at the chosen qindex.
+    pub actual_residue_bytes: u32,
+    /// Residue qindex chosen by the matching picker.
+    pub qindex: u32,
+    /// Running `Σ(actual − target)` after this picture (post-clamp).
+    pub running_surplus_bytes: i64,
+    /// Auto-global-motion fraction (reference P pictures only).
+    pub global_fraction: Option<f64>,
+    /// Whether the auto global estimate was applied (P pictures only).
+    pub global_applied: bool,
+}
+
+/// Encode a **GOP-structured** core-syntax inter sequence: an HQ intra
+/// anchor (`0xEC`), then repeating `[B × b_between_refs, P]` groups in
+/// display order — emitted in **coded order** (each reference P before
+/// the B pictures that need it), the classic
+/// `I B P B P …` long-GOP shape:
+///
+/// * reference P pictures (`0x0D`) reference the previous reference in
+///   the chain and are reconstructed **closed-loop** (the encoder
+///   decodes its own emission and references the reconstruction, as in
+///   [`encode_inter_p_chain_with_residue_target`]);
+/// * B pictures (`0x0A`, non-reference) reference the two enclosing
+///   reconstructions — past reference as ref1, future reference as
+///   ref2 — with per-picture residue qindex from
+///   [`pick_bipred_residue_qindex`];
+/// * input frames past the last complete group are emitted as
+///   non-reference 1-ref P (`0x09`) against the last reference.
+///
+/// One residue-byte rate-control accumulator (`target_residue_bytes` +
+/// [`InterRateControl`], all four variants) spans every inter picture
+/// in coded order, P and B alike. Per-picture auto global motion runs
+/// on the 1-ref pictures (reference and trailing); B pictures honour
+/// an explicit [`InterEncoderParams::global_motion`] config but skip
+/// the auto estimate. Decoded frames come out of
+/// [`crate::decoder::DiracDecoder`] in **coded order**; each frame's
+/// picture number carries its display position.
+pub fn encode_inter_gop_with_residue_target<S: InterSample>(
+    sequence: &SequenceHeader,
+    intra_params: &crate::encoder::EncoderParams,
+    inter_params: &InterEncoderParams,
+    frames: &[InterInputPicture<'_, S>],
+    gop: GopStructure,
+    target_residue_bytes: u32,
+    mode: InterRateControl,
+) -> Vec<u8> {
+    let (stream, _report) = encode_inter_gop_with_residue_target_report(
+        sequence,
+        intra_params,
+        inter_params,
+        frames,
+        gop,
+        target_residue_bytes,
+        mode,
+    );
+    stream
+}
+
+/// [`encode_inter_gop_with_residue_target`] plus per-picture telemetry
+/// in **coded order** (one [`GopPictureRate`] per inter picture).
+pub fn encode_inter_gop_with_residue_target_report<S: InterSample>(
+    sequence: &SequenceHeader,
+    intra_params: &crate::encoder::EncoderParams,
+    inter_params: &InterEncoderParams,
+    frames: &[InterInputPicture<'_, S>],
+    gop: GopStructure,
+    target_residue_bytes: u32,
+    mode: InterRateControl,
+) -> (Vec<u8>, Vec<GopPictureRate>) {
+    let pi_size = 13usize;
+    let sh_payload = crate::encoder::encode_sequence_header(sequence);
+    let sh_unit_len = (pi_size + sh_payload.len()) as u32;
+
+    let mut out = Vec::new();
+    write_parse_info(&mut out, 0x00, sh_unit_len, 0);
+    out.extend_from_slice(&sh_payload);
+    let mut prev_unit_len = sh_unit_len;
+
+    let mut report: Vec<GopPictureRate> = Vec::new();
+
+    let Some((anchor, rest)) = frames.split_first() else {
+        write_parse_info(&mut out, 0x10, 0, prev_unit_len);
+        return (out, report);
+    };
+
+    let anchor_payload = S::encode_hq_intra_anchor(
+        sequence,
+        intra_params,
+        anchor.picture_number,
+        anchor.y,
+        anchor.u,
+        anchor.v,
+    );
+    let anchor_unit_len = (pi_size + anchor_payload.len()) as u32;
+    write_parse_info(&mut out, 0xEC, anchor_unit_len, prev_unit_len);
+    out.extend_from_slice(&anchor_payload);
+    prev_unit_len = anchor_unit_len;
+
+    let mut refs: Vec<crate::picture::ReferencePicture> = Vec::new();
+    let mut prev_ref: ChainReference<S> =
+        reconstruct_chain_reference(sequence, &mut refs, &anchor_payload, 0xEC);
+
+    let mut carry: i64 = 0;
+    let group = gop.b_between_refs as usize + 1; // Bs + the closing P.
+    let mut idx = 0usize;
+
+    // Emit one 1-ref picture (reference 0x0D or trailing 0x09) with
+    // rate control; shared by the group path and the tail path.
+    let emit_one_ref_picture = |pic: &InterInputPicture<'_, S>,
+                                is_reference: bool,
+                                prev_ref: &ChainReference<S>,
+                                carry: &mut i64,
+                                out: &mut Vec<u8>,
+                                prev_unit_len: &mut u32,
+                                report: &mut Vec<GopPictureRate>|
+     -> Vec<u8> {
+        let requested = residue_rate_request(mode, target_residue_bytes, *carry);
+        let (mut pic_params, global_fraction, global_applied) =
+            resolve_per_picture_params(sequence, inter_params, pic.y, &prev_ref.y);
+        let (qindex, actual_residue) = inter_residue_qindex_diagnostic(
+            sequence,
+            &pic_params,
+            pic.y,
+            pic.u,
+            pic.v,
+            &prev_ref.y,
+            &prev_ref.u,
+            &prev_ref.v,
+            requested,
+        );
+        if let Some(ref rp) = inter_params.residue {
+            let mut rp = rp.clone();
+            rp.qindex = qindex;
+            pic_params.residue = Some(rp);
+        }
+        let payload = encode_inter_picture_impl(
+            sequence,
+            &pic_params,
+            pic.picture_number,
+            prev_ref.picture_number,
+            pic.y,
+            pic.u,
+            pic.v,
+            &prev_ref.y,
+            &prev_ref.u,
+            &prev_ref.v,
+            is_reference,
+        );
+        let unit_len = (pi_size + payload.len()) as u32;
+        let parse_code = if is_reference { 0x0D } else { 0x09 };
+        write_parse_info(out, parse_code, unit_len, *prev_unit_len);
+        out.extend_from_slice(&payload);
+        *prev_unit_len = unit_len;
+
+        residue_rate_fold(mode, target_residue_bytes, carry, actual_residue);
+        report.push(GopPictureRate {
+            kind: if is_reference {
+                GopPictureKind::ReferenceP
+            } else {
+                GopPictureKind::TrailingP
+            },
+            picture_number: pic.picture_number,
+            ref1_picture_number: prev_ref.picture_number,
+            ref2_picture_number: None,
+            requested_residue_bytes: requested,
+            actual_residue_bytes: actual_residue as u32,
+            qindex,
+            running_surplus_bytes: *carry,
+            global_fraction,
+            global_applied,
+        });
+        payload
+    };
+
+    while idx < rest.len() {
+        if rest.len() - idx >= group {
+            // Complete `[B…, P]` group: display order puts the
+            // reference LAST; coded order emits it FIRST.
+            let bs = &rest[idx..idx + group - 1];
+            let p = &rest[idx + group - 1];
+
+            let p_payload = emit_one_ref_picture(
+                p,
+                true,
+                &prev_ref,
+                &mut carry,
+                &mut out,
+                &mut prev_unit_len,
+                &mut report,
+            );
+            let next_ref: ChainReference<S> =
+                reconstruct_chain_reference(sequence, &mut refs, &p_payload, 0x0D);
+
+            for b in bs {
+                let requested = residue_rate_request(mode, target_residue_bytes, carry);
+                let mut b_params = inter_params.clone();
+                let (qindex, actual_residue) = bipred_residue_qindex_diagnostic(
+                    sequence,
+                    &b_params,
+                    b.y,
+                    b.u,
+                    b.v,
+                    &prev_ref.y,
+                    &prev_ref.u,
+                    &prev_ref.v,
+                    &next_ref.y,
+                    &next_ref.u,
+                    &next_ref.v,
+                    requested,
+                );
+                if let Some(ref rp) = inter_params.residue {
+                    let mut rp = rp.clone();
+                    rp.qindex = qindex;
+                    b_params.residue = Some(rp);
+                }
+                let b_payload = encode_bipred_inter_picture(
+                    sequence,
+                    &b_params,
+                    b.picture_number,
+                    prev_ref.picture_number,
+                    next_ref.picture_number,
+                    b.y,
+                    b.u,
+                    b.v,
+                    &prev_ref.y,
+                    &prev_ref.u,
+                    &prev_ref.v,
+                    &next_ref.y,
+                    &next_ref.u,
+                    &next_ref.v,
+                );
+                let unit_len = (pi_size + b_payload.len()) as u32;
+                // Non-reference, 2 refs, AC-coded core syntax: 0x0A.
+                write_parse_info(&mut out, 0x0A, unit_len, prev_unit_len);
+                out.extend_from_slice(&b_payload);
+                prev_unit_len = unit_len;
+
+                residue_rate_fold(mode, target_residue_bytes, &mut carry, actual_residue);
+                report.push(GopPictureRate {
+                    kind: GopPictureKind::BipredB,
+                    picture_number: b.picture_number,
+                    ref1_picture_number: prev_ref.picture_number,
+                    ref2_picture_number: Some(next_ref.picture_number),
+                    requested_residue_bytes: requested,
+                    actual_residue_bytes: actual_residue as u32,
+                    qindex,
+                    running_surplus_bytes: carry,
+                    global_fraction: None,
+                    global_applied: false,
+                });
+            }
+
+            prev_ref = next_ref;
+            idx += group;
+        } else {
+            // Tail: not enough frames for a full group — emit each
+            // remaining frame as a non-reference 1-ref P (0x09).
+            let pic = &rest[idx];
+            emit_one_ref_picture(
+                pic,
+                false,
+                &prev_ref,
+                &mut carry,
+                &mut out,
+                &mut prev_unit_len,
+                &mut report,
+            );
+            idx += 1;
+        }
+    }
+
+    write_parse_info(&mut out, 0x10, 0, prev_unit_len);
+    (out, report)
+}
+
 /// Two-frame YUV pair for the inter-encoder fixtures.
 pub type TranslatingPair64 = (
     [u8; 64 * 64],

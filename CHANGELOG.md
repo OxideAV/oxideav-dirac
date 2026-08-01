@@ -60,6 +60,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   contract (`tests/encoder_bipred_residue_rate.rs`: floor keeping,
   budget monotonicity, fit, floor respect, disabled-residue
   degeneracy).
+- GOP-structured (I / P / B) sequence driver:
+  `encode_inter_gop_with_residue_target` (+ `_report`) encodes
+  display-order frames as an HQ intra anchor plus repeating
+  `[B × GopStructure::b_between_refs, P]` groups in **coded order** —
+  each reference P (`0x0D`, closed-loop reconstructed) before the
+  bipred B pictures (`0x0A`) that reference the two enclosing
+  reconstructions, with input tails past the last complete group
+  emitted as non-reference `0x09` pictures. One residue rate-control
+  accumulator (all four `InterRateControl` variants) spans every inter
+  picture in coded order, P pictures via the 1-ref picker (with
+  per-picture auto global motion) and B pictures via the new bipred
+  picker. `GopPictureRate` telemetry carries the picture kind and both
+  reference numbers. `tests/encoder_inter_gop.rs` pins the coded-order
+  parse-code chains (full groups, ragged tail, `b_between_refs = 0`
+  P-chain degeneracy), the reference wiring, q0 bit-exactness through
+  the coded→display mapping, the mixed-kind CBR accumulator law, and
+  lossy decodability.
 
 - `encoder_inter::InterSample` — sealed source-sample abstraction
   (`u8` / `u16`) over the whole inter pipeline: motion estimation
