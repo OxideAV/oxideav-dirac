@@ -30,22 +30,14 @@ pub fn fdiv(a: i64, b: i64) -> i64 {
     debug_assert!(b > 0);
     let q = a / b;
     let r = a % b;
-    if r < 0 {
-        q - 1
-    } else {
-        q
-    }
+    if r < 0 { q - 1 } else { q }
 }
 
 /// Floor shift — `a >> b` with spec semantics: equivalent to
 /// `fdiv(a, 1 << b)`.
 #[inline]
 pub fn fshr(a: i64, b: u32) -> i64 {
-    if b == 0 {
-        a
-    } else {
-        fdiv(a, 1i64 << b)
-    }
+    if b == 0 { a } else { fdiv(a, 1i64 << b) }
 }
 
 /// Half-pel interpolation filter taps (§15.8.11, Fig. 15.2). The

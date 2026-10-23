@@ -19,8 +19,8 @@ use oxideav_core::{
     VideoPlane,
 };
 
-use crate::picture::{decode_picture_with_refs, DecodedPicture, PictureError, ReferencePicture};
-use crate::sequence::{parse_sequence_header, SequenceHeader};
+use crate::picture::{DecodedPicture, PictureError, ReferencePicture, decode_picture_with_refs};
+use crate::sequence::{SequenceHeader, parse_sequence_header};
 use crate::stream::DataUnitIter;
 use crate::video_format::ChromaFormat;
 
@@ -340,7 +340,7 @@ impl Decoder for DiracDecoder {
             _ => {
                 return Err(Error::invalid(
                     "dirac: receive_arena_frame: non-video frame from a video decoder",
-                ))
+                ));
             }
         };
         // `receive_frame` only succeeds after a sequence header has
@@ -580,8 +580,8 @@ mod tests {
         let values = [0i32, 255];
         let p = plane_from_i32(&values, 2, 8, 10);
         assert_eq!(p.stride, 4); // 2 bytes per 16-bit sample
-                                 // 0u16 -> 0x00, 0x00
-                                 // 255 << 2 = 1020 = 0x03FC -> 0xFC, 0x03
+        // 0u16 -> 0x00, 0x00
+        // 255 << 2 = 1020 = 0x03FC -> 0xFC, 0x03
         assert_eq!(p.data, vec![0x00, 0x00, 0xFC, 0x03]);
     }
 

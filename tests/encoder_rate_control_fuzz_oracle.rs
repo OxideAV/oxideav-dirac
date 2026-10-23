@@ -63,10 +63,10 @@
 
 use oxideav_core::{CodecId, CodecParameters, CodecRegistry, Frame, Packet, TimeBase};
 use oxideav_dirac::encoder::{
+    EncoderParams, HqRateControl, InputPicture, LdEncoderParams, LdRateControl,
     encode_hq_sequence_with_size_target, encode_hq_sequence_with_size_target_report,
     encode_ld_sequence_with_size_target, encode_ld_sequence_with_size_target_report,
-    make_minimal_sequence, make_minimal_sequence_ld, EncoderParams, HqRateControl, InputPicture,
-    LdEncoderParams, LdRateControl,
+    make_minimal_sequence, make_minimal_sequence_ld,
 };
 use oxideav_dirac::video_format::ChromaFormat;
 use oxideav_dirac::wavelet::WaveletFilter;

@@ -16,10 +16,10 @@
 
 use oxideav_core::CodecRegistry;
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
-use oxideav_dirac::encoder::{make_minimal_sequence, EncoderParams};
+use oxideav_dirac::encoder::{EncoderParams, make_minimal_sequence};
 use oxideav_dirac::encoder_inter::{
-    encode_inter_gop_with_residue_target, encode_inter_gop_with_residue_target_report,
     GopPictureKind, GopStructure, InterEncoderParams, InterInputPicture, InterRateControl,
+    encode_inter_gop_with_residue_target, encode_inter_gop_with_residue_target_report,
 };
 use oxideav_dirac::parse_info::ParseInfo;
 use oxideav_dirac::sequence::SequenceHeader;

@@ -32,13 +32,13 @@
 
 use crate::bitwriter::BitWriter;
 use crate::parse_info::BBCD;
-use crate::quant::{slice_quantisers, QuantMatrix};
+use crate::quant::{QuantMatrix, slice_quantisers};
 use crate::sequence::SequenceHeader;
 use crate::subband::{
-    padded_component_dims_ho, slice_band_order, subband_dims_ho, Orient, SubbandData,
+    Orient, SubbandData, padded_component_dims_ho, slice_band_order, subband_dims_ho,
 };
 use crate::video_format::ChromaFormat;
-use crate::wavelet::{dwt, dwt_with_ho, WaveletFilter};
+use crate::wavelet::{WaveletFilter, dwt, dwt_with_ho};
 
 /// Parameters that drive picture encoding. Mirrors the subset of
 /// `TransformParameters` the HQ-profile encoder actually needs.
@@ -569,7 +569,7 @@ pub fn hq_picture_payload_bytes_at_qindex(
     // §12.2 picture_header: byte-align then 4-byte picture_number.
     w.byte_align();
     w.write_uint_lit(4, 0); // value does not affect size
-                            // §12.3 wavelet_transform.
+    // §12.3 wavelet_transform.
     w.byte_align();
     write_transform_parameters(&mut w, params);
     w.byte_align();
@@ -968,11 +968,7 @@ fn quantise_coeff(x: i32, q: u32) -> i32 {
     // Dirac "dead-zone" forward quantiser. At q=0 (qf=4) it's a
     // no-op: 4*|x|/4 = |x|, and inverse_quant reconstructs |x| exactly.
     let mag = (x.unsigned_abs() as i64 * 4) / qf;
-    if x < 0 {
-        -(mag as i32)
-    } else {
-        mag as i32
-    }
+    if x < 0 { -(mag as i32) } else { mag as i32 }
 }
 
 /// Slice-area coordinates within a subband (§13.5.6.2). Mirrors the

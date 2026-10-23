@@ -604,7 +604,7 @@ pub fn h_synth(l: &SubbandData, h: &SubbandData, filter: WaveletFilter) -> Subba
 /// 2. One-dimensional analysis along every row.
 /// 3. De-interleave: column `2x` → `L[y][x]`, column `2x + 1` → `H[y][x]`.
 pub fn h_analysis(picture: &SubbandData, filter: WaveletFilter) -> (SubbandData, SubbandData) {
-    debug_assert!(picture.width % 2 == 0);
+    debug_assert!(picture.width.is_multiple_of(2));
     let out_w = picture.width;
     let out_h = picture.height;
     let mut work = picture.clone();
@@ -738,8 +738,8 @@ pub fn vh_analysis(
     picture: &SubbandData,
     filter: WaveletFilter,
 ) -> (SubbandData, SubbandData, SubbandData, SubbandData) {
-    debug_assert!(picture.width % 2 == 0);
-    debug_assert!(picture.height % 2 == 0);
+    debug_assert!(picture.width.is_multiple_of(2));
+    debug_assert!(picture.height.is_multiple_of(2));
     let out_w = picture.width;
     let out_h = picture.height;
     let mut work = picture.clone();

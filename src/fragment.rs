@@ -70,12 +70,12 @@
 use crate::bits::BitReader;
 use crate::parse_info::ParseInfo;
 use crate::picture::{
-    decode_hq_slice, decode_ld_slice, intra_dc_prediction, low_delay_profile_for,
-    parse_transform_parameters, trim_clip_offset, DecodedPicture, LowDelayProfile, PictureError,
-    TransformParameters,
+    DecodedPicture, LowDelayProfile, PictureError, TransformParameters, decode_hq_slice,
+    decode_ld_slice, intra_dc_prediction, low_delay_profile_for, parse_transform_parameters,
+    trim_clip_offset,
 };
 use crate::sequence::SequenceHeader;
-use crate::subband::{init_pyramid_ho, subband_dims_ho, SubbandData};
+use crate::subband::{SubbandData, init_pyramid_ho, subband_dims_ho};
 use crate::wavelet::idwt_with_ho;
 
 /// A picture fragment header, parsed per §14.2.

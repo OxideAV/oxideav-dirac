@@ -57,10 +57,10 @@
 //! in this crate's CHANGELOG (r39 / r73 / r80 / r91 / r95).
 
 use oxideav_core::{CodecId, CodecParameters, CodecRegistry, Frame, Packet, TimeBase};
-use oxideav_dirac::encoder::{make_minimal_sequence, EncoderParams};
+use oxideav_dirac::encoder::{EncoderParams, make_minimal_sequence};
 use oxideav_dirac::encoder_inter::{
-    encode_intra_then_inter_stream, synthetic_camera_pan_64, synthetic_translating_pair_64,
-    InterEncoderParams, InterInputPicture, ResidueParams,
+    InterEncoderParams, InterInputPicture, ResidueParams, encode_intra_then_inter_stream,
+    synthetic_camera_pan_64, synthetic_translating_pair_64,
 };
 use oxideav_dirac::video_format::ChromaFormat;
 use oxideav_dirac::wavelet::WaveletFilter;
@@ -739,7 +739,7 @@ fn smooth_luma_64(seed: u32) -> Vec<u8> {
 /// the ME — can panic the encoder or derail the decoder.
 #[test]
 fn estimated_global_model_random_warp_sweep_never_panics() {
-    use oxideav_dirac::encoder_inter::{estimate_global_motion_config, GlobalMotionModel};
+    use oxideav_dirac::encoder_inter::{GlobalMotionModel, estimate_global_motion_config};
     use oxideav_dirac::picture_inter::GlobalParams;
 
     let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
@@ -821,7 +821,7 @@ fn estimated_global_model_random_warp_sweep_never_panics() {
 /// config must still encode + decode.
 #[test]
 fn estimated_global_model_degenerate_inputs_never_panic() {
-    use oxideav_dirac::encoder_inter::{estimate_global_motion_config, GlobalMotionModel};
+    use oxideav_dirac::encoder_inter::{GlobalMotionModel, estimate_global_motion_config};
 
     let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
     let ip = intra_params();
@@ -878,12 +878,12 @@ type DeepPlanes = (Vec<u16>, Vec<u16>, Vec<u16>);
 fn deep_noise_64(depth: u32, seed: u32) -> DeepPlanes {
     let mut s = seed.max(1);
     let max = (1u64 << depth) - 1;
-    let mut gen = |n: usize| -> Vec<u16> {
+    let mut r#gen = |n: usize| -> Vec<u16> {
         (0..n)
             .map(|_| (xs32(&mut s) as u64 % (max + 1)) as u16)
             .collect()
     };
-    (gen(64 * 64), gen(32 * 32), gen(32 * 32))
+    (r#gen(64 * 64), r#gen(32 * 32), r#gen(32 * 32))
 }
 
 /// Deep solid frame (zero-energy fixture at deep amplitudes).
@@ -1016,7 +1016,7 @@ fn deep_u16_pathological_inputs_never_panic() {
 fn deep_u16_bipred_sweep_never_panics() {
     use oxideav_dirac::encoder::make_minimal_sequence_with_signal_range;
     use oxideav_dirac::encoder_intra_core::{
-        encode_core_intra_then_bipred_stream, CoreIntraEncoderParams,
+        CoreIntraEncoderParams, encode_core_intra_then_bipred_stream,
     };
     let seq =
         make_minimal_sequence_with_signal_range(64, 64, ChromaFormat::Yuv420, full_range_sr(16));
@@ -1071,7 +1071,7 @@ fn deep_u16_bipred_sweep_never_panics() {
 #[test]
 fn chained_driver_shape_sweep_never_panics() {
     use oxideav_dirac::encoder_inter::{
-        encode_inter_gop_with_residue_target, GopStructure, InterRateControl,
+        GopStructure, InterRateControl, encode_inter_gop_with_residue_target,
     };
 
     let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
@@ -1132,7 +1132,7 @@ fn chained_driver_shape_sweep_never_panics() {
 fn deep_chained_driver_pathological_budget_never_panics() {
     use oxideav_dirac::encoder::make_minimal_sequence_with_signal_range;
     use oxideav_dirac::encoder_inter::{
-        encode_inter_p_chain_with_residue_target, InterRateControl,
+        InterRateControl, encode_inter_p_chain_with_residue_target,
     };
 
     let seq =

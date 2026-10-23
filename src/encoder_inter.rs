@@ -37,16 +37,16 @@
 use crate::arith::{ArithEncoder, ContextBank};
 use crate::bitwriter::BitWriter;
 use crate::encoder::write_parse_info;
-use crate::obmc::{interp2by2, spatial_wt, subpel_predict, McParams};
+use crate::obmc::{McParams, interp2by2, spatial_wt, subpel_predict};
 use crate::picture_core::ctx;
 use crate::picture_inter::{
-    mvctx, BlockData, GlobalParams, PictureMotionData, PicturePredictionParams, RefPredMode,
+    BlockData, GlobalParams, PictureMotionData, PicturePredictionParams, RefPredMode, mvctx,
 };
 use crate::quant::quant_factor;
 use crate::sequence::SequenceHeader;
-use crate::subband::{padded_component_dims, Orient, SubbandData};
+use crate::subband::{Orient, SubbandData, padded_component_dims};
 use crate::video_format::ChromaFormat;
-use crate::wavelet::{dwt, WaveletFilter};
+use crate::wavelet::{WaveletFilter, dwt};
 
 mod sealed {
     /// Seals [`super::InterSample`] to the two source-sample widths the
@@ -901,16 +901,16 @@ fn fit_global_params_from_grid(
     let med = sorted[n / 2];
     let thresh = (2.0 * med).max(1.0);
     let inliers: Vec<usize> = (0..n).filter(|&i| resid[i] <= thresh).collect();
-    if inliers.len() >= 8 {
-        if let Some(refit) = affine_lsq(&pts, &vx, &vy, &inliers) {
-            fit = refit;
-            resid = (0..n)
-                .map(|i| {
-                    let (px, py) = fit.eval(pts[i].0, pts[i].1);
-                    (vx[i] - px).abs().max((vy[i] - py).abs())
-                })
-                .collect();
-        }
+    if inliers.len() >= 8
+        && let Some(refit) = affine_lsq(&pts, &vx, &vy, &inliers)
+    {
+        fit = refit;
+        resid = (0..n)
+            .map(|i| {
+                let (px, py) = fit.eval(pts[i].0, pts[i].1);
+                (vx[i] - px).abs().max((vy[i] - py).abs())
+            })
+            .collect();
     }
     let inliers: Vec<usize> = (0..n)
         .filter(|&i| resid[i] <= (2.0 * med).max(1.0))
@@ -3232,11 +3232,7 @@ fn residue_quantise_coeff(x: i32, q: u32) -> i32 {
     }
     let qf = quant_factor(q) as i64;
     let mag = (x.unsigned_abs() as i64 * 4) / qf;
-    if x < 0 {
-        -(mag as i32)
-    } else {
-        mag as i32
-    }
+    if x < 0 { -(mag as i32) } else { mag as i32 }
 }
 
 /// Emit `transform_parameters` for the residue path. Mirrors
@@ -3444,11 +3440,7 @@ fn encode_residue_subband_ac(pyramid: &[[SubbandData; 4]], level: u32, orient: O
 /// across the non-skipped codeblocks in raster order. Mirrors
 /// [`crate::encoder_intra_core`]'s `codeblock_offset`.
 fn residue_codeblock_offset(nonskip_index: u32) -> i32 {
-    if nonskip_index == 0 {
-        0
-    } else {
-        1
-    }
+    if nonskip_index == 0 { 0 } else { 1 }
 }
 
 /// Codeblock pixel bounds inside a subband (§12.4.5.2 partitioning):
@@ -4714,11 +4706,7 @@ fn round_mv_to_half_pel(mv: IntegerMv, p: u32) -> IntegerMv {
         } else {
             ((mag + half) / unit) * unit
         };
-        if v < 0 {
-            -snapped_mag
-        } else {
-            snapped_mag
-        }
+        if v < 0 { -snapped_mag } else { snapped_mag }
     };
     IntegerMv(snap(mv.0), snap(mv.1))
 }
@@ -4755,11 +4743,7 @@ fn round_mv_to_int_pel(mv: IntegerMv, p: u32) -> IntegerMv {
         } else {
             ((mag + half) / unit) * unit
         };
-        if v < 0 {
-            -snapped_mag
-        } else {
-            snapped_mag
-        }
+        if v < 0 { -snapped_mag } else { snapped_mag }
     };
     IntegerMv(snap(mv.0), snap(mv.1))
 }
@@ -6008,15 +5992,15 @@ fn resolve_per_picture_params<S: InterSample>(
     let mut pic_params = inter_params.clone();
     let mut global_fraction: Option<f64> = None;
     let mut global_applied = false;
-    if pic_params.global_motion.is_none() {
-        if let Some(auto) = &inter_params.auto_global_motion {
-            let (cfg, fraction) =
-                estimate_global_motion_config(sequence, inter_params, cur_y, ref_y, auto.model);
-            global_fraction = Some(fraction);
-            if fraction >= auto.min_fraction {
-                pic_params.global_motion = Some(cfg);
-                global_applied = true;
-            }
+    if pic_params.global_motion.is_none()
+        && let Some(auto) = &inter_params.auto_global_motion
+    {
+        let (cfg, fraction) =
+            estimate_global_motion_config(sequence, inter_params, cur_y, ref_y, auto.model);
+        global_fraction = Some(fraction);
+        if fraction >= auto.min_fraction {
+            pic_params.global_motion = Some(cfg);
+            global_applied = true;
         }
     }
     (pic_params, global_fraction, global_applied)
@@ -6725,7 +6709,7 @@ mod tests {
         // grid through BOTH the inter-residue cb encoder and the proven
         // intra-core encoder. The emitted AC bytes must be identical —
         // any divergence is a replica bug in the inter walk.
-        use crate::encoder_intra_core::{encode_subband_ac, CoreIntraEncoderParams};
+        use crate::encoder_intra_core::{CoreIntraEncoderParams, encode_subband_ac};
         let mut pyramid: Vec<[SubbandData; 4]> = (0..=3)
             .map(|_| {
                 [

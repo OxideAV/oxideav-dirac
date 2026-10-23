@@ -28,8 +28,8 @@
 
 use oxideav_core::{CodecId, CodecParameters, CodecRegistry, Frame, Packet, TimeBase};
 use oxideav_dirac::encoder::{
-    encode_ld_sequence_with_size_target, encode_ld_sequence_with_size_target_report,
-    make_minimal_sequence_ld, InputPicture, LdEncoderParams, LdRateControl,
+    InputPicture, LdEncoderParams, LdRateControl, encode_ld_sequence_with_size_target,
+    encode_ld_sequence_with_size_target_report, make_minimal_sequence_ld,
 };
 use oxideav_dirac::video_format::ChromaFormat;
 use oxideav_dirac::wavelet::WaveletFilter;
@@ -227,7 +227,10 @@ fn ld_sequence_cbr_total_within_5pct_of_n_times_target() {
     assert!(
         total_payload >= lo && total_payload <= hi,
         "CBR total payload {total_payload} outside ±5% of N*target {ideal} ({lo}..={hi}); per-pic={:?}",
-        report.iter().map(|r| r.actual_payload_bytes).collect::<Vec<_>>(),
+        report
+            .iter()
+            .map(|r| r.actual_payload_bytes)
+            .collect::<Vec<_>>(),
     );
 
     // Still round-trips to N frames.
@@ -240,7 +243,10 @@ fn ld_sequence_cbr_total_within_5pct_of_n_times_target() {
 
     eprintln!(
         "LD CBR: N={n} target={target} ideal={ideal} total={total_payload} per-pic={:?} qindexes={:?}",
-        report.iter().map(|r| r.actual_payload_bytes).collect::<Vec<_>>(),
+        report
+            .iter()
+            .map(|r| r.actual_payload_bytes)
+            .collect::<Vec<_>>(),
         report.iter().map(|r| r.qindex).collect::<Vec<_>>(),
     );
 }

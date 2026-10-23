@@ -19,8 +19,9 @@
 
 use oxideav_core::{CodecId, CodecParameters, CodecRegistry, Frame, Packet, TimeBase};
 use oxideav_dirac::encoder::{
-    encode_single_hq_intra_stream_with_size_target, hq_picture_payload_bytes_at_qindex,
-    hq_picture_qindex_diagnostic, make_minimal_sequence, pick_hq_picture_qindex, EncoderParams,
+    EncoderParams, encode_single_hq_intra_stream_with_size_target,
+    hq_picture_payload_bytes_at_qindex, hq_picture_qindex_diagnostic, make_minimal_sequence,
+    pick_hq_picture_qindex,
 };
 use oxideav_dirac::video_format::ChromaFormat;
 use oxideav_dirac::wavelet::WaveletFilter;
@@ -204,7 +205,8 @@ fn hq_picture_qindex_picker_hits_three_budgets() {
     assert!(
         chosen_qindexes[0] > chosen_qindexes[2],
         "small target qindex {} should exceed large target qindex {} (tighter budget = aggressive quantiser); all = {chosen_qindexes:?}",
-        chosen_qindexes[0], chosen_qindexes[2],
+        chosen_qindexes[0],
+        chosen_qindexes[2],
     );
 }
 

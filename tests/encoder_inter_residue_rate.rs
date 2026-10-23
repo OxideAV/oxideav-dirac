@@ -16,10 +16,10 @@
 
 use oxideav_core::CodecRegistry;
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
-use oxideav_dirac::encoder::{make_minimal_sequence, EncoderParams};
+use oxideav_dirac::encoder::{EncoderParams, make_minimal_sequence};
 use oxideav_dirac::encoder_inter::{
-    encode_intra_then_inter_stream, inter_residue_qindex_diagnostic, pick_inter_residue_qindex,
-    synthetic_camera_pan_64, InterEncoderParams, InterInputPicture, ResidueParams,
+    InterEncoderParams, InterInputPicture, ResidueParams, encode_intra_then_inter_stream,
+    inter_residue_qindex_diagnostic, pick_inter_residue_qindex, synthetic_camera_pan_64,
 };
 use oxideav_dirac::sequence::SequenceHeader;
 use oxideav_dirac::video_format::ChromaFormat;

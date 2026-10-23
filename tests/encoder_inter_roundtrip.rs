@@ -9,10 +9,10 @@
 
 use oxideav_core::CodecRegistry;
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
-use oxideav_dirac::encoder::{make_minimal_sequence, EncoderParams};
+use oxideav_dirac::encoder::{EncoderParams, make_minimal_sequence};
 use oxideav_dirac::encoder_inter::{
-    encode_intra_then_inter_stream, synthetic_camera_pan_64, synthetic_translating_pair_64,
     GlobalMotionConfig, InterEncoderParams, InterInputPicture, ResidueParams,
+    encode_intra_then_inter_stream, synthetic_camera_pan_64, synthetic_translating_pair_64,
 };
 use oxideav_dirac::picture_inter::GlobalParams;
 use oxideav_dirac::video_format::ChromaFormat;
@@ -968,7 +968,7 @@ fn intra_then_inter_post_obmc_selector_self_roundtrip_is_bit_exact() {
 #[test]
 fn post_obmc_selector_monotonic_at_pipeline_endpoint() {
     use oxideav_dirac::encoder_inter::{
-        inter_select_int_pel_per_block, obmc_refine_me, subpel_search_me, IntegerMv,
+        IntegerMv, inter_select_int_pel_per_block, obmc_refine_me, subpel_search_me,
     };
     let (y0, _, _, y1, _, _) = synthetic_translating_pair_64(2, -1);
 
@@ -1640,7 +1640,7 @@ fn estimated_perspective_warp_roundtrips_bit_exact_and_saves_bytes() {
 #[test]
 fn zero_residue_wire_forms_decode_identically() {
     use oxideav_dirac::encoder_intra_core::{
-        encode_core_intra_then_inter_stream, CoreIntraEncoderParams,
+        CoreIntraEncoderParams, encode_core_intra_then_inter_stream,
     };
     let seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
     let intra_params = CoreIntraEncoderParams::default_intra(WaveletFilter::LeGall5_3, 3);

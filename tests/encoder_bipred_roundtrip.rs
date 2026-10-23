@@ -27,11 +27,11 @@ use oxideav_core::CodecRegistry;
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
 use oxideav_dirac::encoder::make_minimal_sequence;
 use oxideav_dirac::encoder_inter::{
-    bipred_select_modes, GlobalMotionConfig, InterEncoderParams, InterInputPicture, ResidueParams,
+    GlobalMotionConfig, InterEncoderParams, InterInputPicture, ResidueParams, bipred_select_modes,
 };
 use oxideav_dirac::encoder_intra_core::{
-    encode_core_intra_then_bipred_stream, encode_core_intra_then_inter_stream,
-    CoreIntraEncoderParams,
+    CoreIntraEncoderParams, encode_core_intra_then_bipred_stream,
+    encode_core_intra_then_inter_stream,
 };
 use oxideav_dirac::picture_inter::{GlobalParams, RefPredMode};
 use oxideav_dirac::video_format::ChromaFormat;
@@ -296,9 +296,9 @@ fn bipred_with_codeblock_residue_recovers_b_frame() {
 #[test]
 fn bipred_block_motion_data_roundtrips_through_decoder() {
     use oxideav_dirac::bitwriter::BitWriter;
-    use oxideav_dirac::encoder_inter::{encode_block_motion_data_bipred, BipredBlock, IntegerMv};
+    use oxideav_dirac::encoder_inter::{BipredBlock, IntegerMv, encode_block_motion_data_bipred};
     use oxideav_dirac::picture_inter::{
-        decode_block_motion_data, PicturePredictionParams, RefPredMode,
+        PicturePredictionParams, RefPredMode, decode_block_motion_data,
     };
 
     // Tiny 16x16 luma → 1 superblock with 4x4 = 16 blocks at split=2.
@@ -1156,7 +1156,7 @@ fn warp_plane(src: &[u8], w: usize, h: usize, g: &GlobalParams) -> Vec<u8> {
 /// bytes.
 #[test]
 fn estimated_bipred_global_zoom_roundtrips_and_saves_bytes() {
-    use oxideav_dirac::encoder_inter::{estimate_global_bipred_config, GlobalMotionModel};
+    use oxideav_dirac::encoder_inter::{GlobalMotionModel, estimate_global_bipred_config};
 
     let seq = make_minimal_sequence(96, 96, ChromaFormat::Yuv420);
     let intra_params = CoreIntraEncoderParams::default_intra(WaveletFilter::LeGall5_3, 3);

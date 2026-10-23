@@ -52,8 +52,8 @@ use crate::encoder::write_parse_info;
 use crate::picture_core::ctx;
 use crate::quant::quant_factor;
 use crate::sequence::SequenceHeader;
-use crate::subband::{padded_component_dims, Orient, SubbandData};
-use crate::wavelet::{dwt, WaveletFilter};
+use crate::subband::{Orient, SubbandData, padded_component_dims};
+use crate::wavelet::{WaveletFilter, dwt};
 
 /// Encoder-side core-syntax intra parameters.
 ///
@@ -378,11 +378,7 @@ fn quantise_coeff(x: i32, q: u32) -> i32 {
     }
     let qf = quant_factor(q) as i64;
     let mag = (x.unsigned_abs() as i64 * 4) / qf;
-    if x < 0 {
-        -(mag as i32)
-    } else {
-        mag as i32
-    }
+    if x < 0 { -(mag as i32) } else { mag as i32 }
 }
 
 /// Quantise the level-0 LL band at `qindex`, then subtract the §13.4
@@ -496,11 +492,7 @@ fn write_subband_block(
 /// not the absolute codeblock index. The single-codeblock LL band never
 /// reaches this path.
 fn codeblock_offset(nonskip_index: u32) -> i32 {
-    if nonskip_index == 0 {
-        0
-    } else {
-        1
-    }
+    if nonskip_index == 0 { 0 } else { 1 }
 }
 
 /// Encode one subband's coefficients with the §13.4.4 AC contexts,

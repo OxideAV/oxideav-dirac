@@ -18,7 +18,7 @@ const ORACLE_BIN: &str = "ffmpeg";
 use oxideav_core::CodecRegistry;
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
 use oxideav_dirac::parse_info::ParseInfo;
-use oxideav_dirac::sequence::{parse_sequence_header, PictureCodingMode};
+use oxideav_dirac::sequence::{PictureCodingMode, parse_sequence_header};
 use oxideav_dirac::stream::DataUnitIter;
 use oxideav_dirac::video_format::ChromaFormat;
 
@@ -199,7 +199,7 @@ fn oracle_10bit_yuv420_produces_yuv420p10le_frame() {
             // would sit near a single value.
             let mut min: u16 = u16::MAX;
             let mut max: u16 = 0;
-            for chunk in v.planes[0].data.chunks_exact(2) {
+            for chunk in v.planes[0].data.as_chunks::<2>().0 {
                 let s = u16::from_le_bytes([chunk[0], chunk[1]]);
                 if s < min {
                     min = s;
@@ -282,8 +282,8 @@ fn oracle_decodes_our_hq_stream_lossless_q0() {
         return;
     }
     use oxideav_dirac::encoder::{
-        encode_single_hq_intra_stream, make_minimal_sequence, synthetic_testsrc_64_yuv420,
-        EncoderParams,
+        EncoderParams, encode_single_hq_intra_stream, make_minimal_sequence,
+        synthetic_testsrc_64_yuv420,
     };
     use oxideav_dirac::wavelet::WaveletFilter;
 
@@ -389,7 +389,7 @@ fn oracle_decodes_our_deep_preset_hq_streams_bit_exact() {
         return;
     }
     use oxideav_dirac::encoder::{
-        encode_single_hq_intra_stream_u16, make_minimal_sequence_with_signal_range, EncoderParams,
+        EncoderParams, encode_single_hq_intra_stream_u16, make_minimal_sequence_with_signal_range,
     };
     use oxideav_dirac::video_format::SignalRange;
     use oxideav_dirac::wavelet::WaveletFilter;
@@ -438,7 +438,9 @@ fn oracle_decodes_our_deep_preset_hq_streams_bit_exact() {
         let out = std::fs::read(&yuv).expect("read the oracle yuv");
         assert_eq!(out.len(), 2 * (w * h + 2 * cw * ch), "{depth}-bit size");
         let words: Vec<u16> = out
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
         let (oy, rest) = words.split_at(w * h);
@@ -467,8 +469,8 @@ fn oracle_decodes_our_ld_stream_bit_exact() {
         return;
     }
     use oxideav_dirac::encoder::{
-        encode_single_ld_intra_stream, make_minimal_sequence_ld, synthetic_testsrc_64_yuv420,
-        LdEncoderParams,
+        LdEncoderParams, encode_single_ld_intra_stream, make_minimal_sequence_ld,
+        synthetic_testsrc_64_yuv420,
     };
     use oxideav_dirac::wavelet::WaveletFilter;
 
@@ -548,7 +550,7 @@ fn oracle_decodes_our_hq_stream_lossless_q0_yuv422() {
         return;
     }
     use oxideav_dirac::encoder::{
-        encode_single_hq_intra_stream, make_minimal_sequence, EncoderParams,
+        EncoderParams, encode_single_hq_intra_stream, make_minimal_sequence,
     };
     use oxideav_dirac::wavelet::WaveletFilter;
 
@@ -634,7 +636,7 @@ fn oracle_decodes_our_hq_stream_lossless_q0_yuv444() {
         return;
     }
     use oxideav_dirac::encoder::{
-        encode_single_hq_intra_stream, make_minimal_sequence, EncoderParams,
+        EncoderParams, encode_single_hq_intra_stream, make_minimal_sequence,
     };
     use oxideav_dirac::wavelet::WaveletFilter;
 
@@ -723,7 +725,7 @@ fn oracle_accepts_our_hq_stream_across_wavelets() {
         return;
     }
     use oxideav_dirac::encoder::{
-        encode_single_hq_intra_stream, make_minimal_sequence, EncoderParams,
+        EncoderParams, encode_single_hq_intra_stream, make_minimal_sequence,
     };
     use oxideav_dirac::wavelet::WaveletFilter;
 
@@ -822,7 +824,7 @@ fn oracle_decodes_our_ld_constant_frame_lossless() {
         return;
     }
     use oxideav_dirac::encoder::{
-        encode_single_ld_intra_stream, make_minimal_sequence_ld, LdEncoderParams,
+        LdEncoderParams, encode_single_ld_intra_stream, make_minimal_sequence_ld,
     };
     use oxideav_dirac::wavelet::WaveletFilter;
 
@@ -893,10 +895,10 @@ fn oracle_decodes_our_inter_stream_translating_square() {
     }
     use oxideav_dirac::encoder::make_minimal_sequence;
     use oxideav_dirac::encoder_inter::{
-        synthetic_translating_pair_64, InterEncoderParams, InterInputPicture,
+        InterEncoderParams, InterInputPicture, synthetic_translating_pair_64,
     };
     use oxideav_dirac::encoder_intra_core::{
-        encode_core_intra_then_inter_stream, CoreIntraEncoderParams,
+        CoreIntraEncoderParams, encode_core_intra_then_inter_stream,
     };
     use oxideav_dirac::wavelet::WaveletFilter;
 
@@ -1005,10 +1007,10 @@ fn oracle_cross_decodes_camera_pan_with_subpel_me() {
     }
     use oxideav_dirac::encoder::make_minimal_sequence;
     use oxideav_dirac::encoder_inter::{
-        synthetic_camera_pan_64, InterEncoderParams, InterInputPicture,
+        InterEncoderParams, InterInputPicture, synthetic_camera_pan_64,
     };
     use oxideav_dirac::encoder_intra_core::{
-        encode_core_intra_then_inter_stream, CoreIntraEncoderParams,
+        CoreIntraEncoderParams, encode_core_intra_then_inter_stream,
     };
     use oxideav_dirac::wavelet::WaveletFilter;
 
@@ -1121,10 +1123,10 @@ fn oracle_obmc_aware_me_does_not_regress_cross_decode() {
     }
     use oxideav_dirac::encoder::make_minimal_sequence;
     use oxideav_dirac::encoder_inter::{
-        synthetic_translating_pair_64, InterEncoderParams, InterInputPicture,
+        InterEncoderParams, InterInputPicture, synthetic_translating_pair_64,
     };
     use oxideav_dirac::encoder_intra_core::{
-        encode_core_intra_then_inter_stream, CoreIntraEncoderParams,
+        CoreIntraEncoderParams, encode_core_intra_then_inter_stream,
     };
     use oxideav_dirac::wavelet::WaveletFilter;
 
@@ -1247,10 +1249,10 @@ fn oracle_cross_decodes_inter_residue_beats_no_residue() {
     }
     use oxideav_dirac::encoder::make_minimal_sequence;
     use oxideav_dirac::encoder_inter::{
-        synthetic_translating_pair_64, InterEncoderParams, InterInputPicture,
+        InterEncoderParams, InterInputPicture, synthetic_translating_pair_64,
     };
     use oxideav_dirac::encoder_intra_core::{
-        encode_core_intra_then_inter_stream, CoreIntraEncoderParams,
+        CoreIntraEncoderParams, encode_core_intra_then_inter_stream,
     };
     use oxideav_dirac::wavelet::WaveletFilter;
 
@@ -1368,10 +1370,10 @@ fn oracle_decodes_our_global_motion_p_stream_bit_exact() {
     }
     use oxideav_dirac::encoder::make_minimal_sequence;
     use oxideav_dirac::encoder_inter::{
-        synthetic_translating_pair_64, GlobalMotionConfig, InterEncoderParams, InterInputPicture,
+        GlobalMotionConfig, InterEncoderParams, InterInputPicture, synthetic_translating_pair_64,
     };
     use oxideav_dirac::encoder_intra_core::{
-        encode_core_intra_then_inter_stream, CoreIntraEncoderParams,
+        CoreIntraEncoderParams, encode_core_intra_then_inter_stream,
     };
     use oxideav_dirac::picture_inter::GlobalParams;
     use oxideav_dirac::wavelet::WaveletFilter;
@@ -1555,10 +1557,10 @@ fn oracle_decodes_our_estimated_pan_global_stream_bit_exact() {
     }
     use oxideav_dirac::encoder::make_minimal_sequence;
     use oxideav_dirac::encoder_inter::{
-        estimate_global_pan_config, InterEncoderParams, InterInputPicture,
+        InterEncoderParams, InterInputPicture, estimate_global_pan_config,
     };
     use oxideav_dirac::encoder_intra_core::{
-        encode_core_intra_then_inter_stream, CoreIntraEncoderParams,
+        CoreIntraEncoderParams, encode_core_intra_then_inter_stream,
     };
     use oxideav_dirac::wavelet::WaveletFilter;
 
@@ -1638,10 +1640,10 @@ fn oracle_estimated_affine_global_stream_characterised() {
     }
     use oxideav_dirac::encoder::make_minimal_sequence;
     use oxideav_dirac::encoder_inter::{
-        estimate_global_affine_config, InterEncoderParams, InterInputPicture,
+        InterEncoderParams, InterInputPicture, estimate_global_affine_config,
     };
     use oxideav_dirac::encoder_intra_core::{
-        encode_core_intra_then_inter_stream, CoreIntraEncoderParams,
+        CoreIntraEncoderParams, encode_core_intra_then_inter_stream,
     };
     use oxideav_dirac::obmc::global_mv;
     use oxideav_dirac::picture_inter::GlobalParams;
@@ -1760,7 +1762,7 @@ fn oracle_accepts_our_deep_preset_inter_streams_self_decode_bit_exact() {
     use oxideav_dirac::encoder::make_minimal_sequence_with_signal_range;
     use oxideav_dirac::encoder_inter::{InterEncoderParams, InterInputPicture};
     use oxideav_dirac::encoder_intra_core::{
-        encode_core_intra_then_inter_stream, CoreIntraEncoderParams,
+        CoreIntraEncoderParams, encode_core_intra_then_inter_stream,
     };
     use oxideav_dirac::video_format::SignalRange;
     use oxideav_dirac::wavelet::WaveletFilter;
@@ -1840,7 +1842,9 @@ fn oracle_accepts_our_deep_preset_inter_streams_self_decode_bit_exact() {
         let frame_words = w * h + 2 * cw * ch;
         assert_eq!(out.len(), 2 * 2 * frame_words, "{depth}-bit two-frame size");
         let words: Vec<u16> = out
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
 
@@ -1879,7 +1883,9 @@ fn oracle_accepts_our_deep_preset_inter_streams_self_decode_bit_exact() {
         dec.send_packet(&Packet::new(0, TimeBase::new(1, 25), stream))
             .expect("self decode send_packet");
         let as_u16 = |data: &[u8]| -> Vec<u16> {
-            data.chunks_exact(2)
+            data.as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                 .collect()
         };

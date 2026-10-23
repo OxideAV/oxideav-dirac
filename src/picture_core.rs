@@ -25,8 +25,8 @@
 use crate::arith::{ArithDecoder, ContextBank};
 use crate::bits::BitReader;
 use crate::picture::PictureError;
-use crate::quant::{inverse_quant_for, QuantMatrix};
-use crate::subband::{init_pyramid, subband_dims, Orient, SubbandData};
+use crate::quant::{QuantMatrix, inverse_quant_for};
+use crate::subband::{Orient, SubbandData, init_pyramid, subband_dims};
 use crate::wavelet::WaveletFilter;
 
 /// Core-syntax transform parameters (§11.3).
@@ -574,7 +574,7 @@ mod tests {
         let mut byte_buf: Vec<u8> = Vec::new();
         let padded = {
             let mut s = bits.to_string();
-            while s.len() % 8 != 0 {
+            while !s.len().is_multiple_of(8) {
                 s.push('0');
             }
             s

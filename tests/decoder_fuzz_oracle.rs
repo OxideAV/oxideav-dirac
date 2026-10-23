@@ -40,8 +40,8 @@ use oxideav_core::{
     CodecId, CodecParameters, CodecRegistry, Decoder, Error, Frame, Packet, TimeBase,
 };
 use oxideav_dirac::encoder::{
-    encode_single_hq_intra_stream, encode_single_ld_intra_stream, make_minimal_sequence,
-    make_minimal_sequence_ld, synthetic_testsrc_64_yuv420, EncoderParams, LdEncoderParams,
+    EncoderParams, LdEncoderParams, encode_single_hq_intra_stream, encode_single_ld_intra_stream,
+    make_minimal_sequence, make_minimal_sequence_ld, synthetic_testsrc_64_yuv420,
 };
 use oxideav_dirac::parse_info::BBCD;
 use oxideav_dirac::video_format::ChromaFormat;
@@ -370,10 +370,10 @@ fn unknown_base_video_format_yields_invalid_data() {
     bits.push_str("011"); // ver minor = 2
     bits.push_str("011"); // profile = 2
     bits.push_str("001"); // level = 1
-                          // base_video_format = 30 -> N+1=31=11111 -> K=4
-                          // interleaved: 0 1 0 1 0 1 0 1 1
+    // base_video_format = 30 -> N+1=31=11111 -> K=4
+    // interleaved: 0 1 0 1 0 1 0 1 1
     bits.push_str("010101011");
-    while bits.len() % 8 != 0 {
+    while !bits.len().is_multiple_of(8) {
         bits.push('0');
     }
     let payload: Vec<u8> = bits
@@ -451,7 +451,7 @@ fn picture_with_oversized_dwt_depth_yields_invalid_data() {
     // decoder errors out before reading slices.
     let mut payload = Vec::new();
     payload.extend_from_slice(&0u32.to_be_bytes()); // picture_number = 0
-                                                    // byte-align is already on a boundary, so just write the bits.
+    // byte-align is already on a boundary, so just write the bits.
     let mut bits = String::new();
     // wavelet_index = 1 (interleaved exp-golomb): "010"
     bits.push_str("010");
@@ -459,7 +459,7 @@ fn picture_with_oversized_dwt_depth_yields_invalid_data() {
     bits.push_str("01000001000001");
     // Pad to byte boundary; the rest is whatever the decoder happens
     // to read while bailing out.
-    while bits.len() % 8 != 0 {
+    while !bits.len().is_multiple_of(8) {
         bits.push('0');
     }
     let tp_bytes: Vec<u8> = bits

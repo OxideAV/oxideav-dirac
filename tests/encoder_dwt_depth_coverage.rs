@@ -46,8 +46,8 @@
 use oxideav_core::CodecRegistry;
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase, VideoFrame};
 use oxideav_dirac::encoder::{
-    encode_single_hq_intra_stream, encode_single_ld_intra_stream, make_minimal_sequence,
-    make_minimal_sequence_ld, EncoderParams, LdEncoderParams,
+    EncoderParams, LdEncoderParams, encode_single_hq_intra_stream, encode_single_ld_intra_stream,
+    make_minimal_sequence, make_minimal_sequence_ld,
 };
 use oxideav_dirac::quant::QuantMatrix;
 use oxideav_dirac::video_format::ChromaFormat;
@@ -111,11 +111,7 @@ fn psnr(a: &[u8], b: &[u8]) -> f64 {
 /// * depth 4..=5 → `(2, 2)` (slice luma dim 32, slice chroma dim 16
 ///   — both still multiples of `2^5`).
 fn slice_grid_for_64x64_yuv420(dwt_depth: u32) -> (u32, u32) {
-    if dwt_depth <= 3 {
-        (8, 8)
-    } else {
-        (2, 2)
-    }
+    if dwt_depth <= 3 { (8, 8) } else { (2, 2) }
 }
 
 /// Construct an all-zero custom quantisation matrix for the given

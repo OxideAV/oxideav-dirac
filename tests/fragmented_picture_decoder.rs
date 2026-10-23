@@ -31,8 +31,8 @@
 
 use oxideav_dirac::bits::BitReader;
 use oxideav_dirac::encoder::{
-    encode_single_hq_intra_stream, encode_single_ld_intra_stream, make_minimal_sequence,
-    make_minimal_sequence_ld, wavelet_index, EncoderParams, LdEncoderParams,
+    EncoderParams, LdEncoderParams, encode_single_hq_intra_stream, encode_single_ld_intra_stream,
+    make_minimal_sequence, make_minimal_sequence_ld, wavelet_index,
 };
 use oxideav_dirac::fragment::{
     AssemblerError, FragmentAssembler, FragmentEvent, FragmentHeader, FragmentKind,
@@ -40,8 +40,8 @@ use oxideav_dirac::fragment::{
 };
 use oxideav_dirac::parse_info::ParseInfo;
 use oxideav_dirac::picture::{
-    decode_picture, slice_bytes as ld_slice_bytes, DecodedPicture, LowDelayProfile,
-    TransformParameters,
+    DecodedPicture, LowDelayProfile, TransformParameters, decode_picture,
+    slice_bytes as ld_slice_bytes,
 };
 use oxideav_dirac::sequence::parse_sequence_header;
 use oxideav_dirac::stream::DataUnitIter;

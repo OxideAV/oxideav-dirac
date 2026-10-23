@@ -24,14 +24,14 @@
 //! No external source, no web.
 
 use oxideav_core::{CodecId, CodecParameters, CodecRegistry, Frame, Packet, TimeBase, VideoFrame};
-use oxideav_dirac::encoder::{make_minimal_sequence_with_signal_range, EncoderParams};
+use oxideav_dirac::encoder::{EncoderParams, make_minimal_sequence_with_signal_range};
 use oxideav_dirac::encoder_inter::{
-    encode_intra_then_inter_stream, estimate_global_motion_config, GlobalMotionConfig,
-    GlobalMotionModel, InterEncoderParams, InterInputPicture, ResidueParams,
+    GlobalMotionConfig, GlobalMotionModel, InterEncoderParams, InterInputPicture, ResidueParams,
+    encode_intra_then_inter_stream, estimate_global_motion_config,
 };
 use oxideav_dirac::encoder_intra_core::{
-    encode_core_intra_then_bipred_stream, encode_core_intra_then_inter_stream,
-    CoreIntraEncoderParams,
+    CoreIntraEncoderParams, encode_core_intra_then_bipred_stream,
+    encode_core_intra_then_inter_stream,
 };
 use oxideav_dirac::picture_inter::GlobalParams;
 use oxideav_dirac::video_format::{ChromaFormat, SignalRange};
@@ -59,7 +59,9 @@ fn decode_stream(stream: Vec<u8>) -> Vec<VideoFrame> {
 /// Reinterpret a decoded plane's little-endian 16-bit samples as `u16`.
 fn plane_as_u16(data: &[u8]) -> Vec<u16> {
     assert_eq!(data.len() % 2, 0, "16-bit plane must have even byte length");
-    data.chunks_exact(2)
+    data.as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .collect()
 }

@@ -13,8 +13,8 @@
 
 use crate::bits::BitReader;
 use crate::video_format::{
-    preset_frame_rate, preset_pixel_aspect_ratio, BaseVideoFormat, ChromaFormat, ScanFormat,
-    SignalRange,
+    BaseVideoFormat, ChromaFormat, ScanFormat, SignalRange, preset_frame_rate,
+    preset_pixel_aspect_ratio,
 };
 
 /// Parsed parse parameters (§10.1).
@@ -329,12 +329,12 @@ mod tests {
         bits.push_str("011"); // profile 2
         bits.push_str("001"); // level 1
         bits.push_str("00011"); // base_video_format 4 (CIF)
-                                // all 8 "custom_*_flag" booleans False (frame_size, chroma,
-                                // scan, frame_rate, par, clean, signal_range, colour_spec).
+        // all 8 "custom_*_flag" booleans False (frame_size, chroma,
+        // scan, frame_rate, par, clean, signal_range, colour_spec).
         bits.push_str("00000000");
         bits.push('1'); // picture_coding_mode = 0
-                        // pad to byte
-        while bits.len() % 8 != 0 {
+        // pad to byte
+        while !bits.len().is_multiple_of(8) {
             bits.push('0');
         }
         let mut out = Vec::new();
@@ -388,10 +388,10 @@ mod tests {
         bits.push_str("011"); // ver minor 2
         bits.push_str("011"); // profile 2
         bits.push_str("001"); // level 1
-                              // uint for value 30: N+1 = 31 = 11111 -> K=4
-                              // sequence: 0 x3 0 x2 0 x1 0 x0 1 = 0 1 0 1 0 1 0 1 1
+        // uint for value 30: N+1 = 31 = 11111 -> K=4
+        // sequence: 0 x3 0 x2 0 x1 0 x0 1 = 0 1 0 1 0 1 0 1 1
         bits.push_str("010101011");
-        while bits.len() % 8 != 0 {
+        while !bits.len().is_multiple_of(8) {
             bits.push('0');
         }
         let mut out = Vec::new();

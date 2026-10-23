@@ -28,10 +28,10 @@
 
 use oxideav_core::CodecRegistry;
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
-use oxideav_dirac::encoder::{make_minimal_sequence, EncoderParams};
+use oxideav_dirac::encoder::{EncoderParams, make_minimal_sequence};
 use oxideav_dirac::encoder_inter::{
-    encode_intra_then_inter_stream, synthetic_translating_pair_64, InterEncoderParams,
-    InterInputPicture, ResidueParams,
+    InterEncoderParams, InterInputPicture, ResidueParams, encode_intra_then_inter_stream,
+    synthetic_translating_pair_64,
 };
 use oxideav_dirac::video_format::ChromaFormat;
 use oxideav_dirac::wavelet::WaveletFilter;

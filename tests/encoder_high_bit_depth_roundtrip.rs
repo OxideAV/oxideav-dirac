@@ -36,9 +36,9 @@
 
 use oxideav_core::{CodecId, CodecParameters, CodecRegistry, Frame, Packet, TimeBase, VideoFrame};
 use oxideav_dirac::encoder::{
-    encode_single_hq_intra_stream_u16, encode_single_ld_intra_stream_u16,
-    make_minimal_sequence_ld_with_signal_range, make_minimal_sequence_with_signal_range,
-    EncoderParams, LdEncoderParams,
+    EncoderParams, LdEncoderParams, encode_single_hq_intra_stream_u16,
+    encode_single_ld_intra_stream_u16, make_minimal_sequence_ld_with_signal_range,
+    make_minimal_sequence_with_signal_range,
 };
 use oxideav_dirac::quant::QuantMatrix;
 use oxideav_dirac::video_format::{ChromaFormat, SignalRange};
@@ -64,7 +64,9 @@ fn decode_one(stream: Vec<u8>) -> VideoFrame {
 /// plane data length is `2 * sample_count`.
 fn plane_as_u16(data: &[u8]) -> Vec<u16> {
     assert_eq!(data.len() % 2, 0, "16-bit plane must have even byte length");
-    data.chunks_exact(2)
+    data.as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .collect()
 }
@@ -331,7 +333,7 @@ fn hq_13_to_15bit_full_range_q0_bit_exact_msb_aligned() {
 #[test]
 fn core_intra_ac_16bit_q0_bit_exact() {
     use oxideav_dirac::encoder_intra_core::{
-        encode_single_core_intra_stream_u16, CoreIntraEncoderParams,
+        CoreIntraEncoderParams, encode_single_core_intra_stream_u16,
     };
     let (w, h) = (64u32, 64u32);
     let sr = SignalRange::PRESET_16BIT_FULL;
@@ -361,7 +363,7 @@ fn core_intra_ac_16bit_q0_bit_exact() {
 #[test]
 fn core_intra_vlc_deep_q0_bit_exact() {
     use oxideav_dirac::encoder_intra_core::{
-        encode_single_core_intra_stream_vlc_u16, CoreIntraEncoderParams,
+        CoreIntraEncoderParams, encode_single_core_intra_stream_vlc_u16,
     };
     let (w, h) = (64u32, 64u32);
     for (depth, chroma) in [(16u32, ChromaFormat::Yuv420), (13u32, ChromaFormat::Yuv422)] {
@@ -552,11 +554,7 @@ fn hq_10bit_flat_midgrey_offset_is_exact() {
 /// per-component slice dimension must stay an integer multiple of
 /// `2^dwt_depth` (§15.7). Depths 1..=3 tile 8×8; 4..=5 loosen to 2×2.
 fn slice_grid_64x64(dwt_depth: u32) -> (u32, u32) {
-    if dwt_depth <= 3 {
-        (8, 8)
-    } else {
-        (2, 2)
-    }
+    if dwt_depth <= 3 { (8, 8) } else { (2, 2) }
 }
 
 /// All-zero custom quant matrix sized to `dwt_depth + 1` levels — the

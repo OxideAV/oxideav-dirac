@@ -28,9 +28,9 @@
 
 use oxideav_core::{CodecId, CodecParameters, CodecRegistry, Frame, Packet, TimeBase};
 use oxideav_dirac::encoder::{
-    encode_hq_sequence_with_size_target, encode_hq_sequence_with_size_target_report,
-    hq_picture_payload_bytes_at_qindex, make_minimal_sequence, EncoderParams, HqRateControl,
-    InputPicture,
+    EncoderParams, HqRateControl, InputPicture, encode_hq_sequence_with_size_target,
+    encode_hq_sequence_with_size_target_report, hq_picture_payload_bytes_at_qindex,
+    make_minimal_sequence,
 };
 use oxideav_dirac::video_format::ChromaFormat;
 use oxideav_dirac::wavelet::WaveletFilter;

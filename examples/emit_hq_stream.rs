@@ -5,8 +5,8 @@
 use std::io::Write;
 
 use oxideav_dirac::encoder::{
-    encode_single_hq_intra_stream, make_minimal_sequence, synthetic_testsrc_64_yuv420,
-    EncoderParams,
+    EncoderParams, encode_single_hq_intra_stream, make_minimal_sequence,
+    synthetic_testsrc_64_yuv420,
 };
 use oxideav_dirac::video_format::ChromaFormat;
 use oxideav_dirac::wavelet::WaveletFilter;

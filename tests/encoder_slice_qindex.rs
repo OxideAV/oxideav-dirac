@@ -18,7 +18,7 @@
 
 use oxideav_core::{CodecId, CodecParameters, CodecRegistry, Frame, Packet, TimeBase};
 use oxideav_dirac::encoder::{
-    encode_single_hq_intra_stream, hq_slice_qindexes, make_minimal_sequence, EncoderParams,
+    EncoderParams, encode_single_hq_intra_stream, hq_slice_qindexes, make_minimal_sequence,
 };
 use oxideav_dirac::video_format::ChromaFormat;
 use oxideav_dirac::wavelet::WaveletFilter;
@@ -39,7 +39,7 @@ fn varied_energy_plane(w: usize, h: usize, seed: u32) -> Vec<u8> {
             } else {
                 // High-frequency 1-pel checker around mid-grey with a
                 // strong amplitude → big HL/LH/HH coefficients.
-                let checker = if (x + y + seed as usize) % 2 == 0 {
+                let checker = if (x + y + seed as usize).is_multiple_of(2) {
                     200
                 } else {
                     40

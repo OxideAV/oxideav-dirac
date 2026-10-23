@@ -54,7 +54,7 @@
 //! prediction).
 
 use oxideav_dirac::fragment::{
-    slice_coords, AssemblerError, FragmentAssembler, FragmentEvent, FragmentHeader, FragmentKind,
+    AssemblerError, FragmentAssembler, FragmentEvent, FragmentHeader, FragmentKind, slice_coords,
 };
 use oxideav_dirac::subband::SubbandData;
 
@@ -346,11 +346,7 @@ fn random_op(rng: &mut XorShift32, model: &Model) -> Op {
                         0xC8
                     }
                 } else if model.using_dc_prediction {
-                    if rng.next_bool() {
-                        0xC8
-                    } else {
-                        0xCC
-                    }
+                    if rng.next_bool() { 0xC8 } else { 0xCC }
                 } else if rng.next_bool() {
                     0xE8
                 } else {

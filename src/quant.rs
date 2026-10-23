@@ -904,29 +904,35 @@ mod tests {
     #[test]
     fn default_for_asymmetric_off_table_is_none() {
         // sum > 5.
-        assert!(QuantMatrix::default_for_asymmetric(
-            WaveletFilter::LeGall5_3,
-            WaveletFilter::LeGall5_3,
-            3,
-            3
-        )
-        .is_none());
+        assert!(
+            QuantMatrix::default_for_asymmetric(
+                WaveletFilter::LeGall5_3,
+                WaveletFilter::LeGall5_3,
+                3,
+                3
+            )
+            .is_none()
+        );
         // dwt_depth_ho > 4.
-        assert!(QuantMatrix::default_for_asymmetric(
-            WaveletFilter::LeGall5_3,
-            WaveletFilter::LeGall5_3,
-            0,
-            5
-        )
-        .is_none());
+        assert!(
+            QuantMatrix::default_for_asymmetric(
+                WaveletFilter::LeGall5_3,
+                WaveletFilter::LeGall5_3,
+                0,
+                5
+            )
+            .is_none()
+        );
         // Undefined cross-filter pair (LeGall vertical + DD9,7 ho).
-        assert!(QuantMatrix::default_for_asymmetric(
-            WaveletFilter::LeGall5_3,
-            WaveletFilter::DeslauriersDubuc9_7,
-            1,
-            1
-        )
-        .is_none());
+        assert!(
+            QuantMatrix::default_for_asymmetric(
+                WaveletFilter::LeGall5_3,
+                WaveletFilter::DeslauriersDubuc9_7,
+                1,
+                1
+            )
+            .is_none()
+        );
     }
 
     // ---- Annex D Table D.9 corrected Fidelity matrices -----------------
@@ -1232,8 +1238,8 @@ mod tests {
         assert_eq!(qm.levels[0], [3, 0, 0, 0]); // L
         assert_eq!(qm.levels[1], [9, 0, 0, 0]); // H
         assert_eq!(qm.levels[2], [0, 4, 7, 2]); // HL,LH,HH
-                                                // The very next uint must be the sentinel: proves the matrix
-                                                // read stopped at the right bit.
+        // The very next uint must be the sentinel: proves the matrix
+        // read stopped at the right bit.
         assert_eq!(r.read_uint(), sentinel);
     }
 

@@ -771,15 +771,17 @@ fn corpus_hq_16bit_fullrange_64x64() {
 /// standalone crate checkout has no fixtures.
 #[test]
 fn deep_fixture_anchored_inter_p_chains_bit_exact() {
-    use oxideav_dirac::encoder::{make_minimal_sequence_with_signal_range, EncoderParams};
+    use oxideav_dirac::encoder::{EncoderParams, make_minimal_sequence_with_signal_range};
     use oxideav_dirac::encoder_inter::{
-        encode_intra_then_inter_stream, InterEncoderParams, InterInputPicture,
+        InterEncoderParams, InterInputPicture, encode_intra_then_inter_stream,
     };
     use oxideav_dirac::video_format::{ChromaFormat, SignalRange};
     use oxideav_dirac::wavelet::WaveletFilter;
 
     let plane_as_u16 = |data: &[u8]| -> Vec<u16> {
-        data.chunks_exact(2)
+        data.as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect()
     };

@@ -46,11 +46,11 @@
 //! Run with:
 //!     cargo bench -p oxideav-dirac --bench encode
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 use oxideav_dirac::encoder::{
-    encode_single_hq_intra_stream, encode_single_ld_intra_stream, make_minimal_sequence,
-    make_minimal_sequence_ld, EncoderParams, LdEncoderParams,
+    EncoderParams, LdEncoderParams, encode_single_hq_intra_stream, encode_single_ld_intra_stream,
+    make_minimal_sequence, make_minimal_sequence_ld,
 };
 use oxideav_dirac::sequence::SequenceHeader;
 use oxideav_dirac::video_format::ChromaFormat;

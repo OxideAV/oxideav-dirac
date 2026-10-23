@@ -1,6 +1,6 @@
 use oxideav_dirac::encoder::{
-    encode_single_ld_intra_stream, make_minimal_sequence_ld, synthetic_testsrc_64_yuv420,
-    LdEncoderParams,
+    LdEncoderParams, encode_single_ld_intra_stream, make_minimal_sequence_ld,
+    synthetic_testsrc_64_yuv420,
 };
 use oxideav_dirac::video_format::ChromaFormat;
 use oxideav_dirac::wavelet::WaveletFilter;

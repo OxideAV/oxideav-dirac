@@ -25,11 +25,11 @@
 //! encoder-side shaping. No external source, no web.
 
 use oxideav_core::{CodecId, CodecParameters, CodecRegistry, Frame, Packet, TimeBase, VideoFrame};
-use oxideav_dirac::encoder::{make_minimal_sequence_with_signal_range, EncoderParams};
+use oxideav_dirac::encoder::{EncoderParams, make_minimal_sequence_with_signal_range};
 use oxideav_dirac::encoder_inter::{
+    InterEncoderParams, InterInputPicture, InterPictureRate, InterRateControl,
     encode_inter_sequence_with_residue_target, encode_inter_sequence_with_residue_target_report,
-    inter_residue_qindex_diagnostic, InterEncoderParams, InterInputPicture, InterPictureRate,
-    InterRateControl,
+    inter_residue_qindex_diagnostic,
 };
 use oxideav_dirac::sequence::SequenceHeader;
 use oxideav_dirac::video_format::{ChromaFormat, SignalRange};
@@ -101,7 +101,9 @@ fn decode_frames(stream: Vec<u8>) -> Vec<VideoFrame> {
 }
 
 fn plane_as_u16(data: &[u8]) -> Vec<u16> {
-    data.chunks_exact(2)
+    data.as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .collect()
 }

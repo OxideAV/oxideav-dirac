@@ -19,7 +19,7 @@
 use std::io::Write;
 
 use oxideav_dirac::encoder::{
-    encode_single_hq_intra_stream_u16, make_minimal_sequence_with_signal_range, EncoderParams,
+    EncoderParams, encode_single_hq_intra_stream_u16, make_minimal_sequence_with_signal_range,
 };
 use oxideav_dirac::video_format::{ChromaFormat, SignalRange};
 use oxideav_dirac::wavelet::WaveletFilter;

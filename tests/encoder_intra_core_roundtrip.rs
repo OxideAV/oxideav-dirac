@@ -20,11 +20,11 @@ use oxideav_core::CodecRegistry;
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
 use oxideav_dirac::encoder::{make_minimal_sequence, synthetic_testsrc_64_yuv420};
 use oxideav_dirac::encoder_inter::{
-    synthetic_translating_pair_64, InterEncoderParams, InterInputPicture,
+    InterEncoderParams, InterInputPicture, synthetic_translating_pair_64,
 };
 use oxideav_dirac::encoder_intra_core::{
-    encode_core_intra_then_inter_stream, encode_single_core_intra_stream,
-    encode_single_core_intra_stream_vlc, CoreIntraEncoderParams,
+    CoreIntraEncoderParams, encode_core_intra_then_inter_stream, encode_single_core_intra_stream,
+    encode_single_core_intra_stream_vlc,
 };
 use oxideav_dirac::video_format::ChromaFormat;
 use oxideav_dirac::wavelet::WaveletFilter;

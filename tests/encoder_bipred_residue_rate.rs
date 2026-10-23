@@ -11,7 +11,7 @@
 
 use oxideav_dirac::encoder::make_minimal_sequence;
 use oxideav_dirac::encoder_inter::{
-    bipred_residue_qindex_diagnostic, pick_bipred_residue_qindex, InterEncoderParams,
+    InterEncoderParams, bipred_residue_qindex_diagnostic, pick_bipred_residue_qindex,
 };
 use oxideav_dirac::video_format::ChromaFormat;
 

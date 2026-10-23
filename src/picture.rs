@@ -23,10 +23,10 @@
 
 use crate::bits::BitReader;
 use crate::parse_info::ParseInfo;
-use crate::quant::{inverse_quant, slice_quantisers, QuantMatrix};
+use crate::quant::{QuantMatrix, inverse_quant, slice_quantisers};
 use crate::sequence::SequenceHeader;
-use crate::subband::{init_pyramid_ho, slice_band_order, subband_dims_ho, Orient, SubbandData};
-use crate::wavelet::{idwt, idwt_with_ho, WaveletFilter};
+use crate::subband::{Orient, SubbandData, init_pyramid_ho, slice_band_order, subband_dims_ho};
+use crate::wavelet::{WaveletFilter, idwt, idwt_with_ho};
 
 /// A single fully-decoded picture: Y / U / V plane arrays (one signed
 /// int per pixel, non-negative after output offset), plus the picture
@@ -1619,7 +1619,7 @@ mod tests {
         let mut w = BitWriter::new();
         w.write_uint(wavelet_index); // wavelet_index
         w.write_uint(dwt_depth); // dwt_depth
-                                 // extended_transform_parameters (§12.4.4):
+        // extended_transform_parameters (§12.4.4):
         w.write_bool(false); // asym_transform_index_flag = 0 → ho index = default
         if ho > 0 {
             w.write_bool(true); // asym_transform_flag = 1

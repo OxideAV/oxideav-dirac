@@ -18,9 +18,9 @@
 
 use oxideav_core::{CodecId, CodecParameters, CodecRegistry, Frame, Packet, TimeBase};
 use oxideav_dirac::encoder::{
-    encode_single_ld_intra_stream, encode_single_ld_intra_stream_with_size_target,
+    LdEncoderParams, encode_single_ld_intra_stream, encode_single_ld_intra_stream_with_size_target,
     ld_picture_payload_bytes, ld_picture_qindex_diagnostic, make_minimal_sequence_ld,
-    pick_ld_picture_qindex, LdEncoderParams,
+    pick_ld_picture_qindex,
 };
 use oxideav_dirac::video_format::ChromaFormat;
 use oxideav_dirac::wavelet::WaveletFilter;
@@ -132,7 +132,8 @@ fn ld_picture_qindex_picker_hits_three_budgets_within_10pct() {
         assert!(
             (actual_picture as i64) >= lo && (actual_picture as i64) <= hi,
             "target {target}: actual_picture_bytes {actual_picture} outside ±10% ({lo}..={hi}) — qindex={qindex} numer={} denom={}",
-            adjusted.slice_bytes_numer, adjusted.slice_bytes_denom,
+            adjusted.slice_bytes_numer,
+            adjusted.slice_bytes_denom,
         );
         assert!(qindex <= 127);
         chosen_qindexes.push(qindex);
@@ -156,7 +157,9 @@ fn ld_picture_qindex_picker_hits_three_budgets_within_10pct() {
     assert!(
         chosen_qindexes[0] > chosen_qindexes[2],
         "small target qindex {} should exceed large target qindex {} (tighter budget = aggressive quantiser); all = {:?}",
-        chosen_qindexes[0], chosen_qindexes[2], chosen_qindexes,
+        chosen_qindexes[0],
+        chosen_qindexes[2],
+        chosen_qindexes,
     );
 }
 

@@ -17,16 +17,16 @@
 //! * bytes that are not this syntax at all → `0.0`.
 
 use oxideav_core::{CodecRegistry, CodecTag, ProbeContext};
-use oxideav_dirac::encoder::{encode_single_hq_intra_stream, make_minimal_sequence, EncoderParams};
+use oxideav_dirac::encoder::{EncoderParams, encode_single_hq_intra_stream, make_minimal_sequence};
 use oxideav_dirac::encoder_inter::{
-    encode_intra_then_inter_stream, synthetic_translating_pair_64, InterEncoderParams,
-    InterInputPicture,
+    InterEncoderParams, InterInputPicture, encode_intra_then_inter_stream,
+    synthetic_translating_pair_64,
 };
 use oxideav_dirac::video_format::ChromaFormat;
 use oxideav_dirac::wavelet::WaveletFilter;
 use oxideav_dirac::{
-    container_tag_probe, PROBE_CONFIDENCE_INTRA_PROFILE, PROBE_CONFIDENCE_LONG_GOP,
-    PROBE_CONFIDENCE_NO_EVIDENCE,
+    PROBE_CONFIDENCE_INTRA_PROFILE, PROBE_CONFIDENCE_LONG_GOP, PROBE_CONFIDENCE_NO_EVIDENCE,
+    container_tag_probe,
 };
 
 /// The declared strength of the VC-2-profile side's long-GOP claim on
