@@ -617,55 +617,23 @@ fn deep_hq_mutation_walk_terminates_cleanly() {
 /// 24-bit and the maximal 32-bit excursion, on both components.
 #[test]
 fn over_16bit_video_depth_rejected_cleanly() {
-    use oxideav_dirac::encoder::{encode_sequence_header, write_parse_info};
-    use oxideav_dirac::sequence::{
-        ParseParameters, PictureCodingMode, SequenceHeader, VideoParams,
-    };
-    use oxideav_dirac::video_format::{ScanFormat, SignalRange};
+    use oxideav_dirac::encoder::{encode_sequence_header, make_minimal_sequence, write_parse_info};
+    use oxideav_dirac::video_format::SignalRange;
 
     for (le, ce) in [
         (131071u32, 65535u32), // 17-bit luma
         (65535, 16777215),     // 24-bit chroma
         (u32::MAX, u32::MAX),  // 32-bit both
     ] {
-        let vp = VideoParams {
-            frame_width: 64,
-            frame_height: 64,
-            chroma_format: ChromaFormat::Yuv420,
-            source_sampling: ScanFormat::Progressive,
-            top_field_first: false,
-            frame_rate_numer: 25,
-            frame_rate_denom: 1,
-            pixel_aspect_ratio_numer: 1,
-            pixel_aspect_ratio_denom: 1,
-            clean_width: 64,
-            clean_height: 64,
-            clean_left_offset: 0,
-            clean_top_offset: 0,
-            signal_range: SignalRange {
-                luma_offset: 0,
-                luma_excursion: le,
-                chroma_offset: 0,
-                chroma_excursion: ce,
-            },
+        let mut seq = make_minimal_sequence(64, 64, ChromaFormat::Yuv420);
+        seq.video_params.signal_range = SignalRange {
+            luma_offset: 0,
+            luma_excursion: le,
+            chroma_offset: 0,
+            chroma_excursion: ce,
         };
-        let seq = SequenceHeader {
-            parse_parameters: ParseParameters {
-                version_major: 2,
-                version_minor: 0,
-                profile: 3,
-                level: 0,
-            },
-            base_video_format_index: 0,
-            video_params: vp,
-            picture_coding_mode: PictureCodingMode::Frames,
-            luma_width: 64,
-            luma_height: 64,
-            chroma_width: 32,
-            chroma_height: 32,
-            luma_depth: 17, // parse recomputes; placeholder
-            chroma_depth: 17,
-        };
+        seq.luma_depth = 17; // parse recomputes; placeholder
+        seq.chroma_depth = 17;
         let sh_payload = encode_sequence_header(&seq);
         let mut stream = Vec::new();
         write_parse_info(&mut stream, 0x00, (13 + sh_payload.len()) as u32, 0);

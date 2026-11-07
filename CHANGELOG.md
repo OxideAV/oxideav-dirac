@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `#[non_exhaustive]` on `sequence::SequenceHeader` (it carries
+  derived decoder state that can grow); build one with
+  `encoder::make_minimal_sequence` / `make_preset_sequence` and adjust
+  fields. The §10 syntax records `ParseParameters`, `VideoParams`,
+  `SignalRange` and the spec-fixed enums `ChromaFormat`, `ScanFormat`,
+  `PictureCodingMode` stay exhaustive.
+
 ## [0.0.10](https://github.com/OxideAV/oxideav-dirac/compare/v0.0.9...v0.0.10) - 2026-10-23
 
 ### Other
@@ -2177,7 +2186,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`vlc_inter_offset_applies_via_is_intra_false`, pinning the wiring
   with an end-to-end VLC subband decode at `qindex = 12` where intra
   and inter reconstructions differ by 1 LSB).
-
 
 ## [0.0.7](https://github.com/OxideAV/oxideav-dirac/compare/v0.0.6...v0.0.7) - 2026-05-24
 

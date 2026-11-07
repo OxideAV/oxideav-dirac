@@ -88,6 +88,7 @@ impl PictureCodingMode {
 /// A fully parsed sequence header plus the derived decoder state from
 /// `set_coding_parameters` (§10.5).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SequenceHeader {
     pub parse_parameters: ParseParameters,
     pub base_video_format_index: u32,
